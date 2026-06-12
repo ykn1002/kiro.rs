@@ -7,11 +7,11 @@
 //! - 西文字符：每个计 1 个字符单位
 //! - 4 个字符单位 = 1 token（四舍五入）
 
-use crate::anthropic::types::{
-    CountTokensRequest, CountTokensResponse, Message, SystemMessage, Tool,
-};
+use crate::anthropic::types::{CountTokensResponse, Message, SystemMessage, Tool};
 use crate::http_client::{ProxyConfig, build_client};
 use crate::model::config::TlsBackend;
+use reqwest::Client;
+use serde::Serialize;
 use std::sync::OnceLock;
 
 /// Count Tokens API 配置
@@ -31,6 +31,22 @@ pub struct CountTokensConfig {
 
 /// 全局配置存储
 static COUNT_TOKENS_CONFIG: OnceLock<CountTokensConfig> = OnceLock::new();
+
+/// 远程 count_tokens API 的复用 HTTP 客户端
+///
+/// 首次远程调用时按配置构建一次，之后复用（保留连接池 / keep-alive）。
+static COUNT_TOKENS_CLIENT: OnceLock<Client> = OnceLock::new();
+
+/// count_tokens 远程请求体（借用版，避免在热路径上 clone 整个消息列表）
+#[derive(Serialize)]
+struct CountTokensRequestRef<'a> {
+    model: &'a str,
+    messages: &'a [Message],
+    #[serde(skip_serializing_if = "Option::is_none")]
+    system: &'a Option<Vec<SystemMessage>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tools: &'a Option<Vec<Tool>>,
+}
 
 /// 初始化 count_tokens 配置
 ///
@@ -105,30 +121,24 @@ pub fn count_tokens(text: &str) -> u64 {
 /// 估算请求的输入 tokens
 ///
 /// 优先调用远程 API，失败时回退到本地计算
-pub(crate) fn count_all_tokens(
-    model: String,
-    system: Option<Vec<SystemMessage>>,
-    messages: Vec<Message>,
-    tools: Option<Vec<Tool>>,
+pub(crate) async fn count_all_tokens(
+    model: &str,
+    system: &Option<Vec<SystemMessage>>,
+    messages: &[Message],
+    tools: &Option<Vec<Tool>>,
 ) -> u64 {
     // 检查是否配置了远程 API
-    if let Some(config) = get_config() {
-        if let Some(api_url) = &config.api_url {
-            // 尝试调用远程 API
-            let result = tokio::task::block_in_place(|| {
-                tokio::runtime::Handle::current().block_on(call_remote_count_tokens(
-                    api_url, config, model, &system, &messages, &tools,
-                ))
-            });
-
-            match result {
-                Ok(tokens) => {
-                    tracing::debug!("远程 count_tokens API 返回: {}", tokens);
-                    return tokens;
-                }
-                Err(e) => {
-                    tracing::warn!("远程 count_tokens API 调用失败，回退到本地计算: {}", e);
-                }
+    if let Some(config) = get_config()
+        && let Some(api_url) = &config.api_url
+    {
+        // 尝试调用远程 API（async，不再阻塞 worker 线程）
+        match call_remote_count_tokens(api_url, config, model, system, messages, tools).await {
+            Ok(tokens) => {
+                tracing::debug!("远程 count_tokens API 返回: {}", tokens);
+                return tokens;
+            }
+            Err(e) => {
+                tracing::warn!("远程 count_tokens API 调用失败，回退到本地计算: {}", e);
             }
         }
     }
@@ -141,19 +151,30 @@ pub(crate) fn count_all_tokens(
 async fn call_remote_count_tokens(
     api_url: &str,
     config: &CountTokensConfig,
-    model: String,
+    model: &str,
     system: &Option<Vec<SystemMessage>>,
-    messages: &Vec<Message>,
+    messages: &[Message],
     tools: &Option<Vec<Tool>>,
 ) -> Result<u64, Box<dyn std::error::Error + Send + Sync>> {
-    let client = build_client(config.proxy.as_ref(), 300, config.tls_backend)?;
+    // 复用全局 HTTP 客户端（首次构建，之后复用连接池）
+    let client = match COUNT_TOKENS_CLIENT.get() {
+        Some(c) => c,
+        None => {
+            let built = build_client(config.proxy.as_ref(), 300, config.tls_backend)?;
+            // 竞态下可能有其他线程已 set，统一返回已存储的实例
+            let _ = COUNT_TOKENS_CLIENT.set(built);
+            COUNT_TOKENS_CLIENT
+                .get()
+                .expect("COUNT_TOKENS_CLIENT 刚刚已初始化")
+        }
+    };
 
-    // 构建请求体
-    let request = CountTokensRequest {
-        model: model, // 模型名称用于 token 计算
-        messages: messages.clone(),
-        system: system.clone(),
-        tools: tools.clone(),
+    // 构建请求体（借用，避免 clone 整个消息列表）
+    let request = CountTokensRequestRef {
+        model,
+        messages,
+        system,
+        tools,
     };
 
     // 构建请求
@@ -185,21 +206,21 @@ async fn call_remote_count_tokens(
 
 /// 本地计算请求的输入 tokens
 fn count_all_tokens_local(
-    system: Option<Vec<SystemMessage>>,
-    messages: Vec<Message>,
-    tools: Option<Vec<Tool>>,
+    system: &Option<Vec<SystemMessage>>,
+    messages: &[Message],
+    tools: &Option<Vec<Tool>>,
 ) -> u64 {
     let mut total = 0;
 
     // 系统消息
-    if let Some(ref system) = system {
+    if let Some(system) = system {
         for msg in system {
             total += count_tokens(&msg.text);
         }
     }
 
     // 用户消息
-    for msg in &messages {
+    for msg in messages {
         if let serde_json::Value::String(s) = &msg.content {
             total += count_tokens(s);
         } else if let serde_json::Value::Array(arr) = &msg.content {
@@ -212,7 +233,7 @@ fn count_all_tokens_local(
     }
 
     // 工具定义
-    if let Some(ref tools) = tools {
+    if let Some(tools) = tools {
         for tool in tools {
             total += count_tokens(&tool.name);
             total += count_tokens(&tool.description);

@@ -199,16 +199,15 @@ impl AdminService {
         req: AddCredentialRequest,
     ) -> Result<AddCredentialResponse, AdminServiceError> {
         // 校验端点名：未指定则默认合法，指定则必须已注册
-        if let Some(ref name) = req.endpoint {
-            if !self.known_endpoints.contains(name) {
-                let mut known: Vec<&str> =
-                    self.known_endpoints.iter().map(|s| s.as_str()).collect();
-                known.sort();
-                return Err(AdminServiceError::InvalidCredential(format!(
-                    "未知端点 \"{}\"，已注册端点: {:?}",
-                    name, known
-                )));
-            }
+        if let Some(ref name) = req.endpoint
+            && !self.known_endpoints.contains(name)
+        {
+            let mut known: Vec<&str> = self.known_endpoints.iter().map(|s| s.as_str()).collect();
+            known.sort();
+            return Err(AdminServiceError::InvalidCredential(format!(
+                "未知端点 \"{}\"，已注册端点: {:?}",
+                name, known
+            )));
         }
 
         // 构建凭据对象
@@ -448,7 +447,8 @@ impl AdminService {
         let msg = e.to_string();
         if msg.contains("不存在") {
             AdminServiceError::NotFound { id }
-        } else if msg.contains("只能删除已禁用的凭据") || msg.contains("请先禁用凭据") {
+        } else if msg.contains("只能删除已禁用的凭据") || msg.contains("请先禁用凭据")
+        {
             AdminServiceError::InvalidCredential(msg)
         } else {
             AdminServiceError::InternalError(msg)

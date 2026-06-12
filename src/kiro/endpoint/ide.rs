@@ -112,12 +112,12 @@ impl KiroEndpoint for IdeEndpoint {
 
 /// 将 profile_arn 注入到请求体 JSON 根对象
 fn inject_profile_arn(request_body: &str, profile_arn: &Option<String>) -> String {
-    if let Some(arn) = profile_arn {
-        if let Ok(mut json) = serde_json::from_str::<serde_json::Value>(request_body) {
-            json["profileArn"] = serde_json::Value::String(arn.clone());
-            if let Ok(body) = serde_json::to_string(&json) {
-                return body;
-            }
+    if let Some(arn) = profile_arn
+        && let Ok(mut json) = serde_json::from_str::<serde_json::Value>(request_body)
+    {
+        json["profileArn"] = serde_json::Value::String(arn.clone());
+        if let Ok(body) = serde_json::to_string(&json) {
+            return body;
         }
     }
     request_body.to_string()
