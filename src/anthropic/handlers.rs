@@ -466,7 +466,7 @@ fn create_sse_stream(
                             Some((stream::iter(bytes), (body_stream, ctx, decoder, false, ping_interval)))
                         }
                         Some(Err(e)) => {
-                            tracing::error!("读取响应流失败: {}", e);
+                            tracing::error!("读取响应流失败: {:?}", e);
                             // 发送最终事件并结束
                             let final_events = ctx.generate_final_events();
                             let bytes: Vec<Result<Bytes, Infallible>> = final_events
@@ -977,7 +977,7 @@ fn create_buffered_sse_stream(
                                 // 继续读取下一个 chunk，不发送任何数据
                             }
                             Some(Err(e)) => {
-                                tracing::error!("读取响应流失败: {}", e);
+                                tracing::error!("读取响应流失败: {:?}", e);
                                 // 发生错误，完成处理并返回所有事件
                                 let all_events = ctx.finish_and_get_all_events();
                                 let bytes: Vec<Result<Bytes, Infallible>> = all_events
