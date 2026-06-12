@@ -193,6 +193,7 @@ docker-compose up
 | `credentialRpm` | number | `0` | 单凭据目标 RPM（每分钟请求数），用于凭据级节流/分流；某凭据在最近 60 秒内请求数达到该值时会在选择时被跳过并分流到其他凭据；`0` 或未配置表示不限制。作为 Opus/Sonnet 未单独配置时的兜底值 |
 | `credentialRpmOpus` | number | - | 单凭据 Opus 模型专用 RPM，未配置时回退到 `credentialRpm` |
 | `credentialRpmSonnet` | number | - | 单凭据 Sonnet 模型专用 RPM，未配置时回退到 `credentialRpm` |
+| `credentialRpmHaiku` | number | - | 单凭据 Haiku 模型专用 RPM，未配置时回退到 `credentialRpm` |
 | `extractThinking` | boolean | `true` | 非流式响应的 thinking 块提取。启用后 `<thinking>` 标签会被解析为独立的 `thinking` 内容块 |
 | `defaultEndpoint` | string | `ide` | 默认 Kiro 端点。凭据未显式指定 `endpoint` 时使用。当前支持：`ide` |
 
@@ -222,7 +223,8 @@ docker-compose up
    "extractThinking": true,
    "credentialRpm": 0,
    "credentialRpmOpus": 3,
-   "credentialRpmSonnet": 10
+   "credentialRpmSonnet": 10,
+   "credentialRpmHaiku": 20
 }
 ```
 

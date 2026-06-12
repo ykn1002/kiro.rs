@@ -418,12 +418,13 @@ struct CredentialEntry {
     request_times: ModelRequestTimes,
 }
 
-/// 模型类别，用于区分 Opus / Sonnet 的独立 RPM 限制
+/// 模型类别，用于区分 Opus / Sonnet / Haiku 的独立 RPM 限制
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ModelClass {
     Opus,
     Sonnet,
-    /// 其他模型（如 Haiku），使用通用 `credential_rpm`
+    Haiku,
+    /// 其他模型，使用通用 `credential_rpm`
     Other,
 }
 
@@ -437,6 +438,8 @@ impl ModelClass {
                     ModelClass::Opus
                 } else if lower.contains("sonnet") {
                     ModelClass::Sonnet
+                } else if lower.contains("haiku") {
+                    ModelClass::Haiku
                 } else {
                     ModelClass::Other
                 }
@@ -445,12 +448,15 @@ impl ModelClass {
         }
     }
 
-    /// 取得该类别在配置中的有效 RPM 上限（Opus/Sonnet 未配置时回退到通用值）
+    /// 取得该类别在配置中的有效 RPM 上限（Opus/Sonnet/Haiku 未配置时回退到通用值）
     fn effective_rpm(&self, config: &Config) -> u32 {
         match self {
             ModelClass::Opus => config.credential_rpm_opus.unwrap_or(config.credential_rpm),
             ModelClass::Sonnet => config
                 .credential_rpm_sonnet
+                .unwrap_or(config.credential_rpm),
+            ModelClass::Haiku => config
+                .credential_rpm_haiku
                 .unwrap_or(config.credential_rpm),
             ModelClass::Other => config.credential_rpm,
         }
@@ -462,6 +468,7 @@ impl ModelClass {
 struct ModelRequestTimes {
     opus: std::collections::VecDeque<Instant>,
     sonnet: std::collections::VecDeque<Instant>,
+    haiku: std::collections::VecDeque<Instant>,
     other: std::collections::VecDeque<Instant>,
 }
 
@@ -470,6 +477,7 @@ impl ModelRequestTimes {
         match class {
             ModelClass::Opus => &mut self.opus,
             ModelClass::Sonnet => &mut self.sonnet,
+            ModelClass::Haiku => &mut self.haiku,
             ModelClass::Other => &mut self.other,
         }
     }
@@ -478,6 +486,7 @@ impl ModelRequestTimes {
         match class {
             ModelClass::Opus => &self.opus,
             ModelClass::Sonnet => &self.sonnet,
+            ModelClass::Haiku => &self.haiku,
             ModelClass::Other => &self.other,
         }
     }

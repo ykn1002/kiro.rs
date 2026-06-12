@@ -8,5 +8,6 @@
   "defaultEndpoint": "ide",
   "credentialRpm": 5,
   "credentialRpmOpus": 5,
-  "credentialRpmSonnet": 15
+  "credentialRpmSonnet": 15,
+  "credentialRpmHaiku": 30
 }

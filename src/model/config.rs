@@ -110,6 +110,11 @@ pub struct Config {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub credential_rpm_sonnet: Option<u32>,
 
+    /// 单凭据 Haiku 模型专用 RPM，未配置时回退到 `credential_rpm`
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub credential_rpm_haiku: Option<u32>,
+
     /// 是否开启非流式响应的 thinking 块提取（默认 true）
     ///
     /// 启用后，非流式响应中的 `<thinking>...</thinking>` 标签会被解析为
@@ -203,6 +208,7 @@ impl Default for Config {
             credential_rpm: 0,
             credential_rpm_opus: None,
             credential_rpm_sonnet: None,
+            credential_rpm_haiku: None,
             extract_thinking: default_extract_thinking(),
             default_endpoint: default_endpoint(),
             endpoints: HashMap::new(),
