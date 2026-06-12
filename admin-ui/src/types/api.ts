@@ -6,6 +6,23 @@ export interface CredentialsStatusResponse {
   credentials: CredentialStatusItem[]
 }
 
+// 凭据级 RPM 各模型类别当前 60 秒窗口占用
+export interface RpmWindowCounts {
+  opus: number
+  sonnet: number
+  haiku: number
+  other: number
+}
+
+// 凭据级 RPM 实时状态：窗口占用 + 生效上限（0 表示不限制）
+export interface RpmStatus {
+  counts: RpmWindowCounts
+  limitOpus: number
+  limitSonnet: number
+  limitHaiku: number
+  limitOther: number
+}
+
 // 单个凭据状态
 export interface CredentialStatusItem {
   id: number
@@ -27,6 +44,7 @@ export interface CredentialStatusItem {
   refreshFailureCount: number
   disabledReason?: string
   endpoint: string
+  rpm: RpmStatus
 }
 
 // 余额响应

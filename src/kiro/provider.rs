@@ -7,6 +7,7 @@
 
 use reqwest::Client;
 use std::collections::{HashMap, HashSet};
+use std::fmt;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::time::sleep;
@@ -18,6 +19,27 @@ use crate::kiro::model::credentials::KiroCredentials;
 use crate::kiro::token_manager::MultiTokenManager;
 use crate::model::config::TlsBackend;
 use parking_lot::Mutex;
+
+/// 上游 API 返回的 HTTP 错误，携带原始状态码以便上层按需透传给客户端。
+///
+/// provider 在重试耗尽后会把最后一次失败包装成本类型；`map_provider_error`
+/// 据此对客户端可正确处理的状态码（如 429 限流、402 额度）做透传，
+/// 其余状态码仍按 502 处理（不暴露上游凭据/权限细节给客户端）。
+#[derive(Debug)]
+pub(crate) struct UpstreamApiError {
+    /// 上游返回的 HTTP 状态码
+    pub status: u16,
+    /// 用于日志/错误信息的完整描述
+    pub message: String,
+}
+
+impl fmt::Display for UpstreamApiError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.message)
+    }
+}
+
+impl std::error::Error for UpstreamApiError {}
 
 /// 每个凭据的最大重试次数
 const MAX_RETRIES_PER_CREDENTIAL: usize = 3;
@@ -384,20 +406,19 @@ impl KiroProvider {
 
                 let has_available = self.token_manager.report_quota_exhausted(ctx.id);
                 if !has_available {
-                    anyhow::bail!(
-                        "{} API 请求失败（所有凭据已用尽）: {} {}",
-                        api_type,
-                        status,
-                        body
-                    );
+                    return Err(anyhow::Error::new(UpstreamApiError {
+                        status: 402,
+                        message: format!(
+                            "{} API 请求失败（所有凭据已用尽）: {} {}",
+                            api_type, status, body
+                        ),
+                    }));
                 }
 
-                last_error = Some(anyhow::anyhow!(
-                    "{} API 请求失败: {} {}",
-                    api_type,
-                    status,
-                    body
-                ));
+                last_error = Some(anyhow::Error::new(UpstreamApiError {
+                    status: 402,
+                    message: format!("{} API 请求失败: {} {}", api_type, status, body),
+                }));
                 continue;
             }
 
@@ -456,12 +477,10 @@ impl KiroProvider {
                     status,
                     body
                 );
-                last_error = Some(anyhow::anyhow!(
-                    "{} API 请求失败: {} {}",
-                    api_type,
-                    status,
-                    body
-                ));
+                last_error = Some(anyhow::Error::new(UpstreamApiError {
+                    status: status.as_u16(),
+                    message: format!("{} API 请求失败: {} {}", api_type, status, body),
+                }));
                 if attempt + 1 < max_retries {
                     // 429 限流走专用指数退避（优先 Retry-After），其余瞬态错误走默认退避
                     let delay = if status.as_u16() == 429 {

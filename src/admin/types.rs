@@ -62,6 +62,8 @@ pub struct CredentialStatusItem {
     pub disabled_reason: Option<String>,
     /// 端点名称（决定该凭据走哪套 Kiro API，已回退到默认端点）
     pub endpoint: String,
+    /// 凭据级 RPM 实时状态（各模型类别当前 60 秒窗口占用 + 生效上限）
+    pub rpm: crate::kiro::token_manager::RpmStatus,
 }
 
 // ============ 操作请求 ============

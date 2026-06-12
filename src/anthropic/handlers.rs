@@ -56,6 +56,37 @@ fn map_provider_error(err: Error) -> Response {
         )
             .into_response();
     }
+
+    // 上游 HTTP 错误：对客户端可正确处理的状态码做透传（429 限流让客户端退避重试、
+    // 402 额度耗尽让客户端感知），其余仍按 502 处理，不向客户端暴露凭据/权限细节。
+    if let Some(api_err) = err.downcast_ref::<crate::kiro::provider::UpstreamApiError>() {
+        match api_err.status {
+            429 => {
+                tracing::warn!(error = %err, "上游限流，透传 429 给客户端");
+                return (
+                    StatusCode::TOO_MANY_REQUESTS,
+                    Json(ErrorResponse::new(
+                        "rate_limit_error",
+                        "Upstream rate limit reached. Please retry after a short delay.",
+                    )),
+                )
+                    .into_response();
+            }
+            402 => {
+                tracing::warn!(error = %err, "上游额度耗尽，透传 402 给客户端");
+                return (
+                    StatusCode::PAYMENT_REQUIRED,
+                    Json(ErrorResponse::new(
+                        "api_error",
+                        "Upstream credential quota exhausted.",
+                    )),
+                )
+                    .into_response();
+            }
+            _ => {}
+        }
+    }
+
     tracing::error!("Kiro API 调用失败: {}", err);
     (
         StatusCode::BAD_GATEWAY,
@@ -971,4 +1002,55 @@ fn create_buffered_sse_stream(
         },
     )
     .flatten()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::kiro::provider::UpstreamApiError;
+
+    #[test]
+    fn test_map_provider_error_passes_through_429() {
+        let err = anyhow::Error::new(UpstreamApiError {
+            status: 429,
+            message: "流式 API 请求失败: 429 Too Many Requests".to_string(),
+        });
+        let resp = map_provider_error(err);
+        assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+    }
+
+    #[test]
+    fn test_map_provider_error_passes_through_402() {
+        let err = anyhow::Error::new(UpstreamApiError {
+            status: 402,
+            message: "流式 API 请求失败（所有凭据已用尽）: 402".to_string(),
+        });
+        let resp = map_provider_error(err);
+        assert_eq!(resp.status(), StatusCode::PAYMENT_REQUIRED);
+    }
+
+    #[test]
+    fn test_map_provider_error_other_upstream_status_is_502() {
+        // 401/403 等凭据/权限类状态不应透传，仍按 502 处理
+        let err = anyhow::Error::new(UpstreamApiError {
+            status: 403,
+            message: "流式 API 请求失败: 403 Forbidden".to_string(),
+        });
+        let resp = map_provider_error(err);
+        assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+    }
+
+    #[test]
+    fn test_map_provider_error_plain_error_is_502() {
+        let err = anyhow::anyhow!("网络发送失败");
+        let resp = map_provider_error(err);
+        assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+    }
+
+    #[test]
+    fn test_map_provider_error_context_full_is_400() {
+        let err = anyhow::anyhow!("xxx CONTENT_LENGTH_EXCEEDS_THRESHOLD yyy");
+        let resp = map_provider_error(err);
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
 }

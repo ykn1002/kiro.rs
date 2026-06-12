@@ -49,6 +49,17 @@ function formatLastUsed(lastUsedAt: string | null): string {
   return `${days} 天前`
 }
 
+// 构造凭据级 RPM 占用展示：仅显示有上限（>0）的模型类别，格式如 "Opus 2/5"
+function formatRpmUsage(rpm: CredentialStatusItem['rpm']): string | null {
+  if (!rpm) return null
+  const parts: string[] = []
+  if (rpm.limitOpus > 0) parts.push(`Opus ${rpm.counts.opus}/${rpm.limitOpus}`)
+  if (rpm.limitSonnet > 0) parts.push(`Sonnet ${rpm.counts.sonnet}/${rpm.limitSonnet}`)
+  if (rpm.limitHaiku > 0) parts.push(`Haiku ${rpm.counts.haiku}/${rpm.limitHaiku}`)
+  if (rpm.limitOther > 0) parts.push(`其他 ${rpm.counts.other}/${rpm.limitOther}`)
+  return parts.length > 0 ? parts.join('，') : null
+}
+
 export function CredentialCard({
   credential,
   onViewBalance,
@@ -258,6 +269,12 @@ export function CredentialCard({
               <span className="text-muted-foreground">最后调用：</span>
               <span className="font-medium">{formatLastUsed(credential.lastUsedAt)}</span>
             </div>
+            {formatRpmUsage(credential.rpm) && (
+              <div className="col-span-2">
+                <span className="text-muted-foreground">RPM 占用：</span>
+                <span className="font-medium">{formatRpmUsage(credential.rpm)}</span>
+              </div>
+            )}
             {credential.maskedApiKey && (
               <div className="col-span-2">
                 <span className="text-muted-foreground">API Key：</span>

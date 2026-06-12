@@ -525,6 +525,25 @@ impl CredentialEntry {
     fn request_times_len(&self, class: ModelClass) -> usize {
         self.request_times.window(class).len()
     }
+
+    /// 清理所有模型类别的滑动窗口，并返回各类别当前 60 秒窗口内的请求数。
+    /// 用于 Admin API 暴露凭据级 RPM 实时占用情况。
+    fn rpm_window_counts(&mut self, now: Instant) -> RpmWindowCounts {
+        for class in [
+            ModelClass::Opus,
+            ModelClass::Sonnet,
+            ModelClass::Haiku,
+            ModelClass::Other,
+        ] {
+            self.prune_request_times(class, now);
+        }
+        RpmWindowCounts {
+            opus: self.request_times_len(ModelClass::Opus) as u32,
+            sonnet: self.request_times_len(ModelClass::Sonnet) as u32,
+            haiku: self.request_times_len(ModelClass::Haiku) as u32,
+            other: self.request_times_len(ModelClass::Other) as u32,
+        }
+    }
 }
 
 /// 禁用原因
@@ -554,6 +573,33 @@ struct StatsEntry {
 // ============================================================================
 // Admin API 公开结构
 // ============================================================================
+
+/// 各模型类别当前 60 秒滑动窗口内的请求数（凭据级 RPM 实时占用）
+#[derive(Debug, Clone, Copy, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RpmWindowCounts {
+    pub opus: u32,
+    pub sonnet: u32,
+    pub haiku: u32,
+    pub other: u32,
+}
+
+/// 凭据级 RPM 状态：当前各类别窗口占用 + 生效的上限（0 表示该类别不限制）。
+/// 暴露给 Admin API，便于判断 RPM 节流是否生效、是否需要调参。
+#[derive(Debug, Clone, Copy, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RpmStatus {
+    /// 各类别当前 60 秒窗口内请求数
+    pub counts: RpmWindowCounts,
+    /// Opus 生效上限（0 = 不限制）
+    pub limit_opus: u32,
+    /// Sonnet 生效上限（0 = 不限制）
+    pub limit_sonnet: u32,
+    /// Haiku 生效上限（0 = 不限制）
+    pub limit_haiku: u32,
+    /// 其他模型生效上限（0 = 不限制）
+    pub limit_other: u32,
+}
 
 /// 凭据条目快照（用于 Admin API 读取）
 #[derive(Debug, Clone, Serialize)]
@@ -598,6 +644,8 @@ pub struct CredentialEntrySnapshot {
     /// 端点名称（未显式配置时返回 None，由 Admin 层回退到默认值）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub endpoint: Option<String>,
+    /// 凭据级 RPM 实时状态（各类别窗口占用 + 生效上限）
+    pub rpm: RpmStatus,
 }
 
 /// 凭据管理器状态快照
@@ -957,7 +1005,11 @@ impl MultiTokenManager {
                 if let Some(wait) = self.rpm_wait_for_slot(model, now) {
                     let wait = wait.min(StdDuration::from_millis(max_wait_ms));
                     if !wait.is_zero() {
-                        tracing::debug!("所有可用凭据已达 RPM 上限，等待 {:?} 后放行", wait);
+                        tracing::info!(
+                            model = model.unwrap_or("(none)"),
+                            wait_ms = wait.as_millis() as u64,
+                            "所有可用凭据已达 RPM 上限，等待后放行（凭据级 RPM 平滑生效）"
+                        );
                         tokio::time::sleep(wait).await;
                     }
                 }
@@ -1611,14 +1663,29 @@ impl MultiTokenManager {
 
     /// 获取管理器状态快照（用于 Admin API）
     pub fn snapshot(&self) -> ManagerSnapshot {
-        let entries = self.entries.lock();
+        let mut entries = self.entries.lock();
         let current_id = *self.current_id.lock();
         let available = entries.iter().filter(|e| !e.disabled).count();
+        let total = entries.len();
 
-        ManagerSnapshot {
-            entries: entries
-                .iter()
-                .map(|e| CredentialEntrySnapshot {
+        // 预先计算各类别生效上限（对所有凭据一致）
+        let limit_opus = ModelClass::Opus.effective_rpm(&self.config);
+        let limit_sonnet = ModelClass::Sonnet.effective_rpm(&self.config);
+        let limit_haiku = ModelClass::Haiku.effective_rpm(&self.config);
+        let limit_other = ModelClass::Other.effective_rpm(&self.config);
+        let now = Instant::now();
+
+        let snapshots: Vec<CredentialEntrySnapshot> = entries
+            .iter_mut()
+            .map(|e| {
+                let rpm = RpmStatus {
+                    counts: e.rpm_window_counts(now),
+                    limit_opus,
+                    limit_sonnet,
+                    limit_haiku,
+                    limit_other,
+                };
+                CredentialEntrySnapshot {
                     id: e.id,
                     priority: e.credentials.priority,
                     disabled: e.disabled,
@@ -1670,10 +1737,15 @@ impl MultiTokenManager {
                         DisabledReason::InvalidConfig => "InvalidConfig",
                     }.to_string()),
                     endpoint: e.credentials.endpoint.clone(),
-                })
-                .collect(),
+                    rpm,
+                }
+            })
+            .collect();
+
+        ManagerSnapshot {
+            entries: snapshots,
             current_id,
-            total: entries.len(),
+            total,
             available,
         }
     }
@@ -2939,5 +3011,39 @@ mod tests {
         assert!(manager.rpm_wait_for_slot(Some("claude-sonnet-4"), now).is_some());
         // Opus 窗口为空 → 无需等待
         assert_eq!(manager.rpm_wait_for_slot(Some("claude-opus-4"), now), None);
+    }
+
+    #[test]
+    fn test_snapshot_exposes_rpm_window_counts_and_limits() {
+        // 配置各类别上限，记录若干请求，确认 snapshot 暴露的窗口计数与上限正确
+        let mut config = Config::default();
+        config.credential_rpm = 0;
+        config.credential_rpm_opus = Some(5);
+        config.credential_rpm_sonnet = Some(15);
+
+        let mut cred = KiroCredentials::default();
+        cred.access_token = Some("t0".to_string());
+        cred.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
+        let manager = MultiTokenManager::new(config, vec![cred], None, None, false).unwrap();
+
+        let now = Instant::now();
+        {
+            let mut entries = manager.entries.lock();
+            for _ in 0..2 {
+                entries[0].record_request(ModelClass::Opus, now);
+            }
+            entries[0].record_request(ModelClass::Sonnet, now);
+        }
+
+        let snap = manager.snapshot();
+        let item = &snap.entries[0];
+        assert_eq!(item.rpm.counts.opus, 2);
+        assert_eq!(item.rpm.counts.sonnet, 1);
+        assert_eq!(item.rpm.counts.haiku, 0);
+        assert_eq!(item.rpm.limit_opus, 5);
+        assert_eq!(item.rpm.limit_sonnet, 15);
+        // haiku/other 未单独配置且通用值为 0 → 不限制
+        assert_eq!(item.rpm.limit_haiku, 0);
+        assert_eq!(item.rpm.limit_other, 0);
     }
 }
