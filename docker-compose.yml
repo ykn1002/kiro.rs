@@ -2,7 +2,7 @@ services:
   kiro-rs:
     # 使用国内镜像
     # image: ghcr.nju.edu.cn/${IMAGE_OWNER:-hank9999}/kiro-rs:${IMAGE_TAG:-latest}
-    # docker build -t ghcr.io/hank9999/kiro-rs:latest .
+    # build: docker build -t ghcr.io/hank9999/kiro-rs:latest .
     image: ghcr.io/${IMAGE_OWNER:-hank9999}/kiro-rs:${IMAGE_TAG:-latest}
     container_name: kiro-rs
     extra_hosts:
