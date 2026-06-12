@@ -57,6 +57,7 @@ pub fn create_router_with_provider(
     // 需要认证的 /cc/v1 路由（Claude Code 兼容端点）
     // 与 /v1 的区别：流式响应会等待 contextUsageEvent 后再发送 message_start
     let cc_v1_routes = Router::new()
+        .route("/models", get(get_models))
         .route("/messages", post(post_messages_cc))
         .route("/messages/count_tokens", post(count_tokens))
         .layer(middleware::from_fn_with_state(
