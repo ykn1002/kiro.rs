@@ -198,6 +198,9 @@ impl KiroProvider {
                 return Ok(response);
             }
 
+            // 在消费 body 前提取 Retry-After（429 限流时上游可能指示等待时长）
+            let retry_after = Self::parse_retry_after(response.headers());
+
             // 失败响应
             let body = response.text().await.unwrap_or_default();
 
@@ -248,7 +251,13 @@ impl KiroProvider {
                 );
                 last_error = Some(anyhow::anyhow!("MCP 请求失败: {} {}", status, body));
                 if attempt + 1 < max_retries {
-                    sleep(Self::retry_delay(attempt)).await;
+                    // 429 限流走专用指数退避（优先 Retry-After），其余瞬态错误走默认退避
+                    let delay = if status.as_u16() == 429 {
+                        Self::rate_limit_delay(attempt, retry_after)
+                    } else {
+                        Self::retry_delay(attempt)
+                    };
+                    sleep(delay).await;
                 }
                 continue;
             }
@@ -357,6 +366,9 @@ impl KiroProvider {
                 return Ok(response);
             }
 
+            // 在消费 body 前提取 Retry-After（429 限流时上游可能指示等待时长）
+            let retry_after = Self::parse_retry_after(response.headers());
+
             // 失败响应：读取 body 用于日志/错误信息
             let body = response.text().await.unwrap_or_default();
 
@@ -451,7 +463,13 @@ impl KiroProvider {
                     body
                 ));
                 if attempt + 1 < max_retries {
-                    sleep(Self::retry_delay(attempt)).await;
+                    // 429 限流走专用指数退避（优先 Retry-After），其余瞬态错误走默认退避
+                    let delay = if status.as_u16() == 429 {
+                        Self::rate_limit_delay(attempt, retry_after)
+                    } else {
+                        Self::retry_delay(attempt)
+                    };
+                    sleep(delay).await;
                 }
                 continue;
             }
@@ -512,6 +530,43 @@ impl KiroProvider {
         const MAX_MS: u64 = 2_000;
         let exp = BASE_MS.saturating_mul(2u64.saturating_pow(attempt.min(6) as u32));
         let backoff = exp.min(MAX_MS);
+        let jitter_max = (backoff / 4).max(1);
+        let jitter = fastrand::u64(0..=jitter_max);
+        Duration::from_millis(backoff.saturating_add(jitter))
+    }
+
+    /// 解析 `Retry-After` 响应头
+    ///
+    /// 仅支持「整数秒」格式（429 限流场景最常见），HTTP-date 格式返回 None
+    /// 由调用方回退到指数退避。
+    fn parse_retry_after(headers: &reqwest::header::HeaderMap) -> Option<Duration> {
+        let value = headers
+            .get(reqwest::header::RETRY_AFTER)?
+            .to_str()
+            .ok()?
+            .trim();
+        let secs = value.parse::<u64>().ok()?;
+        Some(Duration::from_secs(secs))
+    }
+
+    /// 429 限流专用退避策略
+    ///
+    /// 关键点：429 时不要立即重试，使用指数退避避免「重试风暴」。
+    /// - 若上游返回 `Retry-After`，优先采用（并设上限避免请求长时间挂起）
+    /// - 否则使用更激进的指数退避（1s → 2s → 4s … 上限 30s）+ 抖动
+    ///   抖动用于打散并发请求的重试时刻，避免惊群（thundering herd）。
+    fn rate_limit_delay(attempt: usize, retry_after: Option<Duration>) -> Duration {
+        const CAP_MS: u64 = 30_000;
+
+        if let Some(ra) = retry_after {
+            let capped = ra.min(Duration::from_millis(CAP_MS));
+            let jitter = Duration::from_millis(fastrand::u64(0..=250));
+            return capped.saturating_add(jitter);
+        }
+
+        const BASE_MS: u64 = 1_000;
+        let exp = BASE_MS.saturating_mul(2u64.saturating_pow(attempt.min(6) as u32));
+        let backoff = exp.min(CAP_MS);
         let jitter_max = (backoff / 4).max(1);
         let jitter = fastrand::u64(0..=jitter_max);
         Duration::from_millis(backoff.saturating_add(jitter))

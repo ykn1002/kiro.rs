@@ -91,6 +91,25 @@ pub struct Config {
     #[serde(default = "default_load_balancing_mode")]
     pub load_balancing_mode: String,
 
+    /// 单凭据目标 RPM（每分钟请求数），用于凭据级节流/分流
+    ///
+    /// 当某个凭据在最近 60 秒内的请求数达到该值时，会在凭据选择时被跳过，
+    /// 请求会被分流到其他可用凭据。`0` 或未配置表示不限制（使用内置默认策略）。
+    ///
+    /// 作为未匹配到 Opus/Sonnet 专用限制时的兜底值。
+    #[serde(default)]
+    pub credential_rpm: u32,
+
+    /// 单凭据 Opus 模型专用 RPM，未配置时回退到 `credential_rpm`
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub credential_rpm_opus: Option<u32>,
+
+    /// 单凭据 Sonnet 模型专用 RPM，未配置时回退到 `credential_rpm`
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub credential_rpm_sonnet: Option<u32>,
+
     /// 是否开启非流式响应的 thinking 块提取（默认 true）
     ///
     /// 启用后，非流式响应中的 `<thinking>...</thinking>` 标签会被解析为
@@ -181,6 +200,9 @@ impl Default for Config {
             proxy_password: None,
             admin_api_key: None,
             load_balancing_mode: default_load_balancing_mode(),
+            credential_rpm: 0,
+            credential_rpm_opus: None,
+            credential_rpm_sonnet: None,
             extract_thinking: default_extract_thinking(),
             default_endpoint: default_endpoint(),
             endpoints: HashMap::new(),

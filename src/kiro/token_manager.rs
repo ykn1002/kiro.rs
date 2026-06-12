@@ -414,6 +414,108 @@ struct CredentialEntry {
     success_count: u64,
     /// 最后一次 API 调用时间（RFC3339 格式）
     last_used_at: Option<String>,
+    /// 按模型类别分别记录最近 60 秒内的请求时间戳（用于凭据级 RPM 节流，滑动窗口）
+    request_times: ModelRequestTimes,
+}
+
+/// 模型类别，用于区分 Opus / Sonnet 的独立 RPM 限制
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ModelClass {
+    Opus,
+    Sonnet,
+    /// 其他模型（如 Haiku），使用通用 `credential_rpm`
+    Other,
+}
+
+impl ModelClass {
+    /// 根据模型名称推断类别
+    fn from_model(model: Option<&str>) -> Self {
+        match model {
+            Some(m) => {
+                let lower = m.to_lowercase();
+                if lower.contains("opus") {
+                    ModelClass::Opus
+                } else if lower.contains("sonnet") {
+                    ModelClass::Sonnet
+                } else {
+                    ModelClass::Other
+                }
+            }
+            None => ModelClass::Other,
+        }
+    }
+
+    /// 取得该类别在配置中的有效 RPM 上限（Opus/Sonnet 未配置时回退到通用值）
+    fn effective_rpm(&self, config: &Config) -> u32 {
+        match self {
+            ModelClass::Opus => config.credential_rpm_opus.unwrap_or(config.credential_rpm),
+            ModelClass::Sonnet => config
+                .credential_rpm_sonnet
+                .unwrap_or(config.credential_rpm),
+            ModelClass::Other => config.credential_rpm,
+        }
+    }
+}
+
+/// 按模型类别维护的请求时间戳滑动窗口
+#[derive(Default)]
+struct ModelRequestTimes {
+    opus: std::collections::VecDeque<Instant>,
+    sonnet: std::collections::VecDeque<Instant>,
+    other: std::collections::VecDeque<Instant>,
+}
+
+impl ModelRequestTimes {
+    fn window_mut(&mut self, class: ModelClass) -> &mut std::collections::VecDeque<Instant> {
+        match class {
+            ModelClass::Opus => &mut self.opus,
+            ModelClass::Sonnet => &mut self.sonnet,
+            ModelClass::Other => &mut self.other,
+        }
+    }
+
+    fn window(&self, class: ModelClass) -> &std::collections::VecDeque<Instant> {
+        match class {
+            ModelClass::Opus => &self.opus,
+            ModelClass::Sonnet => &self.sonnet,
+            ModelClass::Other => &self.other,
+        }
+    }
+}
+
+impl CredentialEntry {
+    /// 清理指定类别滑动窗口中超过 60 秒的请求时间戳
+    fn prune_request_times(&mut self, class: ModelClass, now: Instant) {
+        let window = StdDuration::from_secs(60);
+        let times = self.request_times.window_mut(class);
+        while let Some(&front) = times.front() {
+            if now.duration_since(front) >= window {
+                times.pop_front();
+            } else {
+                break;
+            }
+        }
+    }
+
+    /// 判断该凭据在指定模型类别下是否已达到 RPM 上限（rpm 为 0 表示不限制）
+    fn is_rpm_exceeded(&mut self, class: ModelClass, rpm: u32, now: Instant) -> bool {
+        if rpm == 0 {
+            return false;
+        }
+        self.prune_request_times(class, now);
+        self.request_times.window_mut(class).len() as u32 >= rpm
+    }
+
+    /// 记录一次指定模型类别的请求（用于 RPM 滑动窗口统计）
+    fn record_request(&mut self, class: ModelClass, now: Instant) {
+        self.prune_request_times(class, now);
+        self.request_times.window_mut(class).push_back(now);
+    }
+
+    /// 只读获取指定类别当前窗口内的请求数（调用前应已 prune）
+    fn request_times_len(&self, class: ModelClass) -> usize {
+        self.request_times.window(class).len()
+    }
 }
 
 /// 禁用原因
@@ -599,6 +701,7 @@ impl MultiTokenManager {
                     },
                     success_count: 0,
                     last_used_at: None,
+                    request_times: ModelRequestTimes::default(),
                 }
             })
             .collect();
@@ -695,27 +798,52 @@ impl MultiTokenManager {
     /// # 参数
     /// - `model`: 可选的模型名称，用于过滤支持该模型的凭据（如 opus 模型需要付费订阅）
     fn select_next_credential(&self, model: Option<&str>) -> Option<(u64, KiroCredentials)> {
-        let entries = self.entries.lock();
+        let mut entries = self.entries.lock();
 
         // 检查是否是 opus 模型
         let is_opus = model
             .map(|m| m.to_lowercase().contains("opus"))
             .unwrap_or(false);
 
-        // 过滤可用凭据
-        let available: Vec<_> = entries
-            .iter()
-            .filter(|e| {
-                if e.disabled {
-                    return false;
-                }
-                // 如果是 opus 模型，需要检查订阅等级
-                if is_opus && !e.credentials.supports_opus() {
-                    return false;
-                }
-                true
-            })
-            .collect();
+        // RPM 节流：按模型类别取有效上限，并清理对应类别的滑动窗口
+        let class = ModelClass::from_model(model);
+        let rpm = class.effective_rpm(&self.config);
+        let now = Instant::now();
+        if rpm > 0 {
+            for e in entries.iter_mut() {
+                e.prune_request_times(class, now);
+            }
+        }
+
+        // 基础可用过滤（禁用状态 / opus 订阅）
+        let base_available = |e: &&CredentialEntry| -> bool {
+            if e.disabled {
+                return false;
+            }
+            // 如果是 opus 模型，需要检查订阅等级
+            if is_opus && !e.credentials.supports_opus() {
+                return false;
+            }
+            true
+        };
+
+        // 优先选择该模型类别下未达到 RPM 上限的凭据；若全部达到上限则回退到全部可用凭据，
+        // 避免因节流导致请求直接失败（节流的目的是分流而非拒绝）。
+        let available: Vec<&CredentialEntry> = {
+            let not_capped: Vec<&CredentialEntry> = entries
+                .iter()
+                .filter(|e| base_available(e))
+                .filter(|e| {
+                    rpm == 0 || (e.request_times_len(class) as u32) < rpm
+                })
+                .collect();
+
+            if !not_capped.is_empty() {
+                not_capped
+            } else {
+                entries.iter().filter(|e| base_available(e)).collect()
+            }
+        };
 
         if available.is_empty() {
             return None;
@@ -774,12 +902,22 @@ impl MultiTokenManager {
                 let current_hit = if is_balanced {
                     None
                 } else {
-                    let entries = self.entries.lock();
+                    let class = ModelClass::from_model(model);
+                    let rpm = class.effective_rpm(&self.config);
+                    let now = Instant::now();
+                    let mut entries = self.entries.lock();
                     let current_id = *self.current_id.lock();
                     entries
-                        .iter()
+                        .iter_mut()
                         .find(|e| e.id == current_id && !e.disabled)
-                        .map(|e| (e.id, e.credentials.clone()))
+                        // 当前凭据达到该模型类别 RPM 上限时返回 None，触发下方分流选择
+                        .and_then(|e| {
+                            if e.is_rpm_exceeded(class, rpm, now) {
+                                None
+                            } else {
+                                Some((e.id, e.credentials.clone()))
+                            }
+                        })
                 };
 
                 if let Some(hit) = current_hit {
@@ -828,6 +966,15 @@ impl MultiTokenManager {
             // 尝试获取/刷新 Token
             match self.try_ensure_token(id, &credentials).await {
                 Ok(ctx) => {
+                    // 记录一次请求，用于凭据级 RPM 滑动窗口统计（按模型类别）
+                    let class = ModelClass::from_model(model);
+                    if class.effective_rpm(&self.config) > 0 {
+                        let now = Instant::now();
+                        let mut entries = self.entries.lock();
+                        if let Some(entry) = entries.iter_mut().find(|e| e.id == ctx.id) {
+                            entry.record_request(class, now);
+                        }
+                    }
                     return Ok(ctx);
                 }
                 Err(e) => {
@@ -1757,6 +1904,7 @@ impl MultiTokenManager {
                 disabled_reason: None,
                 success_count: 0,
                 last_used_at: None,
+                request_times: ModelRequestTimes::default(),
             });
         }
 
