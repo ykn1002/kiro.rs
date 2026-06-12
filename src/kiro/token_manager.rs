@@ -879,6 +879,50 @@ impl MultiTokenManager {
         }
     }
 
+    /// 当所有基础可用凭据都已达到该模型类别的 RPM 上限时，返回距离最早一个请求
+    /// 滑出 60 秒窗口的等待时长；只要有任一可用凭据尚有空位则返回 None（无需等待）。
+    ///
+    /// 仅基于「禁用状态 / opus 订阅」做基础可用过滤，与 `select_next_credential`
+    /// 的过滤口径保持一致。无任何可用凭据时返回 None，把"全灭"交给后续报错逻辑处理。
+    fn rpm_wait_for_slot(&self, model: Option<&str>, now: Instant) -> Option<StdDuration> {
+        let class = ModelClass::from_model(model);
+        let rpm = class.effective_rpm(&self.config);
+        if rpm == 0 {
+            return None;
+        }
+        let is_opus = model
+            .map(|m| m.to_lowercase().contains("opus"))
+            .unwrap_or(false);
+
+        let mut entries = self.entries.lock();
+        let window = StdDuration::from_secs(60);
+        let mut min_wait: Option<StdDuration> = None;
+        let mut any_available = false;
+
+        for e in entries.iter_mut() {
+            if e.disabled || (is_opus && !e.credentials.supports_opus()) {
+                continue;
+            }
+            any_available = true;
+            e.prune_request_times(class, now);
+            if (e.request_times_len(class) as u32) < rpm {
+                // 该凭据尚有空位，无需等待
+                return None;
+            }
+            // 已满：取窗口内最早一个时间戳，算出其滑出窗口所需时间
+            if let Some(&front) = e.request_times.window(class).front() {
+                let wait = window.saturating_sub(now.duration_since(front));
+                min_wait = Some(min_wait.map_or(wait, |w| w.min(wait)));
+            }
+        }
+
+        if any_available {
+            min_wait
+        } else {
+            None
+        }
+    }
+
     /// 获取 API 调用上下文
     ///
     /// 返回绑定了 id、credentials 和 token 的调用上下文
@@ -901,6 +945,22 @@ impl MultiTokenManager {
                     self.available_count(),
                     total
                 );
+            }
+
+            // 凭据级 RPM 平滑：当所有可用凭据都已打满该模型类别的 RPM 上限时，
+            // 等待最早一个槽位滑出 60s 窗口再放行（最多等待 credential_rpm_max_wait_ms）。
+            // 主要服务于单凭据场景——此时 RPM 上限本会被回退放行而形同虚设。
+            // 等满上限后仍走原有 fallback 放行，保证不会无限阻塞。
+            let max_wait_ms = self.config.credential_rpm_max_wait_ms;
+            if max_wait_ms > 0 {
+                let now = Instant::now();
+                if let Some(wait) = self.rpm_wait_for_slot(model, now) {
+                    let wait = wait.min(StdDuration::from_millis(max_wait_ms));
+                    if !wait.is_zero() {
+                        tracing::debug!("所有可用凭据已达 RPM 上限，等待 {:?} 后放行", wait);
+                        tokio::time::sleep(wait).await;
+                    }
+                }
             }
 
             let (id, credentials) = {
@@ -2752,5 +2812,132 @@ mod tests {
 
         assert_eq!(credentials.effective_auth_region(&config), "auth-only");
         assert_eq!(credentials.effective_api_region(&config), "api-only");
+    }
+
+    /// 构造一个带 N 个有效凭据的 manager，便于 RPM 等待相关测试
+    fn make_manager_with_rpm(n: usize, rpm: u32, max_wait_ms: u64) -> MultiTokenManager {
+        let mut config = Config::default();
+        config.credential_rpm = rpm;
+        config.credential_rpm_max_wait_ms = max_wait_ms;
+
+        let creds: Vec<KiroCredentials> = (0..n)
+            .map(|i| {
+                let mut c = KiroCredentials::default();
+                c.priority = i as u32;
+                c.access_token = Some(format!("t{}", i));
+                c.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
+                c
+            })
+            .collect();
+
+        MultiTokenManager::new(config, creds, None, None, false).unwrap()
+    }
+
+    #[test]
+    fn test_rpm_wait_for_slot_disabled_when_rpm_zero() {
+        // rpm = 0 表示不限制，永远不应等待
+        let manager = make_manager_with_rpm(1, 0, 3000);
+        assert_eq!(manager.rpm_wait_for_slot(None, Instant::now()), None);
+    }
+
+    #[test]
+    fn test_rpm_wait_for_slot_has_free_slot() {
+        // 单凭据 rpm=5，仅记录 2 次请求 → 仍有空位，无需等待
+        let manager = make_manager_with_rpm(1, 5, 3000);
+        let now = Instant::now();
+        {
+            let mut entries = manager.entries.lock();
+            for _ in 0..2 {
+                entries[0].record_request(ModelClass::Other, now);
+            }
+        }
+        assert_eq!(manager.rpm_wait_for_slot(None, now), None);
+    }
+
+    #[test]
+    fn test_rpm_wait_for_slot_single_credential_full() {
+        // 单凭据 rpm=3，窗口打满 → 应返回一个 (0, 60s] 区间内的等待时长
+        let manager = make_manager_with_rpm(1, 3, 3000);
+        let now = Instant::now();
+        {
+            let mut entries = manager.entries.lock();
+            for _ in 0..3 {
+                entries[0].record_request(ModelClass::Other, now);
+            }
+        }
+        let wait = manager.rpm_wait_for_slot(None, now);
+        assert!(wait.is_some(), "单凭据打满时应返回等待时长");
+        let wait = wait.unwrap();
+        assert!(
+            wait > StdDuration::ZERO && wait <= StdDuration::from_secs(60),
+            "等待时长应落在 (0, 60s]，实际: {:?}",
+            wait
+        );
+    }
+
+    #[test]
+    fn test_rpm_wait_for_slot_multi_credential_one_has_slot() {
+        // 两个凭据 rpm=2：一个打满、一个有空位 → 不应等待（分流到有空位的那个）
+        let manager = make_manager_with_rpm(2, 2, 3000);
+        let now = Instant::now();
+        {
+            let mut entries = manager.entries.lock();
+            for _ in 0..2 {
+                entries[0].record_request(ModelClass::Other, now);
+            }
+            // entries[1] 留空
+        }
+        assert_eq!(manager.rpm_wait_for_slot(None, now), None);
+    }
+
+    #[test]
+    fn test_rpm_wait_for_slot_all_credentials_full() {
+        // 两个凭据 rpm=2，全部打满 → 应返回等待时长
+        let manager = make_manager_with_rpm(2, 2, 3000);
+        let now = Instant::now();
+        {
+            let mut entries = manager.entries.lock();
+            for e in entries.iter_mut() {
+                for _ in 0..2 {
+                    e.record_request(ModelClass::Other, now);
+                }
+            }
+        }
+        assert!(
+            manager.rpm_wait_for_slot(None, now).is_some(),
+            "所有凭据打满时应返回等待时长"
+        );
+    }
+
+    #[test]
+    fn test_rpm_wait_for_slot_no_available_credential() {
+        // 唯一凭据被禁用 → 无可用凭据，返回 None（交给后续报错逻辑，而非阻塞等待）
+        let manager = make_manager_with_rpm(1, 3, 3000);
+        let now = Instant::now();
+        {
+            let mut entries = manager.entries.lock();
+            for _ in 0..3 {
+                entries[0].record_request(ModelClass::Other, now);
+            }
+            entries[0].disabled = true;
+        }
+        assert_eq!(manager.rpm_wait_for_slot(None, now), None);
+    }
+
+    #[test]
+    fn test_rpm_wait_for_slot_is_per_model_class() {
+        // rpm 按模型类别独立计数：Sonnet 打满不影响 Opus 的判断
+        let manager = make_manager_with_rpm(1, 2, 3000);
+        let now = Instant::now();
+        {
+            let mut entries = manager.entries.lock();
+            for _ in 0..2 {
+                entries[0].record_request(ModelClass::Sonnet, now);
+            }
+        }
+        // Sonnet 打满 → 需要等待
+        assert!(manager.rpm_wait_for_slot(Some("claude-sonnet-4"), now).is_some());
+        // Opus 窗口为空 → 无需等待
+        assert_eq!(manager.rpm_wait_for_slot(Some("claude-opus-4"), now), None);
     }
 }

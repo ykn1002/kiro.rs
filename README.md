@@ -194,6 +194,7 @@ docker-compose up
 | `credentialRpmOpus` | number | - | 单凭据 Opus 模型专用 RPM，未配置时回退到 `credentialRpm` |
 | `credentialRpmSonnet` | number | - | 单凭据 Sonnet 模型专用 RPM，未配置时回退到 `credentialRpm` |
 | `credentialRpmHaiku` | number | - | 单凭据 Haiku 模型专用 RPM，未配置时回退到 `credentialRpm` |
+| `credentialRpmMaxWaitMs` | number | `0` | 当所有可用凭据都达到 RPM 上限时，请求发出前最多等待的毫秒数（平滑突发）。`0` 表示关闭等待，沿用"全部超限即直接分流放行"的行为。单凭据场景下尤其有用：此时 RPM 上限本会被回退放行而形同虚设，开启后可把突发压到上游限速以内、主动规避上游 429。等待发生在请求发出之前，不消耗重试次数；等满上限仍无空位时仍会 best-effort 放行，不会无限阻塞 |
 | `extractThinking` | boolean | `true` | 非流式响应的 thinking 块提取。启用后 `<thinking>` 标签会被解析为独立的 `thinking` 内容块 |
 | `defaultEndpoint` | string | `ide` | 默认 Kiro 端点。凭据未显式指定 `endpoint` 时使用。当前支持：`ide` |
 
@@ -224,7 +225,8 @@ docker-compose up
    "credentialRpm": 0,
    "credentialRpmOpus": 3,
    "credentialRpmSonnet": 10,
-   "credentialRpmHaiku": 20
+   "credentialRpmHaiku": 20,
+   "credentialRpmMaxWaitMs": 0
 }
 ```
 

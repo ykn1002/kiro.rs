@@ -9,5 +9,6 @@
   "credentialRpm": 5,
   "credentialRpmOpus": 5,
   "credentialRpmSonnet": 15,
-  "credentialRpmHaiku": 30
+  "credentialRpmHaiku": 30,
+  "credentialRpmMaxWaitMs": 5000
 }

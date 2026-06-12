@@ -115,6 +115,15 @@ pub struct Config {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub credential_rpm_haiku: Option<u32>,
 
+    /// 当所有可用凭据都达到 RPM 上限时，最多等待多少毫秒再放行（而非立即突发）。
+    ///
+    /// `0`（默认）表示关闭等待，沿用原有"全部超限即直接分流放行"的行为。
+    /// 单凭据场景下尤其有用：此时 RPM 上限本来形同虚设（唯一凭据超限也会被回退放行），
+    /// 开启后可把突发平滑到上游限速以内，主动规避上游 429。等待发生在请求发出之前，
+    /// 不消耗重试次数；等满上限后若仍无空位，仍会 best-effort 放行以避免无限阻塞。
+    #[serde(default)]
+    pub credential_rpm_max_wait_ms: u64,
+
     /// 是否开启非流式响应的 thinking 块提取（默认 true）
     ///
     /// 启用后，非流式响应中的 `<thinking>...</thinking>` 标签会被解析为
@@ -209,6 +218,7 @@ impl Default for Config {
             credential_rpm_opus: None,
             credential_rpm_sonnet: None,
             credential_rpm_haiku: None,
+            credential_rpm_max_wait_ms: 0,
             extract_thinking: default_extract_thinking(),
             default_endpoint: default_endpoint(),
             endpoints: HashMap::new(),
