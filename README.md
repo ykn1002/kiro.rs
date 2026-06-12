@@ -35,7 +35,7 @@
 - **流式响应**: 支持 SSE (Server-Sent Events) 流式输出
 - **Token 自动刷新**: 自动管理和刷新 OAuth Token
 - **多凭据支持**: 支持配置多个凭据，按优先级自动故障转移
-- **负载均衡**: 支持 `priority`（按优先级）和 `balanced`（均衡分配）两种模式
+- **负载均衡**: 支持 `priority`（按优先级）、`balanced`（按累计成功数均衡）和 `round-robin`（真·轮询，不看使用次数）三种模式
 - **智能重试**: 单凭据最多重试 3 次，单请求最多重试 9 次
 - **凭据回写**: 多凭据格式下自动回写刷新后的 Token
 - **Thinking 模式**: 支持 Claude 的 extended thinking 功能
@@ -189,7 +189,7 @@ docker-compose up
 | `proxyUsername` | string | - | 代理用户名 |
 | `proxyPassword` | string | - | 代理密码 |
 | `adminApiKey` | string | - | Admin API 密钥，配置后启用凭据管理 API 和 Web 管理界面 |
-| `loadBalancingMode` | string | `priority` | 负载均衡模式：`priority`（按优先级）或 `balanced`（均衡分配） |
+| `loadBalancingMode` | string | `priority` | 负载均衡模式：`priority`（按优先级，主备式黏住最高优先级凭据）、`balanced`（按累计成功数 least-used 均衡）或 `round-robin`（真·轮询，在可用凭据间严格依次轮转，不看使用次数） |
 | `credentialRpm` | number | `0` | 单凭据目标 RPM（每分钟请求数），用于凭据级节流/分流；某凭据在最近 60 秒内请求数达到该值时会在选择时被跳过并分流到其他凭据；`0` 或未配置表示不限制。作为 Opus/Sonnet 未单独配置时的兜底值 |
 | `credentialRpmOpus` | number | - | 单凭据 Opus 模型专用 RPM，未配置时回退到 `credentialRpm` |
 | `credentialRpmSonnet` | number | - | 单凭据 Sonnet 模型专用 RPM，未配置时回退到 `credentialRpm` |
@@ -312,6 +312,13 @@ docker-compose up
 - 单凭据最多重试 3 次，单请求最多重试 9 次
 - 自动故障转移到下一个可用凭据
 - 多凭据格式下 Token 刷新后自动回写到源文件
+
+负载均衡模式（`loadBalancingMode`，可在 config 配置或 Admin UI 运行时切换）：
+- `priority`（默认）：主备式，始终使用优先级最高（priority 最小）的凭据，仅当其被禁用、额度用尽或撞上 RPM 上限时才故障转移到下一个。**同级凭据是主备关系，不会分摊负载。**
+- `balanced`：least-used，每次请求选累计成功次数（`success_count`）最少的凭据。注意成功计数会持久化到 `kiro_stats.json` 并跨重启加载，因此切换初期会偏向历史计数低的凭据。
+- `round-robin`：真·轮询，在可用凭据间按 `(priority, id)` 顺序严格依次轮转，**完全不看使用次数**，低流量下也能均匀分摊。
+
+> 三种模式的候选集都会先过滤掉禁用 / 不支持 Opus 订阅 / 已达 RPM 上限的凭据。
 
 ### Region 配置
 

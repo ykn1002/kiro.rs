@@ -14,6 +14,7 @@ import { KamImportDialog } from '@/components/kam-import-dialog'
 import { BatchVerifyDialog, type VerifyResult } from '@/components/batch-verify-dialog'
 import { useCredentials, useDeleteCredential, useResetFailure, useLoadBalancingMode, useSetLoadBalancingMode } from '@/hooks/use-credentials'
 import { getCredentialBalance, forceRefreshToken } from '@/api/credentials'
+import type { LoadBalancingMode } from '@/api/credentials'
 import { extractErrorMessage } from '@/lib/utils'
 import type { BalanceResponse } from '@/types/api'
 
@@ -491,15 +492,24 @@ export function Dashboard({ onLogout }: DashboardProps) {
     setVerifying(false)
   }
 
-  // 切换负载均衡模式
+  // 切换负载均衡模式（三态循环：priority → balanced → round-robin → priority）
   const handleToggleLoadBalancing = () => {
     const currentMode = loadBalancingData?.mode || 'priority'
-    const newMode = currentMode === 'priority' ? 'balanced' : 'priority'
+    const nextModeMap: Record<string, LoadBalancingMode> = {
+      priority: 'balanced',
+      balanced: 'round-robin',
+      'round-robin': 'priority',
+    }
+    const newMode: LoadBalancingMode = nextModeMap[currentMode] ?? 'priority'
+    const modeNameMap: Record<string, string> = {
+      priority: '优先级模式',
+      balanced: '均衡负载模式',
+      'round-robin': '轮询模式',
+    }
 
     setLoadBalancingMode(newMode, {
       onSuccess: () => {
-        const modeName = newMode === 'priority' ? '优先级模式' : '均衡负载模式'
-        toast.success(`已切换到${modeName}`)
+        toast.success(`已切换到${modeNameMap[newMode] ?? newMode}`)
       },
       onError: (error) => {
         toast.error(`切换失败: ${extractErrorMessage(error)}`)
@@ -552,7 +562,11 @@ export function Dashboard({ onLogout }: DashboardProps) {
               disabled={isLoadingMode || isSettingMode}
               title="切换负载均衡模式"
             >
-              {isLoadingMode ? '加载中...' : (loadBalancingData?.mode === 'priority' ? '优先级模式' : '均衡负载')}
+              {isLoadingMode ? '加载中...' : (
+                loadBalancingData?.mode === 'priority' ? '优先级模式'
+                  : loadBalancingData?.mode === 'round-robin' ? '轮询模式'
+                  : '均衡负载'
+              )}
             </Button>
             <Button variant="ghost" size="icon" onClick={toggleDarkMode}>
               {darkMode ? <Sun className="h-5 w-5" /> : <Moon className="h-5 w-5" />}

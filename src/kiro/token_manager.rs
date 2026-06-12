@@ -13,7 +13,7 @@ use tokio::sync::Mutex as TokioMutex;
 use std::collections::HashMap;
 use std::fmt;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration as StdDuration, Instant};
 
 use crate::http_client::{ProxyConfig, build_client};
@@ -681,6 +681,8 @@ pub struct MultiTokenManager {
     is_multiple_format: bool,
     /// 负载均衡模式（运行时可修改）
     load_balancing_mode: Mutex<String>,
+    /// round-robin 模式的轮转游标（单调递增，对可用凭据取模）
+    round_robin_cursor: AtomicU64,
     /// 最近一次统计持久化时间（用于 debounce）
     last_stats_save_at: Mutex<Option<Instant>>,
     /// 统计数据是否有未落盘更新
@@ -813,6 +815,7 @@ impl MultiTokenManager {
             credentials_path,
             is_multiple_format,
             load_balancing_mode: Mutex::new(load_balancing_mode),
+            round_robin_cursor: AtomicU64::new(0),
             last_stats_save_at: Mutex::new(None),
             stats_dirty: AtomicBool::new(false),
         };
@@ -919,6 +922,18 @@ impl MultiTokenManager {
 
                 Some((entry.id, entry.credentials.clone()))
             }
+            "round-robin" => {
+                // 真·轮询：不看使用次数，在可用候选中按稳定顺序逐个轮转。
+                // 先按 (priority, id) 排序保证候选顺序稳定（不受 entries 内部顺序/RPM 过滤抖动影响），
+                // 再用单调递增的游标对候选数取模，确保连续请求依次落到不同凭据。
+                let mut ordered: Vec<&CredentialEntry> = available.clone();
+                ordered.sort_by_key(|e| (e.credentials.priority, e.id));
+                let n = ordered.len() as u64;
+                // fetch_add 返回旧值，对当前候选数取模得到本次索引
+                let idx = (self.round_robin_cursor.fetch_add(1, Ordering::Relaxed) % n) as usize;
+                let entry = ordered[idx];
+                Some((entry.id, entry.credentials.clone()))
+            }
             _ => {
                 // priority 模式（默认）：选择优先级最高的
                 let entry = available.iter().min_by_key(|e| e.credentials.priority)?;
@@ -1016,11 +1031,14 @@ impl MultiTokenManager {
             }
 
             let (id, credentials) = {
-                let is_balanced = self.load_balancing_mode.lock().as_str() == "balanced";
-
-                // balanced 模式：每次请求都重新均衡选择，不固定 current_id
+                // balanced / round-robin 模式：每次请求都重新选择，不固定 current_id
                 // priority 模式：优先使用 current_id 指向的凭据
-                let current_hit = if is_balanced {
+                let reselect_each_time = matches!(
+                    self.load_balancing_mode.lock().as_str(),
+                    "balanced" | "round-robin"
+                );
+
+                let current_hit = if reselect_each_time {
                     None
                 } else {
                     let class = ModelClass::from_model(model);
@@ -2191,7 +2209,7 @@ impl MultiTokenManager {
     /// 设置负载均衡模式（Admin API）
     pub fn set_load_balancing_mode(&self, mode: String) -> anyhow::Result<()> {
         // 验证模式值
-        if mode != "priority" && mode != "balanced" {
+        if mode != "priority" && mode != "balanced" && mode != "round-robin" {
             anyhow::bail!("无效的负载均衡模式: {}", mode);
         }
 
@@ -2437,6 +2455,101 @@ mod tests {
             MultiTokenManager::new(config, vec![cred1, cred2], None, None, false).unwrap();
         assert_eq!(manager.total_count(), 2);
         assert_eq!(manager.available_count(), 2);
+    }
+
+    #[test]
+    fn test_select_next_credential_round_robin_cycles_in_order() {
+        let mut config = Config::default();
+        config.load_balancing_mode = "round-robin".to_string();
+
+        // 三个凭据，priority 故意打乱（2,0,1），轮询应按 (priority, id) 稳定顺序轮转
+        let mut cred_a = KiroCredentials::default();
+        cred_a.priority = 2;
+        let mut cred_b = KiroCredentials::default();
+        cred_b.priority = 0;
+        let mut cred_c = KiroCredentials::default();
+        cred_c.priority = 1;
+
+        let manager =
+            MultiTokenManager::new(config, vec![cred_a, cred_b, cred_c], None, None, false)
+                .unwrap();
+
+        // 凭据 id 按输入顺序分配为 1(prio2)、2(prio0)、3(prio1)
+        // 排序后顺序应为 id=2(prio0) → id=3(prio1) → id=1(prio2)
+        let picks: Vec<u64> = (0..6)
+            .map(|_| manager.select_next_credential(None).unwrap().0)
+            .collect();
+
+        assert_eq!(picks, vec![2, 3, 1, 2, 3, 1], "轮询应按 (priority, id) 顺序循环");
+    }
+
+    #[test]
+    fn test_select_next_credential_round_robin_ignores_success_count() {
+        let mut config = Config::default();
+        config.load_balancing_mode = "round-robin".to_string();
+
+        let cred1 = KiroCredentials::default();
+        let cred2 = KiroCredentials::default();
+
+        let manager =
+            MultiTokenManager::new(config, vec![cred1, cred2], None, None, false).unwrap();
+
+        // 人为把 id=1 的成功次数拉高：balanced 会回避它，但 round-robin 应无视
+        {
+            let mut entries = manager.entries.lock();
+            if let Some(e) = entries.iter_mut().find(|e| e.id == 1) {
+                e.success_count = 9999;
+            }
+        }
+
+        let picks: Vec<u64> = (0..4)
+            .map(|_| manager.select_next_credential(None).unwrap().0)
+            .collect();
+        // 严格交替，不受 success_count 影响
+        assert_eq!(picks, vec![1, 2, 1, 2]);
+    }
+
+    #[test]
+    fn test_select_next_credential_round_robin_skips_disabled() {
+        let mut config = Config::default();
+        config.load_balancing_mode = "round-robin".to_string();
+
+        let cred1 = KiroCredentials::default();
+        let cred2 = KiroCredentials::default();
+        let cred3 = KiroCredentials::default();
+
+        let manager =
+            MultiTokenManager::new(config, vec![cred1, cred2, cred3], None, None, false).unwrap();
+
+        // 禁用 id=2，轮询应只在 id=1 和 id=3 间循环
+        {
+            let mut entries = manager.entries.lock();
+            if let Some(e) = entries.iter_mut().find(|e| e.id == 2) {
+                e.disabled = true;
+            }
+        }
+
+        let picks: Vec<u64> = (0..4)
+            .map(|_| manager.select_next_credential(None).unwrap().0)
+            .collect();
+        assert!(
+            picks.iter().all(|&id| id == 1 || id == 3),
+            "被禁用的 id=2 不应被选中，实际: {:?}",
+            picks
+        );
+        // 两个可用凭据都应出现
+        assert!(picks.contains(&1) && picks.contains(&3));
+    }
+
+    #[test]
+    fn test_set_load_balancing_mode_accepts_round_robin() {
+        let manager =
+            MultiTokenManager::new(Config::default(), vec![KiroCredentials::default()], None, None, false)
+                .unwrap();
+        assert!(manager.set_load_balancing_mode("round-robin".to_string()).is_ok());
+        assert_eq!(manager.get_load_balancing_mode(), "round-robin");
+        // 非法模式仍应被拒绝
+        assert!(manager.set_load_balancing_mode("nonsense".to_string()).is_err());
     }
 
     #[test]
