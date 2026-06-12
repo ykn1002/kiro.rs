@@ -5,5 +5,8 @@
   "tlsBackend": "rustls",
   "region": "us-east-1",
   "adminApiKey": "sk-admin-your-secret-key",
-  "defaultEndpoint": "ide"
+  "defaultEndpoint": "ide",
+  "credentialRpm": 5,
+  "credentialRpmOpus": 5,
+  "credentialRpmSonnet": 15
 }
