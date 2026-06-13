@@ -3,6 +3,7 @@
 //! 负责将 Anthropic API 请求格式转换为 Kiro API 请求格式
 
 use std::collections::HashMap;
+use std::sync::OnceLock;
 
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
@@ -14,8 +15,55 @@ use crate::kiro::model::requests::conversation::{
 use crate::kiro::model::requests::tool::{
     InputSchema, Tool, ToolResult, ToolSpecification, ToolUseEntry,
 };
+use crate::model::config::{ModelDef, default_models};
 
 use super::types::{ContentBlock, MessagesRequest};
+
+/// 全局模型注册表，由 `main.rs` 在启动时通过 `init_model_registry` 注入配置。
+///
+/// 未初始化时（单元测试 / 直接调用 `map_model` 的场景）回退到内置默认表，
+/// 这样既无需改动 `map_model` / `get_context_window_size` 的函数签名，
+/// 也不破坏现有调用方与测试。
+static MODEL_REGISTRY: OnceLock<Vec<ModelDef>> = OnceLock::new();
+
+/// 使用配置的模型表初始化全局注册表。
+///
+/// 仅首次调用生效（`OnceLock` 语义），重复调用静默忽略。应在启动早期、
+/// 任何请求进入前调用一次。
+pub fn init_model_registry(models: Vec<ModelDef>) {
+    let _ = MODEL_REGISTRY.set(models);
+}
+
+/// 获取当前生效的模型表：已初始化用注入值，否则回退内置默认表。
+fn models() -> &'static [ModelDef] {
+    MODEL_REGISTRY.get_or_init(default_models)
+}
+
+/// 公开当前生效的模型表，供 `GET /v1/models` 生成展示列表。
+pub fn registered_models() -> &'static [ModelDef] {
+    models()
+}
+
+/// 在小写模型名中按 family + version 模糊匹配一个模型定义。
+///
+/// 复现原 `map_model` 的语义：先匹配 `family`，若条目带 `version` 则同时尝试
+/// `4-6` / `4.6` 两种写法；不带 version（如 haiku）则 family 命中即可。
+/// 按表中顺序返回首个命中项。
+fn match_model_def(model: &str) -> Option<&'static ModelDef> {
+    let model_lower = model.to_lowercase();
+    models().iter().find(|def| {
+        if !model_lower.contains(&def.family.to_lowercase()) {
+            return false;
+        }
+        match &def.version {
+            Some(v) => {
+                let dash = v.replace('.', "-");
+                model_lower.contains(&dash) || model_lower.contains(v)
+            }
+            None => true,
+        }
+    })
+}
 
 /// 规范化 JSON Schema，修复 MCP 工具定义中常见的类型问题
 ///
@@ -32,14 +80,26 @@ fn normalize_json_schema(schema: serde_json::Value) -> serde_json::Value {
     };
 
     // type（必须是字符串）
-    if !obj.get("type").and_then(|v| v.as_str()).is_some_and(|s| !s.is_empty()) {
-        obj.insert("type".to_string(), serde_json::Value::String("object".to_string()));
+    if !obj
+        .get("type")
+        .and_then(|v| v.as_str())
+        .is_some_and(|s| !s.is_empty())
+    {
+        obj.insert(
+            "type".to_string(),
+            serde_json::Value::String("object".to_string()),
+        );
     }
 
     // properties（必须是 object）
     match obj.get("properties") {
         Some(serde_json::Value::Object(_)) => {}
-        _ => { obj.insert("properties".to_string(), serde_json::Value::Object(serde_json::Map::new())); }
+        _ => {
+            obj.insert(
+                "properties".to_string(),
+                serde_json::Value::Object(serde_json::Map::new()),
+            );
+        }
     }
 
     // required（必须是 string 数组）
@@ -56,7 +116,12 @@ fn normalize_json_schema(schema: serde_json::Value) -> serde_json::Value {
     // additionalProperties（允许 bool 或 object，其他按 true 处理）
     match obj.get("additionalProperties") {
         Some(serde_json::Value::Bool(_)) | Some(serde_json::Value::Object(_)) => {}
-        _ => { obj.insert("additionalProperties".to_string(), serde_json::Value::Bool(true)); }
+        _ => {
+            obj.insert(
+                "additionalProperties".to_string(),
+                serde_json::Value::Bool(true),
+            );
+        }
     }
 
     serde_json::Value::Object(obj)
@@ -76,47 +141,20 @@ Never ask the user whether to switch approaches. \
 Complete all chunked operations without commentary.";
 
 /// 模型映射：将 Anthropic 模型名映射到 Kiro 模型 ID
-/// 严格对照版本号
+///
+/// 由全局模型注册表（配置文件 `models` 或内置默认表）驱动，按 family + version
+/// 模糊匹配。无匹配返回 None。
 pub fn map_model(model: &str) -> Option<String> {
-    let model_lower = model.to_lowercase();
-
-    if model_lower.contains("sonnet") {
-        if model_lower.contains("4-6") || model_lower.contains("4.6") {
-            Some("claude-sonnet-4.6".to_string())
-        } else if model_lower.contains("4-5") || model_lower.contains("4.5") {
-            Some("claude-sonnet-4.5".to_string())
-        } else {
-            None
-        }
-    } else if model_lower.contains("opus") {
-        if model_lower.contains("4-5") || model_lower.contains("4.5") {
-            Some("claude-opus-4.5".to_string())
-        } else if model_lower.contains("4-6") || model_lower.contains("4.6") {
-            Some("claude-opus-4.6".to_string())
-        } else if model_lower.contains("4-7") || model_lower.contains("4.7") {
-            Some("claude-opus-4.7".to_string())
-        } else if model_lower.contains("4-8") || model_lower.contains("4.8") {
-            Some("claude-opus-4.8".to_string())
-        } else {
-            None
-        }
-    } else if model_lower.contains("haiku") {
-        Some("claude-haiku-4.5".to_string())
-    } else {
-        None
-    }
+    match_model_def(model).map(|def| def.kiro_id.clone())
 }
 
 /// 根据模型名称返回对应的上下文窗口大小
 ///
-/// 复用 `map_model` 的映射逻辑，确保窗口大小判断与模型映射一致。
-/// Kiro 于 2026-03-24 将 Opus 4.6 和 Sonnet 4.6 升级至 1M 上下文。
-/// 4.7 / 4.8 同 1M
+/// 由全局模型注册表驱动；命中返回该模型的 `context_window`，未命中回退 200K。
 pub fn get_context_window_size(model: &str) -> i32 {
-    match map_model(model) {
-        Some(mapped) if mapped == "claude-sonnet-4.6" || mapped == "claude-opus-4.6" || mapped == "claude-opus-4.7" || mapped == "claude-opus-4.8" => 1_000_000,
-        _ => 200_000,
-    }
+    match_model_def(model)
+        .map(|def| def.context_window)
+        .unwrap_or(200_000)
 }
 
 /// 转换结果
@@ -323,10 +361,7 @@ pub fn convert_request(req: &MessagesRequest) -> Result<ConversionResult, Conver
         .with_history(history);
 
     if !tool_name_map.is_empty() {
-        tracing::info!(
-            "工具名称映射: {} 个超长名称已缩短",
-            tool_name_map.len()
-        );
+        tracing::info!("工具名称映射: {} 个超长名称已缩短", tool_name_map.len());
     }
 
     Ok(ConversionResult {
@@ -577,7 +612,10 @@ fn map_tool_name(name: &str, tool_name_map: &mut HashMap<String, String>) -> Str
 }
 
 /// 转换工具定义
-fn convert_tools(tools: &Option<Vec<super::types::Tool>>, tool_name_map: &mut HashMap<String, String>) -> Vec<Tool> {
+fn convert_tools(
+    tools: &Option<Vec<super::types::Tool>>,
+    tool_name_map: &mut HashMap<String, String>,
+) -> Vec<Tool> {
     let Some(tools) = tools else {
         return Vec::new();
     };
@@ -608,7 +646,9 @@ fn convert_tools(tools: &Option<Vec<super::types::Tool>>, tool_name_map: &mut Ha
                 tool_specification: ToolSpecification {
                     name: map_tool_name(&t.name, tool_name_map),
                     description,
-                    input_schema: InputSchema::from_json(normalize_json_schema(serde_json::json!(t.input_schema))),
+                    input_schema: InputSchema::from_json(normalize_json_schema(serde_json::json!(
+                        t.input_schema
+                    ))),
                 },
             }
         })
@@ -651,7 +691,12 @@ fn has_thinking_tags(content: &str) -> bool {
 ///   注意：该切片与 `req.messages` 可能不同（prefill 时会截断末尾的 assistant 消息），
 ///   调用方应始终使用此参数而非 `req.messages`。
 /// * `model_id` - 已映射的 Kiro 模型 ID
-fn build_history(req: &MessagesRequest, messages: &[super::types::Message], model_id: &str, tool_name_map: &mut HashMap<String, String>) -> Result<Vec<Message>, ConversionError> {
+fn build_history(
+    req: &MessagesRequest,
+    messages: &[super::types::Message],
+    model_id: &str,
+    tool_name_map: &mut HashMap<String, String>,
+) -> Result<Vec<Message>, ConversionError> {
     let mut history = Vec::new();
 
     // 生成thinking前缀（如果需要）
@@ -815,7 +860,8 @@ fn convert_assistant_message(
                             if let (Some(id), Some(name)) = (block.id, block.name) {
                                 let input = block.input.unwrap_or(serde_json::json!({}));
                                 let mapped_name = map_tool_name(&name, tool_name_map);
-                                tool_uses.push(ToolUseEntry::new(id, mapped_name).with_input(input));
+                                tool_uses
+                                    .push(ToolUseEntry::new(id, mapped_name).with_input(input));
                             }
                         }
                         _ => {}
@@ -901,21 +947,17 @@ mod tests {
     #[test]
     fn test_map_model_sonnet() {
         assert!(
-            map_model("claude-sonnet-4-20250514")
+            map_model("claude-sonnet-4-5-20250929")
                 .unwrap()
                 .contains("sonnet")
         );
-        assert!(
-            map_model("claude-3-5-sonnet-20241022")
-                .unwrap()
-                .contains("sonnet")
-        );
+        assert!(map_model("claude-sonnet-4-6").unwrap().contains("sonnet"));
     }
 
     #[test]
     fn test_map_model_opus() {
         assert!(
-            map_model("claude-opus-4-20250514")
+            map_model("claude-opus-4-5-20251101")
                 .unwrap()
                 .contains("opus")
         );
@@ -980,7 +1022,7 @@ mod tests {
     fn test_determine_chat_trigger_type() {
         // 无工具时返回 MANUAL
         let req = MessagesRequest {
-            model: "claude-sonnet-4".to_string(),
+            model: "claude-sonnet-4-6".to_string(),
             max_tokens: 1024,
             messages: vec![],
             stream: false,
@@ -1037,13 +1079,18 @@ mod tests {
 
     #[test]
     fn test_shorten_tool_name_deterministic() {
-        let long_name = "mcp__some_very_long_server_name__some_very_long_tool_name_that_exceeds_limit";
+        let long_name =
+            "mcp__some_very_long_server_name__some_very_long_tool_name_that_exceeds_limit";
         assert!(long_name.len() > TOOL_NAME_MAX_LEN);
 
         let short1 = shorten_tool_name(long_name);
         let short2 = shorten_tool_name(long_name);
         assert_eq!(short1, short2, "相同输入应产生相同的短名称");
-        assert!(short1.len() <= TOOL_NAME_MAX_LEN, "短名称长度应 <= 63，实际 {}", short1.len());
+        assert!(
+            short1.len() <= TOOL_NAME_MAX_LEN,
+            "短名称长度应 <= 63，实际 {}",
+            short1.len()
+        );
     }
 
     #[test]
@@ -1076,7 +1123,8 @@ mod tests {
     fn test_tool_name_mapping_in_convert_request() {
         use super::super::types::{Message as AnthropicMessage, Tool as AnthropicTool};
 
-        let long_tool_name = "mcp__plugin_very_long_server_name__extremely_long_tool_name_exceeds_63";
+        let long_tool_name =
+            "mcp__plugin_very_long_server_name__extremely_long_tool_name_exceeds_63";
         assert!(long_tool_name.len() > TOOL_NAME_MAX_LEN);
 
         let mut schema = std::collections::HashMap::new();
@@ -1084,14 +1132,12 @@ mod tests {
         schema.insert("properties".to_string(), serde_json::json!({}));
 
         let req = MessagesRequest {
-            model: "claude-sonnet-4".to_string(),
+            model: "claude-sonnet-4-6".to_string(),
             max_tokens: 1024,
-            messages: vec![
-                AnthropicMessage {
-                    role: "user".to_string(),
-                    content: serde_json::json!("test"),
-                },
-            ],
+            messages: vec![AnthropicMessage {
+                role: "user".to_string(),
+                content: serde_json::json!("test"),
+            }],
             system: None,
             stream: false,
             tools: Some(vec![AnthropicTool {
@@ -1118,8 +1164,12 @@ mod tests {
         assert!(short.len() <= TOOL_NAME_MAX_LEN);
 
         // Kiro 请求中的工具名应该是短名称
-        let tools = &result.conversation_state.current_message.user_input_message
-            .user_input_message_context.tools;
+        let tools = &result
+            .conversation_state
+            .current_message
+            .user_input_message
+            .user_input_message_context
+            .tools;
         assert_eq!(tools[0].tool_specification.name, *short);
     }
 
@@ -1127,14 +1177,15 @@ mod tests {
     fn test_tool_name_mapping_in_history() {
         use super::super::types::{Message as AnthropicMessage, Tool as AnthropicTool};
 
-        let long_tool_name = "mcp__plugin_very_long_server_name__extremely_long_tool_name_exceeds_63";
+        let long_tool_name =
+            "mcp__plugin_very_long_server_name__extremely_long_tool_name_exceeds_63";
 
         let mut schema = std::collections::HashMap::new();
         schema.insert("type".to_string(), serde_json::json!("object"));
         schema.insert("properties".to_string(), serde_json::json!({}));
 
         let req = MessagesRequest {
-            model: "claude-sonnet-4".to_string(),
+            model: "claude-sonnet-4-6".to_string(),
             max_tokens: 1024,
             messages: vec![
                 AnthropicMessage {
@@ -1197,7 +1248,7 @@ mod tests {
 
         // 创建一个请求，历史中有工具使用，但 tools 列表为空
         let req = MessagesRequest {
-            model: "claude-sonnet-4".to_string(),
+            model: "claude-sonnet-4-6".to_string(),
             max_tokens: 1024,
             messages: vec![
                 AnthropicMessage {
@@ -1296,7 +1347,7 @@ mod tests {
 
         // 测试带有 metadata 的请求，应该使用 session UUID 作为 conversationId
         let req = MessagesRequest {
-            model: "claude-sonnet-4".to_string(),
+            model: "claude-sonnet-4-6".to_string(),
             max_tokens: 1024,
             messages: vec![AnthropicMessage {
                 role: "user".to_string(),
@@ -1328,7 +1379,7 @@ mod tests {
 
         // 测试没有 metadata 的请求，应该生成新的 UUID
         let req = MessagesRequest {
-            model: "claude-sonnet-4".to_string(),
+            model: "claude-sonnet-4-6".to_string(),
             max_tokens: 1024,
             messages: vec![AnthropicMessage {
                 role: "user".to_string(),
@@ -1722,9 +1773,15 @@ mod tests {
 
         let content = &result.assistant_response_message.content;
         assert!(content.contains("<thinking>"), "应包含 thinking 标签");
-        assert!(content.contains("Let me read that file"), "应包含第二条消息的 text 内容");
+        assert!(
+            content.contains("Let me read that file"),
+            "应包含第二条消息的 text 内容"
+        );
 
-        let tool_uses = result.assistant_response_message.tool_uses.expect("应有 tool_uses");
+        let tool_uses = result
+            .assistant_response_message
+            .tool_uses
+            .expect("应有 tool_uses");
         assert_eq!(tool_uses.len(), 1);
         assert_eq!(tool_uses[0].tool_use_id, "toolu_01ABC");
     }
@@ -1735,7 +1792,7 @@ mod tests {
         use super::super::types::Message as AnthropicMessage;
 
         let req = MessagesRequest {
-            model: "claude-sonnet-4".to_string(),
+            model: "claude-sonnet-4-6".to_string(),
             max_tokens: 1024,
             messages: vec![
                 AnthropicMessage {
@@ -1774,7 +1831,11 @@ mod tests {
         };
 
         let result = convert_request(&req);
-        assert!(result.is_ok(), "连续 assistant 消息场景不应报错: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "连续 assistant 消息场景不应报错: {:?}",
+            result.err()
+        );
 
         let state = result.unwrap().conversation_state;
         let mut found_tool_use = false;
@@ -1789,5 +1850,83 @@ mod tests {
             }
         }
         assert!(found_tool_use, "合并后的 assistant 消息应包含 tool_use");
+    }
+
+    #[test]
+    fn test_default_models_mapping_parity() {
+        // 默认表应复现原 map_model 的全部映射（未调用 init_model_registry 时回退默认表）
+        assert_eq!(
+            map_model("claude-opus-4-8"),
+            Some("claude-opus-4.8".to_string())
+        );
+        assert_eq!(
+            map_model("claude-opus-4-7"),
+            Some("claude-opus-4.7".to_string())
+        );
+        assert_eq!(
+            map_model("claude-opus-4-6"),
+            Some("claude-opus-4.6".to_string())
+        );
+        assert_eq!(
+            map_model("claude-opus-4-5-20251101"),
+            Some("claude-opus-4.5".to_string())
+        );
+        assert_eq!(
+            map_model("claude-sonnet-4-6"),
+            Some("claude-sonnet-4.6".to_string())
+        );
+        assert_eq!(
+            map_model("claude-sonnet-4-5-20250929"),
+            Some("claude-sonnet-4.5".to_string())
+        );
+        assert_eq!(
+            map_model("claude-haiku-4-5-20251001"),
+            Some("claude-haiku-4.5".to_string())
+        );
+        // 点号写法同样命中
+        assert_eq!(
+            map_model("claude-opus-4.6"),
+            Some("claude-opus-4.6".to_string())
+        );
+        // 不支持的模型返回 None
+        assert_eq!(map_model("gpt-4"), None);
+    }
+
+    #[test]
+    fn test_default_models_context_window_parity() {
+        // 1M 上下文模型
+        assert_eq!(get_context_window_size("claude-opus-4-8"), 1_000_000);
+        assert_eq!(get_context_window_size("claude-opus-4-7"), 1_000_000);
+        assert_eq!(get_context_window_size("claude-opus-4-6"), 1_000_000);
+        assert_eq!(get_context_window_size("claude-sonnet-4-6"), 1_000_000);
+        // 200K 上下文模型
+        assert_eq!(get_context_window_size("claude-opus-4-5-20251101"), 200_000);
+        assert_eq!(
+            get_context_window_size("claude-sonnet-4-5-20250929"),
+            200_000
+        );
+        assert_eq!(
+            get_context_window_size("claude-haiku-4-5-20251001"),
+            200_000
+        );
+        // 未知模型回退 200K
+        assert_eq!(get_context_window_size("gpt-4"), 200_000);
+    }
+
+    #[test]
+    fn test_match_model_def_respects_order() {
+        // opus 各版本应按表顺序精确命中各自版本，互不串扰
+        assert_eq!(
+            map_model("claude-opus-4-6-thinking"),
+            Some("claude-opus-4.6".to_string())
+        );
+        assert_eq!(
+            map_model("claude-opus-4-7-thinking"),
+            Some("claude-opus-4.7".to_string())
+        );
+        assert_eq!(
+            map_model("claude-opus-4-8-thinking"),
+            Some("claude-opus-4.8".to_string())
+        );
     }
 }

@@ -31,4 +31,5 @@ mod stream;
 pub mod types;
 mod websearch;
 
+pub use converter::init_model_registry;
 pub use router::create_router_with_provider;

@@ -197,6 +197,24 @@ docker-compose up
 | `credentialRpmMaxWaitMs` | number | `0` | 当所有可用凭据都达到 RPM 上限时，请求发出前最多等待的毫秒数（平滑突发）。`0` 表示关闭等待，沿用"全部超限即直接分流放行"的行为。单凭据场景下尤其有用：此时 RPM 上限本会被回退放行而形同虚设，开启后可把突发压到上游限速以内、主动规避上游 429。等待发生在请求发出之前，不消耗重试次数；等满上限仍无空位时仍会 best-effort 放行，不会无限阻塞 |
 | `extractThinking` | boolean | `true` | 非流式响应的 thinking 块提取。启用后 `<thinking>` 标签会被解析为独立的 `thinking` 内容块 |
 | `defaultEndpoint` | string | `ide` | 默认 Kiro 端点。凭据未显式指定 `endpoint` 时使用。当前支持：`ide` |
+| `models` | array | 内置默认表 | 模型列表（驱动 `/v1/models` 展示、模型名映射、上下文窗口判断）。未配置时使用内置默认表，**完全向后兼容**；一旦提供则整张表以配置为准。每项字段见下方说明 |
+
+#### `models` 项字段
+
+未配置 `models` 时使用内置默认表（涵盖 Opus 4.5–4.8、Sonnet 4.5/4.6、Haiku 4.5），老配置无需改动。如需自定义（增删模型、改窗口/展示信息），提供完整的 `models` 数组，每项：
+
+| 字段 | 类型 | 说明 |
+| --- | --- | --- |
+| `family` | string | 模型族，模糊匹配第一段：`sonnet` / `opus` / `haiku` |
+| `version` | string? | 版本号如 `4.6`；匹配时同时尝试 `4-6`/`4.6` 两种写法。省略则仅靠 `family` 命中（如 haiku） |
+| `kiroId` | string | 映射后的 Kiro 模型 ID，如 `claude-sonnet-4.6` |
+| `displayId` | string | `/v1/models` 展示 ID，如 `claude-sonnet-4-6`（`-thinking` 变体自动派生） |
+| `displayName` | string | `/v1/models` 展示名，如 `Claude Sonnet 4.6` |
+| `created` | number | `/v1/models` 创建时间戳（Unix 秒） |
+| `maxTokens` | number | `/v1/models` 的 max_tokens |
+| `contextWindow` | number | 上下文窗口大小，如 `200000` / `1000000` |
+
+> 匹配按数组顺序取首个命中项，请把同族不同版本按区分度排列。客户端传入的模型名（含日期后缀、`-thinking` 后缀）通过 `family` + `version` 模糊命中对应项。
 
 完整配置示例：
 
@@ -226,9 +244,42 @@ docker-compose up
    "credentialRpmOpus": 3,
    "credentialRpmSonnet": 10,
    "credentialRpmHaiku": 20,
-   "credentialRpmMaxWaitMs": 0
+   "credentialRpmMaxWaitMs": 0,
+   "models": [
+      {
+         "family": "opus",
+         "version": "4.8",
+         "kiroId": "claude-opus-4.8",
+         "displayId": "claude-opus-4-8",
+         "displayName": "Claude Opus 4.8",
+         "created": 1779897600,
+         "maxTokens": 128000,
+         "contextWindow": 1000000
+      },
+      {
+         "family": "sonnet",
+         "version": "4.6",
+         "kiroId": "claude-sonnet-4.6",
+         "displayId": "claude-sonnet-4-6",
+         "displayName": "Claude Sonnet 4.6",
+         "created": 1771286400,
+         "maxTokens": 64000,
+         "contextWindow": 1000000
+      },
+      {
+         "family": "haiku",
+         "kiroId": "claude-haiku-4.5",
+         "displayId": "claude-haiku-4-5-20251001",
+         "displayName": "Claude Haiku 4.5",
+         "created": 1760486400,
+         "maxTokens": 64000,
+         "contextWindow": 200000
+      }
+   ]
 }
 ```
+
+> `models` 为可选项。**不配置即使用内置默认表**（涵盖 Opus 4.5–4.8、Sonnet 4.5/4.6、Haiku 4.5），上方示例仅演示自定义写法；一旦提供则整张表以配置为准（按数组顺序匹配，`-thinking` 变体自动派生）。`haiku` 一项省略了 `version`，仅靠 `family` 命中。
 
 ### credentials.json
 

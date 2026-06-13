@@ -10,5 +10,76 @@
   "credentialRpmOpus": 5,
   "credentialRpmSonnet": 15,
   "credentialRpmHaiku": 30,
-  "credentialRpmMaxWaitMs": 5000
+  "credentialRpmMaxWaitMs": 5000,
+  "models": [
+    {
+      "family": "opus",
+      "version": "4.8",
+      "kiroId": "claude-opus-4.8",
+      "displayId": "claude-opus-4-8",
+      "displayName": "Claude Opus 4.8",
+      "created": 1779897600,
+      "maxTokens": 128000,
+      "contextWindow": 1000000
+    },
+    {
+      "family": "opus",
+      "version": "4.7",
+      "kiroId": "claude-opus-4.7",
+      "displayId": "claude-opus-4-7",
+      "displayName": "Claude Opus 4.7",
+      "created": 1776276000,
+      "maxTokens": 64000,
+      "contextWindow": 1000000
+    },
+    {
+      "family": "opus",
+      "version": "4.6",
+      "kiroId": "claude-opus-4.6",
+      "displayId": "claude-opus-4-6",
+      "displayName": "Claude Opus 4.6",
+      "created": 1770163200,
+      "maxTokens": 64000,
+      "contextWindow": 1000000
+    },
+    {
+      "family": "opus",
+      "version": "4.5",
+      "kiroId": "claude-opus-4.5",
+      "displayId": "claude-opus-4-5-20251101",
+      "displayName": "Claude Opus 4.5",
+      "created": 1763942400,
+      "maxTokens": 64000,
+      "contextWindow": 200000
+    },
+    {
+      "family": "sonnet",
+      "version": "4.6",
+      "kiroId": "claude-sonnet-4.6",
+      "displayId": "claude-sonnet-4-6",
+      "displayName": "Claude Sonnet 4.6",
+      "created": 1771286400,
+      "maxTokens": 64000,
+      "contextWindow": 1000000
+    },
+    {
+      "family": "sonnet",
+      "version": "4.5",
+      "kiroId": "claude-sonnet-4.5",
+      "displayId": "claude-sonnet-4-5-20250929",
+      "displayName": "Claude Sonnet 4.5",
+      "created": 1759104000,
+      "maxTokens": 64000,
+      "contextWindow": 200000
+    },
+    {
+      "family": "haiku",
+      "kiroId": "claude-haiku-4.5",
+      "displayId": "claude-haiku-4-5-20251001",
+      "displayName": "Claude Haiku 4.5",
+      "created": 1760486400,
+      "maxTokens": 64000,
+      "contextWindow": 200000
+    }
+  ]
 }

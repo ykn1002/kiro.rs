@@ -40,6 +40,10 @@ async fn main() {
         std::process::exit(1);
     });
 
+    // 初始化全局模型注册表（配置的 models 或内置默认表），供 map_model /
+    // get_context_window_size / get_models 使用。须在任何请求进入前完成。
+    anthropic::init_model_registry(config.effective_models());
+
     // 加载凭证（支持单对象或数组格式）
     let credentials_path = args
         .credentials
@@ -111,10 +115,7 @@ async fn main() {
 
     // 校验所有凭据声明的端点都已注册
     for cred in &credentials_list {
-        let name = cred
-            .endpoint
-            .as_deref()
-            .unwrap_or(&config.default_endpoint);
+        let name = cred.endpoint.as_deref().unwrap_or(&config.default_endpoint);
         if !endpoints.contains_key(name) {
             tracing::error!(
                 "凭据 id={:?} 指定了未知端点 \"{}\"（已注册: {:?}）",

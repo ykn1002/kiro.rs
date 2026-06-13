@@ -17,6 +17,44 @@ impl Default for TlsBackend {
     }
 }
 
+/// 模型定义
+///
+/// 同时驱动三处逻辑：
+/// 1. `map_model`：用 `family` + `version` 模糊匹配 Anthropic 模型名 → `kiro_id`
+/// 2. `get_context_window_size`：命中后返回 `context_window`
+/// 3. `GET /v1/models`：用 `display_id` / `display_name` / `created` / `max_tokens` 生成展示列表
+///    （thinking 变体由代码自动派生，无需在配置中重复）
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelDef {
+    /// 模型族，模糊匹配的第一段（小写匹配）："sonnet" / "opus" / "haiku"
+    pub family: String,
+
+    /// 版本号，如 "4.6"。匹配时同时尝试 "4-6" 和 "4.6" 两种写法。
+    /// 为 `None` 时（如 haiku）仅靠 `family` 命中。
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
+
+    /// 映射后的 Kiro 模型 ID，如 "claude-sonnet-4.6"
+    pub kiro_id: String,
+
+    /// `/v1/models` 展示用 ID，如 "claude-sonnet-4-6"
+    pub display_id: String,
+
+    /// `/v1/models` 展示名，如 "Claude Sonnet 4.6"
+    pub display_name: String,
+
+    /// `/v1/models` 的创建时间戳（Unix 秒）
+    pub created: i64,
+
+    /// `/v1/models` 的 max_tokens
+    pub max_tokens: i32,
+
+    /// 上下文窗口大小（200_000 / 1_000_000）
+    pub context_window: i32,
+}
+
 /// KNA 应用配置
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -142,6 +180,14 @@ pub struct Config {
     #[serde(default)]
     pub endpoints: HashMap<String, serde_json::Value>,
 
+    /// 模型列表
+    ///
+    /// 为 `None`/缺失时回退到内置默认表 `default_models()`（见 `effective_models`）。
+    /// 完全向后兼容：老配置无需改动。
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub models: Option<Vec<ModelDef>>,
+
     /// 配置文件路径（运行时元数据，不写入 JSON）
     #[serde(skip)]
     config_path: Option<PathBuf>,
@@ -192,6 +238,85 @@ fn default_endpoint() -> String {
     crate::kiro::endpoint::ide::IDE_ENDPOINT_NAME.to_string()
 }
 
+/// 内置默认模型表
+///
+/// 顺序即匹配优先级（与原 `map_model` 的 if-else 顺序一致）。
+/// `get_models` / `map_model` / `get_context_window_size` 在配置未提供 `models` 时回退到此表。
+pub fn default_models() -> Vec<ModelDef> {
+    vec![
+        ModelDef {
+            family: "opus".to_string(),
+            version: Some("4.8".to_string()),
+            kiro_id: "claude-opus-4.8".to_string(),
+            display_id: "claude-opus-4-8".to_string(),
+            display_name: "Claude Opus 4.8".to_string(),
+            created: 1779897600,
+            max_tokens: 128_000,
+            context_window: 1_000_000,
+        },
+        ModelDef {
+            family: "opus".to_string(),
+            version: Some("4.7".to_string()),
+            kiro_id: "claude-opus-4.7".to_string(),
+            display_id: "claude-opus-4-7".to_string(),
+            display_name: "Claude Opus 4.7".to_string(),
+            created: 1776276000,
+            max_tokens: 64000,
+            context_window: 1_000_000,
+        },
+        ModelDef {
+            family: "opus".to_string(),
+            version: Some("4.6".to_string()),
+            kiro_id: "claude-opus-4.6".to_string(),
+            display_id: "claude-opus-4-6".to_string(),
+            display_name: "Claude Opus 4.6".to_string(),
+            created: 1770163200,
+            max_tokens: 64000,
+            context_window: 1_000_000,
+        },
+        ModelDef {
+            family: "opus".to_string(),
+            version: Some("4.5".to_string()),
+            kiro_id: "claude-opus-4.5".to_string(),
+            display_id: "claude-opus-4-5-20251101".to_string(),
+            display_name: "Claude Opus 4.5".to_string(),
+            created: 1763942400,
+            max_tokens: 64000,
+            context_window: 200_000,
+        },
+        ModelDef {
+            family: "sonnet".to_string(),
+            version: Some("4.6".to_string()),
+            kiro_id: "claude-sonnet-4.6".to_string(),
+            display_id: "claude-sonnet-4-6".to_string(),
+            display_name: "Claude Sonnet 4.6".to_string(),
+            created: 1771286400,
+            max_tokens: 64000,
+            context_window: 1_000_000,
+        },
+        ModelDef {
+            family: "sonnet".to_string(),
+            version: Some("4.5".to_string()),
+            kiro_id: "claude-sonnet-4.5".to_string(),
+            display_id: "claude-sonnet-4-5-20250929".to_string(),
+            display_name: "Claude Sonnet 4.5".to_string(),
+            created: 1759104000,
+            max_tokens: 64000,
+            context_window: 200_000,
+        },
+        ModelDef {
+            family: "haiku".to_string(),
+            version: None,
+            kiro_id: "claude-haiku-4.5".to_string(),
+            display_id: "claude-haiku-4-5-20251001".to_string(),
+            display_name: "Claude Haiku 4.5".to_string(),
+            created: 1760486400,
+            max_tokens: 64000,
+            context_window: 200_000,
+        },
+    ]
+}
+
 impl Default for Config {
     fn default() -> Self {
         Self {
@@ -222,6 +347,7 @@ impl Default for Config {
             extract_thinking: default_extract_thinking(),
             default_endpoint: default_endpoint(),
             endpoints: HashMap::new(),
+            models: None,
             config_path: None,
         }
     }
@@ -243,6 +369,12 @@ impl Config {
     /// 优先使用 api_region，未配置时回退到 region
     pub fn effective_api_region(&self) -> &str {
         self.api_region.as_deref().unwrap_or(&self.region)
+    }
+
+    /// 获取有效的模型表
+    /// 优先使用配置的 `models`，未配置时回退到内置默认表
+    pub fn effective_models(&self) -> Vec<ModelDef> {
+        self.models.clone().unwrap_or_else(default_models)
     }
 
     /// 从文件加载配置
@@ -274,7 +406,66 @@ impl Config {
             .ok_or_else(|| anyhow::anyhow!("配置文件路径未知，无法保存配置"))?;
 
         let content = serde_json::to_string_pretty(self).context("序列化配置失败")?;
-        fs::write(path, content).with_context(|| format!("写入配置文件失败: {}", path.display()))?;
+        fs::write(path, content)
+            .with_context(|| format!("写入配置文件失败: {}", path.display()))?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 缺省 models 时回退内置默认表
+    #[test]
+    fn test_effective_models_defaults_when_absent() {
+        let cfg = Config::default();
+        assert!(cfg.models.is_none());
+        let models = cfg.effective_models();
+        assert_eq!(models.len(), default_models().len());
+        assert!(models.iter().any(|m| m.kiro_id == "claude-opus-4.8"));
+    }
+
+    /// 解析自定义 models（同步守护 README 完整配置示例的字段结构）
+    #[test]
+    fn test_parse_custom_models() {
+        let json = r#"{
+            "apiKey": "k",
+            "models": [
+                { "family": "opus", "version": "4.8", "kiroId": "claude-opus-4.8", "displayId": "claude-opus-4-8", "displayName": "Claude Opus 4.8", "created": 1779897600, "maxTokens": 128000, "contextWindow": 1000000 },
+                { "family": "haiku", "kiroId": "claude-haiku-4.5", "displayId": "claude-haiku-4-5-20251001", "displayName": "Claude Haiku 4.5", "created": 1760486400, "maxTokens": 64000, "contextWindow": 200000 }
+            ]
+        }"#;
+        let cfg: Config = serde_json::from_str(json).expect("自定义 models 应能解析");
+        let models = cfg.effective_models();
+        assert_eq!(models.len(), 2);
+        assert_eq!(models[0].kiro_id, "claude-opus-4.8");
+        assert_eq!(models[0].context_window, 1_000_000);
+        assert!(models[1].version.is_none(), "haiku 省略 version 应为 None");
+    }
+
+    /// config.example.json 的 models 必须与内置 default_models() 完全一致
+    /// （样例脱节即报警，保证样例真实可复制为默认行为）
+    #[test]
+    fn test_example_config_models_match_defaults() {
+        let json = include_str!("../../config.example.json");
+        let cfg: Config = serde_json::from_str(json).expect("config.example.json 应能解析");
+        let example = cfg.models.expect("样例应包含 models");
+        let defaults = default_models();
+        assert_eq!(
+            example.len(),
+            defaults.len(),
+            "样例模型数量应与默认表一致"
+        );
+        for (e, d) in example.iter().zip(defaults.iter()) {
+            assert_eq!(e.family, d.family);
+            assert_eq!(e.version, d.version);
+            assert_eq!(e.kiro_id, d.kiro_id);
+            assert_eq!(e.display_id, d.display_id);
+            assert_eq!(e.display_name, d.display_name);
+            assert_eq!(e.created, d.created);
+            assert_eq!(e.max_tokens, d.max_tokens);
+            assert_eq!(e.context_window, d.context_window);
+        }
     }
 }
