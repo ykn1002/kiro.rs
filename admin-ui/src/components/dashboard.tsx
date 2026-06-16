@@ -11,6 +11,7 @@ import { BalanceDialog } from '@/components/balance-dialog'
 import { AddCredentialDialog } from '@/components/add-credential-dialog'
 import { BatchImportDialog } from '@/components/batch-import-dialog'
 import { KamImportDialog } from '@/components/kam-import-dialog'
+import { AwsSsoImportDialog } from '@/components/aws-sso-import-dialog'
 import { BatchVerifyDialog, type VerifyResult } from '@/components/batch-verify-dialog'
 import { useCredentials, useDeleteCredential, useResetFailure, useLoadBalancingMode, useSetLoadBalancingMode } from '@/hooks/use-credentials'
 import { getCredentialBalance, forceRefreshToken } from '@/api/credentials'
@@ -28,6 +29,7 @@ export function Dashboard({ onLogout }: DashboardProps) {
   const [addDialogOpen, setAddDialogOpen] = useState(false)
   const [batchImportDialogOpen, setBatchImportDialogOpen] = useState(false)
   const [kamImportDialogOpen, setKamImportDialogOpen] = useState(false)
+  const [awsSsoImportDialogOpen, setAwsSsoImportDialogOpen] = useState(false)
   const [selectedIds, setSelectedIds] = useState<Set<number>>(new Set())
   const [verifyDialogOpen, setVerifyDialogOpen] = useState(false)
   const [verifying, setVerifying] = useState(false)
@@ -700,6 +702,10 @@ export function Dashboard({ onLogout }: DashboardProps) {
                 <FileUp className="h-4 w-4 mr-2" />
                 Kiro Account Manager 导入
               </Button>
+              <Button onClick={() => setAwsSsoImportDialogOpen(true)} size="sm" variant="outline">
+                <FileUp className="h-4 w-4 mr-2" />
+                AWS SSO 导入
+              </Button>
               <Button onClick={() => setBatchImportDialogOpen(true)} size="sm" variant="outline">
                 <Upload className="h-4 w-4 mr-2" />
                 批量导入
@@ -784,6 +790,12 @@ export function Dashboard({ onLogout }: DashboardProps) {
       <KamImportDialog
         open={kamImportDialogOpen}
         onOpenChange={setKamImportDialogOpen}
+      />
+
+      {/* AWS SSO 导入对话框 */}
+      <AwsSsoImportDialog
+        open={awsSsoImportDialogOpen}
+        onOpenChange={setAwsSsoImportDialogOpen}
       />
 
       {/* 批量验活对话框 */}
