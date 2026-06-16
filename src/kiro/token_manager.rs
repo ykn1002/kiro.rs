@@ -392,6 +392,122 @@ pub(crate) async fn get_usage_limits(
     Ok(data)
 }
 
+/// ListAvailableProfiles 接口返回的单个 Profile
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AvailableProfile {
+    #[serde(default)]
+    arn: Option<String>,
+}
+
+/// ListAvailableProfiles 接口响应体
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ListAvailableProfilesResponse {
+    #[serde(default)]
+    profiles: Vec<AvailableProfile>,
+}
+
+/// 获取可用的 Profile（IdC 账号必需），返回 (arn, region)
+///
+/// IdC（Builder ID / IAM Identity Center）账号的 OAuth 刷新响应不包含 profileArn，
+/// 需要调用 CodeWhisperer 的 `ListAvailableProfiles` 单独获取。
+///
+/// 该接口使用 AWS JSON 1.0 协议（POST `/`，`X-Amz-Target` 头分发），且仅部署在
+/// `us-east-1` 与 `eu-central-1` 两个区域。这里依次查询这两个区域，返回第一个
+/// 可用 Profile 的 ARN 及其所在区域（区域取自 ARN 的第 4 段）。
+pub(crate) async fn list_available_profile(
+    credentials: &KiroCredentials,
+    config: &Config,
+    token: &str,
+    proxy: Option<&ProxyConfig>,
+) -> anyhow::Result<Option<(String, Option<String>)>> {
+    // CodeWhisperer Profile 接口仅在以下区域可用
+    const PROFILE_REGIONS: [&str; 2] = ["us-east-1", "eu-central-1"];
+
+    let mut last_err: Option<anyhow::Error> = None;
+    for region in PROFILE_REGIONS {
+        match list_available_profile_in_region(credentials, config, token, proxy, region).await {
+            Ok(Some(arn)) => {
+                // 从 ARN 解析区域：arn:aws:codewhisperer:<region>:<acct>:profile/<id>
+                let arn_region = arn.split(':').nth(3).filter(|s| !s.is_empty()).map(String::from);
+                return Ok(Some((arn, arn_region)));
+            }
+            Ok(None) => {
+                tracing::debug!("区域 {} 未返回可用 Profile", region);
+            }
+            Err(e) => {
+                tracing::debug!("区域 {} 获取 Profile 失败: {}", region, e);
+                last_err = Some(e);
+            }
+        }
+    }
+
+    match last_err {
+        Some(e) => Err(e),
+        None => Ok(None),
+    }
+}
+
+/// 在指定区域调用 ListAvailableProfiles（AWS JSON 1.0 协议）
+async fn list_available_profile_in_region(
+    credentials: &KiroCredentials,
+    config: &Config,
+    token: &str,
+    proxy: Option<&ProxyConfig>,
+    region: &str,
+) -> anyhow::Result<Option<String>> {
+    tracing::debug!("正在获取可用 Profile（区域 {}）...", region);
+
+    let host = format!("q.{}.amazonaws.com", region);
+    let machine_id = machine_id::generate_from_credentials(credentials, config);
+    let kiro_version = &config.kiro_version;
+    let os_name = &config.system_version;
+    let node_version = &config.node_version;
+
+    let url = format!("https://{}/", host);
+
+    let user_agent = format!(
+        "aws-sdk-js/1.0.0 ua/2.1 os/{} lang/js md/nodejs#{} api/codewhisperer#1.0.0 m/N,E KiroIDE-{}-{}",
+        os_name, node_version, kiro_version, machine_id
+    );
+    let amz_user_agent = format!("aws-sdk-js/1.0.0 KiroIDE-{}-{}", kiro_version, machine_id);
+
+    let client = build_client(proxy, 60, config.tls_backend)?;
+
+    let mut request = client
+        .post(&url)
+        .header("content-type", "application/x-amz-json-1.0")
+        .header(
+            "x-amz-target",
+            "AmazonCodeWhispererService.ListAvailableProfiles",
+        )
+        .header("x-amz-user-agent", &amz_user_agent)
+        .header("user-agent", &user_agent)
+        .header("host", &host)
+        .header("amz-sdk-invocation-id", uuid::Uuid::new_v4().to_string())
+        .header("amz-sdk-request", "attempt=1; max=1")
+        .header("Authorization", format!("Bearer {}", token))
+        .header("Connection", "close")
+        // maxResults 可选，请求全部可用 Profile
+        .body(r#"{"maxResults":10}"#);
+
+    if credentials.is_api_key_credential() {
+        request = request.header("tokentype", "API_KEY");
+    }
+
+    let response = request.send().await?;
+
+    let status = response.status();
+    if !status.is_success() {
+        let body_text = response.text().await.unwrap_or_default();
+        bail!("获取 Profile 列表失败: {} {}", status, body_text);
+    }
+
+    let data: ListAvailableProfilesResponse = response.json().await?;
+    Ok(data.profiles.into_iter().find_map(|p| p.arn))
+}
+
 // ============================================================================
 // 多凭据 Token 管理器
 // ============================================================================
@@ -1247,6 +1363,52 @@ impl MultiTokenManager {
             }
         }
 
+        // IdC 账号的 OAuth 刷新响应不含 profileArn，但 generateAssistantResponse
+        // 等接口要求必须携带。若缺失则通过 ListAvailableProfiles 获取并持久化。
+        let creds = if creds.is_idc() && creds.profile_arn.is_none() {
+            let effective_proxy = creds.effective_proxy(self.proxy.as_ref());
+            match list_available_profile(&creds, &self.config, &token, effective_proxy.as_ref())
+                .await
+            {
+                Ok(Some((arn, arn_region))) => {
+                    tracing::info!(
+                        "IdC 凭据 #{} 自动获取 Profile ARN 成功（区域 {:?}）",
+                        id,
+                        arn_region.as_deref().unwrap_or("?")
+                    );
+                    let mut updated = creds.clone();
+                    updated.profile_arn = Some(arn.clone());
+                    // 同步 API 区域到 Profile 所在区域，确保后续请求命中正确端点
+                    if let (None, Some(r)) = (&updated.api_region, &arn_region) {
+                        updated.api_region = Some(r.clone());
+                    }
+                    {
+                        let mut entries = self.entries.lock();
+                        if let Some(entry) = entries.iter_mut().find(|e| e.id == id) {
+                            entry.credentials.profile_arn = updated.profile_arn.clone();
+                            if entry.credentials.api_region.is_none() {
+                                entry.credentials.api_region = updated.api_region.clone();
+                            }
+                        }
+                    }
+                    if let Err(e) = self.persist_credentials() {
+                        tracing::warn!("Profile ARN 持久化失败（不影响本次请求）: {}", e);
+                    }
+                    updated
+                }
+                Ok(None) => {
+                    tracing::warn!("IdC 凭据 #{} 未找到可用 Profile ARN", id);
+                    creds
+                }
+                Err(e) => {
+                    tracing::warn!("IdC 凭据 #{} 获取 Profile ARN 失败: {}", id, e);
+                    creds
+                }
+            }
+        } else {
+            creds
+        };
+
         Ok(CallContext {
             id,
             credentials: creds,
@@ -1835,6 +1997,23 @@ impl MultiTokenManager {
         Ok(())
     }
 
+    /// 确保指定凭据已具备有效 Token，并在需要时自动获取 Profile ARN（IdC 凭据）。
+    ///
+    /// 主要用于添加凭据后主动初始化，使 IdC 凭据在首次真正请求前即拥有 profileArn。
+    pub async fn ensure_profile_arn_for(&self, id: u64) -> anyhow::Result<()> {
+        let credentials = {
+            let entries = self.entries.lock();
+            entries
+                .iter()
+                .find(|e| e.id == id)
+                .map(|e| e.credentials.clone())
+                .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?
+        };
+        // try_ensure_token 会在 IdC 凭据缺失 profileArn 时自动获取并持久化
+        self.try_ensure_token(id, &credentials).await?;
+        Ok(())
+    }
+
     /// 获取指定凭据的使用额度（Admin API）
     pub async fn get_usage_limits_for(&self, id: u64) -> anyhow::Result<UsageLimitsResponse> {
         let credentials = {
@@ -2309,6 +2488,29 @@ mod tests {
             result,
             "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08"
         );
+    }
+
+    #[test]
+    fn test_parse_list_available_profiles_response() {
+        let body = r#"{
+            "profiles": [
+                {"arn": "arn:aws:codewhisperer:us-east-1:111:profile/ABC", "profileName": "p1"},
+                {"arn": "arn:aws:codewhisperer:us-east-1:222:profile/DEF"}
+            ]
+        }"#;
+        let parsed: ListAvailableProfilesResponse = serde_json::from_str(body).unwrap();
+        let arn = parsed.profiles.into_iter().find_map(|p| p.arn);
+        assert_eq!(
+            arn,
+            Some("arn:aws:codewhisperer:us-east-1:111:profile/ABC".to_string())
+        );
+    }
+
+    #[test]
+    fn test_parse_list_available_profiles_empty() {
+        let body = r#"{"profiles": []}"#;
+        let parsed: ListAvailableProfilesResponse = serde_json::from_str(body).unwrap();
+        assert!(parsed.profiles.into_iter().find_map(|p| p.arn).is_none());
     }
 
     #[tokio::test]

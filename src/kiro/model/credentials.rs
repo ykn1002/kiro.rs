@@ -261,6 +261,16 @@ impl KiroCredentials {
         }
     }
 
+    /// 检查是否为 IdC（Builder ID / IAM Identity Center）凭据
+    ///
+    /// IdC 账号没有 FREE/PRO 订阅等级的概念，getUsageLimits 接口对其不适用
+    pub fn is_idc(&self) -> bool {
+        self.auth_method
+            .as_deref()
+            .map(|m| m.eq_ignore_ascii_case("idc"))
+            .unwrap_or(false)
+    }
+
     /// 检查是否为 API Key 凭据
     ///
     /// API Key 凭据直接使用 kiro_api_key 作为 Bearer Token，无需 refreshToken

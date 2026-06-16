@@ -214,7 +214,7 @@ impl AdminService {
 
         // 构建凭据对象
         let email = req.email.clone();
-        let new_cred = KiroCredentials {
+        let mut new_cred = KiroCredentials {
             id: None,
             access_token: None,
             refresh_token: req.refresh_token,
@@ -238,6 +238,10 @@ impl AdminService {
             endpoint: req.endpoint,
         };
 
+        // 规范化认证方式（builder-id / iam -> idc），用于后续判定是否需要获取订阅等级
+        new_cred.canonicalize_auth_method();
+        let is_idc = new_cred.is_idc();
+
         // 调用 token_manager 添加凭据
         let credential_id = self
             .token_manager
@@ -245,8 +249,22 @@ impl AdminService {
             .await
             .map_err(|e| self.classify_add_error(e))?;
 
-        // 主动获取订阅等级，避免首次请求时 Free 账号绕过 Opus 模型过滤
-        if let Err(e) = self.token_manager.get_usage_limits_for(credential_id).await {
+        // 主动获取订阅等级，避免首次请求时 Free 账号绕过 Opus 模型过滤。
+        // IdC 账号没有 FREE/PRO 订阅等级概念，getUsageLimits 接口对其不适用
+        // （会返回 "Invalid profileArn"）；但 IdC 需要 profileArn 才能正常请求，
+        // 因此改为主动获取并持久化 Profile ARN。
+        if is_idc {
+            if let Err(e) = self
+                .token_manager
+                .ensure_profile_arn_for(credential_id)
+                .await
+            {
+                tracing::warn!(
+                    "添加 IdC 凭据后获取 Profile ARN 失败（不影响凭据添加）: {}",
+                    e
+                );
+            }
+        } else if let Err(e) = self.token_manager.get_usage_limits_for(credential_id).await {
             tracing::warn!("添加凭据后获取订阅等级失败（不影响凭据添加）: {}", e);
         }
 
