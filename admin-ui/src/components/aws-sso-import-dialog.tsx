@@ -216,12 +216,28 @@ export function AwsSsoImportDialog({ open, onOpenChange }: AwsSsoImportDialogPro
             请分别粘贴或上传。
           </p>
 
+          <div className="rounded-md border border-dashed bg-muted/40 px-3 py-2 text-xs text-muted-foreground space-y-1">
+            <div className="font-medium text-foreground">文件路径（位于 SSO 缓存目录）</div>
+            <div>
+              macOS：<code className="font-mono">/Users/{'{user}'}/.aws/sso/cache/</code>
+            </div>
+            <div>
+              Windows：<code className="font-mono">C:\Users\{'{user}'}\.aws\sso\cache\</code>
+            </div>
+            <div>
+              鉴权 Token 文件：<code className="font-mono">kiro-auth-token.json</code>
+            </div>
+            <div>
+              客户端注册文件：<code className="font-mono">{'<机器ID（32位十六进制）>'}.json</code>
+            </div>
+          </div>
+
           {/* 客户端注册文件 */}
           <div className="space-y-2">
             <div className="flex items-center justify-between">
               <label className="text-sm font-medium">
                 客户端注册 JSON <span className="text-red-500">*</span>
-                <span className="text-xs text-muted-foreground ml-1">（clientId / clientSecret）</span>
+                <span className="text-xs text-muted-foreground ml-1">（clientId / clientSecret，文件名 <code className="font-mono">{'<机器ID 32位>'}.json</code>）</span>
               </label>
               <Button
                 type="button"
@@ -255,7 +271,7 @@ export function AwsSsoImportDialog({ open, onOpenChange }: AwsSsoImportDialogPro
             <div className="flex items-center justify-between">
               <label className="text-sm font-medium">
                 鉴权 Token JSON <span className="text-red-500">*</span>
-                <span className="text-xs text-muted-foreground ml-1">（refreshToken / region）</span>
+                <span className="text-xs text-muted-foreground ml-1">（refreshToken / region，文件名 <code className="font-mono">kiro-auth-token.json</code>）</span>
               </label>
               <Button
                 type="button"
