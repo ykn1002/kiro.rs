@@ -8,13 +8,15 @@ use chrono::Utc;
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 
+use crate::anthropic::SharedApiKey;
 use crate::kiro::model::credentials::KiroCredentials;
 use crate::kiro::token_manager::MultiTokenManager;
 
 use super::error::AdminServiceError;
 use super::types::{
-    AddCredentialRequest, AddCredentialResponse, BalanceResponse, CredentialStatusItem,
-    CredentialsStatusResponse, LoadBalancingModeResponse, SetLoadBalancingModeRequest,
+    AddCredentialRequest, AddCredentialResponse, AppConfigResponse, BalanceResponse,
+    CredentialStatusItem, CredentialsStatusResponse, LoadBalancingModeResponse,
+    SetLoadBalancingModeRequest, UpdateAppConfigRequest,
 };
 
 /// 余额缓存过期时间（秒），5 分钟
@@ -38,12 +40,15 @@ pub struct AdminService {
     cache_path: Option<PathBuf>,
     /// 已注册的端点名称集合（用于 add_credential 校验）
     known_endpoints: HashSet<String>,
+    /// 客户端 API Key 共享句柄（与 AppState 共享，用于热替换 apiKey）
+    shared_api_key: SharedApiKey,
 }
 
 impl AdminService {
     pub fn new(
         token_manager: Arc<MultiTokenManager>,
         known_endpoints: impl IntoIterator<Item = String>,
+        shared_api_key: SharedApiKey,
     ) -> Self {
         let cache_path = token_manager
             .cache_dir()
@@ -56,6 +61,7 @@ impl AdminService {
             balance_cache: Mutex::new(balance_cache),
             cache_path,
             known_endpoints: known_endpoints.into_iter().collect(),
+            shared_api_key,
         }
     }
 
@@ -326,6 +332,116 @@ impl AdminService {
             .map_err(|e| self.classify_balance_error(e, id))
     }
 
+    // ============ 应用配置（页面可编辑子集） ============
+
+    /// 获取可在页面编辑的应用配置当前值
+    pub fn get_app_config(&self) -> AppConfigResponse {
+        let config = self.token_manager.config();
+        AppConfigResponse {
+            api_key: self.shared_api_key.read().clone(),
+            credential_rpm: config.credential_rpm,
+            credential_rpm_opus: config.credential_rpm_opus,
+            credential_rpm_sonnet: config.credential_rpm_sonnet,
+            credential_rpm_haiku: config.credential_rpm_haiku,
+            kiro_version: config.kiro_version.clone(),
+            system_version: config.system_version.clone(),
+            node_version: config.node_version.clone(),
+            models: config.effective_models(),
+        }
+    }
+
+    /// 更新可编辑的应用配置子集，回写 config.json 并热生效
+    ///
+    /// 流程：校验 → 重新读盘（保留 host/port/adminApiKey 等未编辑字段）→ 改字段 →
+    /// save() 回写 → 热应用（token_manager.replace_config + 模型注册表 + apiKey 句柄）。
+    pub fn update_app_config(
+        &self,
+        req: UpdateAppConfigRequest,
+    ) -> Result<AppConfigResponse, AdminServiceError> {
+        use crate::model::config::Config;
+
+        // ---- 校验 ----
+        let api_key = req.api_key.trim();
+        if api_key.is_empty() {
+            return Err(AdminServiceError::InvalidCredential(
+                "apiKey 不能为空".to_string(),
+            ));
+        }
+        if req.kiro_version.trim().is_empty()
+            || req.system_version.trim().is_empty()
+            || req.node_version.trim().is_empty()
+        {
+            return Err(AdminServiceError::InvalidCredential(
+                "kiroVersion / systemVersion / nodeVersion 均不能为空".to_string(),
+            ));
+        }
+        if req.models.is_empty() {
+            return Err(AdminServiceError::InvalidCredential(
+                "models 至少需要一个模型定义".to_string(),
+            ));
+        }
+        for (i, m) in req.models.iter().enumerate() {
+            if m.family.trim().is_empty()
+                || m.kiro_id.trim().is_empty()
+                || m.display_id.trim().is_empty()
+                || m.display_name.trim().is_empty()
+            {
+                return Err(AdminServiceError::InvalidCredential(format!(
+                    "第 {} 个模型的 family / kiroId / displayId / displayName 均不能为空",
+                    i + 1
+                )));
+            }
+            if m.max_tokens <= 0 || m.context_window <= 0 {
+                return Err(AdminServiceError::InvalidCredential(format!(
+                    "第 {} 个模型的 maxTokens / contextWindow 必须为正数",
+                    i + 1
+                )));
+            }
+        }
+
+        // ---- 读盘 → 改字段 → 回写 ----
+        let config_path = self
+            .token_manager
+            .config()
+            .config_path()
+            .map(|p| p.to_path_buf());
+
+        // 以磁盘上的最新配置为基底（保留 host/port/adminApiKey 等未编辑字段），
+        // 路径未知时回退到当前内存配置。
+        let mut new_config = match &config_path {
+            Some(path) => Config::load(path).map_err(|e| {
+                AdminServiceError::InternalError(format!("重新加载配置失败: {}", e))
+            })?,
+            None => (*self.token_manager.config()).clone(),
+        };
+
+        new_config.api_key = Some(api_key.to_string());
+        new_config.credential_rpm = req.credential_rpm;
+        new_config.credential_rpm_opus = req.credential_rpm_opus;
+        new_config.credential_rpm_sonnet = req.credential_rpm_sonnet;
+        new_config.credential_rpm_haiku = req.credential_rpm_haiku;
+        new_config.kiro_version = req.kiro_version.trim().to_string();
+        new_config.system_version = req.system_version.trim().to_string();
+        new_config.node_version = req.node_version.trim().to_string();
+        new_config.models = Some(req.models.clone());
+
+        if config_path.is_some() {
+            new_config.save().map_err(|e| {
+                AdminServiceError::InternalError(format!("回写配置文件失败: {}", e))
+            })?;
+        } else {
+            tracing::warn!("配置文件路径未知，应用配置仅在当前进程生效");
+        }
+
+        // ---- 热应用 ----
+        *self.shared_api_key.write() = api_key.to_string();
+        crate::anthropic::set_model_registry(req.models);
+        self.token_manager.replace_config(new_config);
+
+        tracing::info!("应用配置已更新并热生效");
+        Ok(self.get_app_config())
+    }
+
     // ============ 余额缓存持久化 ============
 
     fn load_balance_cache_from(cache_path: &Option<PathBuf>) -> HashMap<u64, CachedBalance> {
@@ -467,7 +583,8 @@ impl AdminService {
         let msg = e.to_string();
         if msg.contains("不存在") {
             AdminServiceError::NotFound { id }
-        } else if msg.contains("只能删除已禁用的凭据") || msg.contains("请先禁用凭据") {
+        } else if msg.contains("只能删除已禁用的凭据") || msg.contains("请先禁用凭据")
+        {
             AdminServiceError::InvalidCredential(msg)
         } else {
             AdminServiceError::InternalError(msg)

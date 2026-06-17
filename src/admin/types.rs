@@ -2,6 +2,8 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::model::config::ModelDef;
+
 // ============ 凭据状态 ============
 
 /// 所有凭据状态响应
@@ -196,6 +198,60 @@ pub struct LoadBalancingModeResponse {
 pub struct SetLoadBalancingModeRequest {
     /// 模式（"priority"、"balanced" 或 "round-robin"）
     pub mode: String,
+}
+
+// ============ 应用配置（页面可编辑子集） ============
+
+/// 应用配置响应（页面可编辑字段的当前值）
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AppConfigResponse {
+    /// 客户端 API Key
+    pub api_key: String,
+    /// 单凭据兜底 RPM
+    pub credential_rpm: u32,
+    /// Opus 专用 RPM
+    pub credential_rpm_opus: Option<u32>,
+    /// Sonnet 专用 RPM
+    pub credential_rpm_sonnet: Option<u32>,
+    /// Haiku 专用 RPM
+    pub credential_rpm_haiku: Option<u32>,
+    /// Kiro 客户端版本
+    pub kiro_version: String,
+    /// 系统版本指纹
+    pub system_version: String,
+    /// Node 版本
+    pub node_version: String,
+    /// 模型列表（生效值，缺省时为内置默认表）
+    pub models: Vec<ModelDef>,
+}
+
+/// 更新应用配置请求（全量替换可编辑子集）
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UpdateAppConfigRequest {
+    /// 客户端 API Key（不能为空）
+    pub api_key: String,
+    /// 单凭据兜底 RPM
+    #[serde(default)]
+    pub credential_rpm: u32,
+    /// Opus 专用 RPM
+    #[serde(default)]
+    pub credential_rpm_opus: Option<u32>,
+    /// Sonnet 专用 RPM
+    #[serde(default)]
+    pub credential_rpm_sonnet: Option<u32>,
+    /// Haiku 专用 RPM
+    #[serde(default)]
+    pub credential_rpm_haiku: Option<u32>,
+    /// Kiro 客户端版本（不能为空）
+    pub kiro_version: String,
+    /// 系统版本指纹（不能为空）
+    pub system_version: String,
+    /// Node 版本（不能为空）
+    pub node_version: String,
+    /// 模型列表（至少一个）
+    pub models: Vec<ModelDef>,
 }
 
 // ============ 通用响应 ============

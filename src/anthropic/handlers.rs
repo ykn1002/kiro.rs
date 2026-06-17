@@ -111,7 +111,7 @@ pub async fn get_models() -> impl IntoResponse {
     tracing::info!("Received GET /v1/models request");
 
     let mut models = Vec::new();
-    for def in super::converter::registered_models() {
+    for def in super::converter::registered_models().iter() {
         // 基础变体
         models.push(Model {
             id: def.display_id.clone(),

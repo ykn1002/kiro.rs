@@ -1,5 +1,5 @@
 import { useState, useEffect, useRef } from 'react'
-import { RefreshCw, LogOut, Moon, Sun, Server, Plus, Upload, FileUp, Trash2, RotateCcw, CheckCircle2 } from 'lucide-react'
+import { RefreshCw, LogOut, Moon, Sun, Server, Plus, Upload, FileUp, Trash2, RotateCcw, CheckCircle2, Settings } from 'lucide-react'
 import { useQueryClient } from '@tanstack/react-query'
 import { toast } from 'sonner'
 import { storage } from '@/lib/storage'
@@ -13,6 +13,7 @@ import { BatchImportDialog } from '@/components/batch-import-dialog'
 import { KamImportDialog } from '@/components/kam-import-dialog'
 import { AwsSsoImportDialog } from '@/components/aws-sso-import-dialog'
 import { BatchVerifyDialog, type VerifyResult } from '@/components/batch-verify-dialog'
+import { SettingsDialog } from '@/components/settings-dialog'
 import { useCredentials, useDeleteCredential, useResetFailure, useLoadBalancingMode, useSetLoadBalancingMode } from '@/hooks/use-credentials'
 import { getCredentialBalance, forceRefreshToken } from '@/api/credentials'
 import type { LoadBalancingMode } from '@/api/credentials'
@@ -30,6 +31,7 @@ export function Dashboard({ onLogout }: DashboardProps) {
   const [batchImportDialogOpen, setBatchImportDialogOpen] = useState(false)
   const [kamImportDialogOpen, setKamImportDialogOpen] = useState(false)
   const [awsSsoImportDialogOpen, setAwsSsoImportDialogOpen] = useState(false)
+  const [settingsDialogOpen, setSettingsDialogOpen] = useState(false)
   const [selectedIds, setSelectedIds] = useState<Set<number>>(new Set())
   const [verifyDialogOpen, setVerifyDialogOpen] = useState(false)
   const [verifying, setVerifying] = useState(false)
@@ -570,6 +572,9 @@ export function Dashboard({ onLogout }: DashboardProps) {
                   : '均衡负载'
               )}
             </Button>
+            <Button variant="ghost" size="icon" onClick={() => setSettingsDialogOpen(true)} title="系统设置">
+              <Settings className="h-5 w-5" />
+            </Button>
             <Button variant="ghost" size="icon" onClick={toggleDarkMode}>
               {darkMode ? <Sun className="h-5 w-5" /> : <Moon className="h-5 w-5" />}
             </Button>
@@ -796,6 +801,12 @@ export function Dashboard({ onLogout }: DashboardProps) {
       <AwsSsoImportDialog
         open={awsSsoImportDialogOpen}
         onOpenChange={setAwsSsoImportDialogOpen}
+      />
+
+      {/* 系统设置对话框 */}
+      <SettingsDialog
+        open={settingsDialogOpen}
+        onOpenChange={setSettingsDialogOpen}
       />
 
       {/* 批量验活对话框 */}

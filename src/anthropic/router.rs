@@ -11,7 +11,7 @@ use crate::kiro::provider::KiroProvider;
 
 use super::{
     handlers::{count_tokens, get_models, post_messages, post_messages_cc},
-    middleware::{AppState, auth_middleware, cors_layer},
+    middleware::{AppState, SharedApiKey, auth_middleware, cors_layer},
 };
 
 /// 请求体最大大小限制 (50MB)
@@ -30,12 +30,12 @@ const MAX_BODY_SIZE: usize = 50 * 1024 * 1024;
 /// - `Authorization: Bearer <token>` header
 ///
 /// # 参数
-/// - `api_key`: API 密钥，用于验证客户端请求
+/// - `api_key`: API 密钥共享句柄，用于验证客户端请求（可热替换）
 /// - `kiro_provider`: 可选的 KiroProvider，用于调用上游 API
 
 /// 创建带有 KiroProvider 的 Anthropic API 路由
 pub fn create_router_with_provider(
-    api_key: impl Into<String>,
+    api_key: SharedApiKey,
     kiro_provider: Option<KiroProvider>,
     extract_thinking: bool,
 ) -> Router {

@@ -10,6 +10,8 @@ import {
   deleteCredential,
   getLoadBalancingMode,
   setLoadBalancingMode,
+  getAppConfig,
+  updateAppConfig,
 } from '@/api/credentials'
 import type { AddCredentialRequest } from '@/types/api'
 
@@ -115,6 +117,25 @@ export function useSetLoadBalancingMode() {
     mutationFn: setLoadBalancingMode,
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['loadBalancingMode'] })
+    },
+  })
+}
+
+// 获取应用配置
+export function useAppConfig() {
+  return useQuery({
+    queryKey: ['appConfig'],
+    queryFn: getAppConfig,
+  })
+}
+
+// 更新应用配置
+export function useUpdateAppConfig() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: updateAppConfig,
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['appConfig'] })
     },
   })
 }

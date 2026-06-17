@@ -3,7 +3,9 @@
 //! 负责将 Anthropic API 请求格式转换为 Kiro API 请求格式
 
 use std::collections::HashMap;
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
+
+use parking_lot::RwLock;
 
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
@@ -24,23 +26,44 @@ use super::types::{ContentBlock, MessagesRequest};
 /// 未初始化时（单元测试 / 直接调用 `map_model` 的场景）回退到内置默认表，
 /// 这样既无需改动 `map_model` / `get_context_window_size` 的函数签名，
 /// 也不破坏现有调用方与测试。
-static MODEL_REGISTRY: OnceLock<Vec<ModelDef>> = OnceLock::new();
+///
+/// 用 `RwLock<Arc<...>>` 包裹以支持运行时热替换（Admin API 修改 models 后无需重启）：
+/// 读多写少，读取时克隆 `Arc` 即可获得稳定快照，写入时整体替换。
+static MODEL_REGISTRY: OnceLock<RwLock<Arc<Vec<ModelDef>>>> = OnceLock::new();
+
+/// 获取（惰性初始化）注册表容器，未初始化时回退内置默认表。
+fn registry() -> &'static RwLock<Arc<Vec<ModelDef>>> {
+    MODEL_REGISTRY.get_or_init(|| RwLock::new(Arc::new(default_models())))
+}
 
 /// 使用配置的模型表初始化全局注册表。
 ///
-/// 仅首次调用生效（`OnceLock` 语义），重复调用静默忽略。应在启动早期、
-/// 任何请求进入前调用一次。
+/// 应在启动早期、任何请求进入前调用一次。若注册表尚未初始化则直接以注入值建立；
+/// 否则等价于一次热替换（见 [`set_model_registry`]）。
 pub fn init_model_registry(models: Vec<ModelDef>) {
-    let _ = MODEL_REGISTRY.set(models);
+    if MODEL_REGISTRY
+        .set(RwLock::new(Arc::new(models.clone())))
+        .is_err()
+    {
+        // 已初始化（极少见：测试中先触发了惰性默认表），改为热替换
+        set_model_registry(models);
+    }
 }
 
-/// 获取当前生效的模型表：已初始化用注入值，否则回退内置默认表。
-fn models() -> &'static [ModelDef] {
-    MODEL_REGISTRY.get_or_init(default_models)
+/// 运行时热替换全局模型表（Admin API 修改 models 后调用）。
+///
+/// 立即对后续的 `map_model` / `get_context_window_size` / `registered_models` 生效。
+pub fn set_model_registry(models: Vec<ModelDef>) {
+    *registry().write() = Arc::new(models);
 }
 
-/// 公开当前生效的模型表，供 `GET /v1/models` 生成展示列表。
-pub fn registered_models() -> &'static [ModelDef] {
+/// 获取当前生效的模型表快照（克隆 `Arc`，廉价）。
+fn models() -> Arc<Vec<ModelDef>> {
+    registry().read().clone()
+}
+
+/// 公开当前生效的模型表快照，供 `GET /v1/models` 生成展示列表。
+pub fn registered_models() -> Arc<Vec<ModelDef>> {
     models()
 }
 
@@ -48,21 +71,24 @@ pub fn registered_models() -> &'static [ModelDef] {
 ///
 /// 复现原 `map_model` 的语义：先匹配 `family`，若条目带 `version` 则同时尝试
 /// `4-6` / `4.6` 两种写法；不带 version（如 haiku）则 family 命中即可。
-/// 按表中顺序返回首个命中项。
-fn match_model_def(model: &str) -> Option<&'static ModelDef> {
+/// 按表中顺序返回首个命中项（克隆，因注册表可热替换无法返回 `'static` 引用）。
+fn match_model_def(model: &str) -> Option<ModelDef> {
     let model_lower = model.to_lowercase();
-    models().iter().find(|def| {
-        if !model_lower.contains(&def.family.to_lowercase()) {
-            return false;
-        }
-        match &def.version {
-            Some(v) => {
-                let dash = v.replace('.', "-");
-                model_lower.contains(&dash) || model_lower.contains(v)
+    models()
+        .iter()
+        .find(|def| {
+            if !model_lower.contains(&def.family.to_lowercase()) {
+                return false;
             }
-            None => true,
-        }
-    })
+            match &def.version {
+                Some(v) => {
+                    let dash = v.replace('.', "-");
+                    model_lower.contains(&dash) || model_lower.contains(v)
+                }
+                None => true,
+            }
+        })
+        .cloned()
 }
 
 /// 规范化 JSON Schema，修复 MCP 工具定义中常见的类型问题

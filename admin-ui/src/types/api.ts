@@ -105,3 +105,41 @@ export interface AddCredentialResponse {
   credentialId: number
   email?: string
 }
+
+// 模型定义（与后端 ModelDef camelCase 对应）
+export interface ModelDef {
+  family: string
+  version?: string | null
+  kiroId: string
+  displayId: string
+  displayName: string
+  created: number
+  maxTokens: number
+  contextWindow: number
+}
+
+// 应用配置（页面可编辑子集）当前值
+export interface AppConfig {
+  apiKey: string
+  credentialRpm: number
+  credentialRpmOpus?: number | null
+  credentialRpmSonnet?: number | null
+  credentialRpmHaiku?: number | null
+  kiroVersion: string
+  systemVersion: string
+  nodeVersion: string
+  models: ModelDef[]
+}
+
+// 更新应用配置请求（全量替换可编辑子集）
+export interface UpdateAppConfigRequest {
+  apiKey: string
+  credentialRpm: number
+  credentialRpmOpus?: number | null
+  credentialRpmSonnet?: number | null
+  credentialRpmHaiku?: number | null
+  kiroVersion: string
+  systemVersion: string
+  nodeVersion: string
+  models: ModelDef[]
+}

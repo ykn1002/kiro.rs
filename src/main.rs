@@ -87,6 +87,10 @@ async fn main() {
         std::process::exit(1);
     });
 
+    // 客户端 API Key 共享句柄（可被 Admin API 热替换），AppState 与 AdminService 共享
+    let shared_api_key: anthropic::SharedApiKey =
+        Arc::new(parking_lot::RwLock::new(api_key.clone()));
+
     // 构建代理配置
     let proxy_config = config.proxy_url.as_ref().map(|url| {
         let mut proxy = http_client::ProxyConfig::new(url);
@@ -160,7 +164,7 @@ async fn main() {
 
     // 构建 Anthropic API 路由（profile_arn 由 provider 层根据实际凭据动态注入）
     let anthropic_app = anthropic::create_router_with_provider(
-        &api_key,
+        shared_api_key.clone(),
         Some(kiro_provider),
         config.extract_thinking,
     );
@@ -178,8 +182,11 @@ async fn main() {
             tracing::warn!("admin_api_key 配置为空，Admin API 未启用");
             anthropic_app
         } else {
-            let admin_service =
-                admin::AdminService::new(token_manager.clone(), endpoint_names.clone());
+            let admin_service = admin::AdminService::new(
+                token_manager.clone(),
+                endpoint_names.clone(),
+                shared_api_key.clone(),
+            );
             let admin_state = admin::AdminState::new(admin_key, admin_service);
             let admin_app = admin::create_admin_router(admin_state);
 

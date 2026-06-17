@@ -10,7 +10,7 @@ use super::{
     middleware::AdminState,
     types::{
         AddCredentialRequest, SetDisabledRequest, SetLoadBalancingModeRequest, SetPriorityRequest,
-        SuccessResponse,
+        SuccessResponse, UpdateAppConfigRequest,
     },
 };
 
@@ -136,6 +136,24 @@ pub async fn set_load_balancing_mode(
     Json(payload): Json<SetLoadBalancingModeRequest>,
 ) -> impl IntoResponse {
     match state.service.set_load_balancing_mode(payload) {
+        Ok(response) => Json(response).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+/// GET /api/admin/config/app
+/// 获取页面可编辑的应用配置
+pub async fn get_app_config(State(state): State<AdminState>) -> impl IntoResponse {
+    Json(state.service.get_app_config())
+}
+
+/// PUT /api/admin/config/app
+/// 更新页面可编辑的应用配置（回写文件并热生效）
+pub async fn update_app_config(
+    State(state): State<AdminState>,
+    Json(payload): Json<UpdateAppConfigRequest>,
+) -> impl IntoResponse {
+    match state.service.update_app_config(payload) {
         Ok(response) => Json(response).into_response(),
         Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
     }

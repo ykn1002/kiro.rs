@@ -5,7 +5,7 @@
 
 use anyhow::bail;
 use chrono::{DateTime, Duration, Utc};
-use parking_lot::Mutex;
+use parking_lot::{Mutex, RwLock};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::sync::Mutex as TokioMutex;
@@ -14,6 +14,7 @@ use std::collections::HashMap;
 use std::fmt;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::{Duration as StdDuration, Instant};
 
 use crate::http_client::{ProxyConfig, build_client};
@@ -783,7 +784,9 @@ pub struct ManagerSnapshot {
 /// 支持多个凭据的管理，实现固定优先级 + 故障转移策略
 /// 故障统计基于 API 调用结果，而非 Token 刷新结果
 pub struct MultiTokenManager {
-    config: Config,
+    /// 应用配置（`RwLock<Arc<...>>` 以支持运行时热替换：Admin API 修改后无需重启）。
+    /// 读取时克隆 `Arc` 获得稳定快照，可安全跨 await 持有；写入时整体替换。
+    config: RwLock<Arc<Config>>,
     proxy: Option<ProxyConfig>,
     /// 凭据条目列表
     entries: Mutex<Vec<CredentialEntry>>,
@@ -923,7 +926,7 @@ impl MultiTokenManager {
 
         let load_balancing_mode = config.load_balancing_mode.clone();
         let manager = Self {
-            config,
+            config: RwLock::new(Arc::new(config)),
             proxy,
             entries: Mutex::new(entries),
             current_id: Mutex::new(initial_id),
@@ -951,9 +954,21 @@ impl MultiTokenManager {
         Ok(manager)
     }
 
-    /// 获取配置的引用
-    pub fn config(&self) -> &Config {
-        &self.config
+    /// 获取当前配置的快照（克隆 `Arc`，廉价）。
+    ///
+    /// 返回 `Arc` 而非引用，因配置可被 [`replace_config`](Self::replace_config)
+    /// 热替换；持有快照可保证单次调用期间配置一致，且能安全跨 await。
+    pub fn config(&self) -> Arc<Config> {
+        self.config.read().clone()
+    }
+
+    /// 运行时热替换配置（Admin API 修改后调用）。
+    ///
+    /// 立即对后续读取 `config()` 的逻辑生效（RPM 上限、版本信息、TLS 等）。
+    /// 注意：`load_balancing_mode` 由独立的运行时字段维护，不受此方法影响；
+    /// `host`/`port` 已在启动时绑定，热替换不会重新绑定监听地址。
+    pub fn replace_config(&self, new_config: Config) {
+        *self.config.write() = Arc::new(new_config);
     }
 
     /// 获取凭据总数
@@ -983,7 +998,7 @@ impl MultiTokenManager {
 
         // RPM 节流：按模型类别取有效上限，并清理对应类别的滑动窗口
         let class = ModelClass::from_model(model);
-        let rpm = class.effective_rpm(&self.config);
+        let rpm = class.effective_rpm(&self.config());
         let now = Instant::now();
         if rpm > 0 {
             for e in entries.iter_mut() {
@@ -1065,7 +1080,7 @@ impl MultiTokenManager {
     /// 的过滤口径保持一致。无任何可用凭据时返回 None，把"全灭"交给后续报错逻辑处理。
     fn rpm_wait_for_slot(&self, model: Option<&str>, now: Instant) -> Option<StdDuration> {
         let class = ModelClass::from_model(model);
-        let rpm = class.effective_rpm(&self.config);
+        let rpm = class.effective_rpm(&self.config());
         if rpm == 0 {
             return None;
         }
@@ -1130,7 +1145,7 @@ impl MultiTokenManager {
             // 等待最早一个槽位滑出 60s 窗口再放行（最多等待 credential_rpm_max_wait_ms）。
             // 主要服务于单凭据场景——此时 RPM 上限本会被回退放行而形同虚设。
             // 等满上限后仍走原有 fallback 放行，保证不会无限阻塞。
-            let max_wait_ms = self.config.credential_rpm_max_wait_ms;
+            let max_wait_ms = self.config().credential_rpm_max_wait_ms;
             if max_wait_ms > 0 {
                 let now = Instant::now();
                 if let Some(wait) = self.rpm_wait_for_slot(model, now) {
@@ -1158,7 +1173,7 @@ impl MultiTokenManager {
                     None
                 } else {
                     let class = ModelClass::from_model(model);
-                    let rpm = class.effective_rpm(&self.config);
+                    let rpm = class.effective_rpm(&self.config());
                     let now = Instant::now();
                     let mut entries = self.entries.lock();
                     let current_id = *self.current_id.lock();
@@ -1223,7 +1238,7 @@ impl MultiTokenManager {
                 Ok(ctx) => {
                     // 记录一次请求，用于凭据级 RPM 滑动窗口统计（按模型类别）
                     let class = ModelClass::from_model(model);
-                    if class.effective_rpm(&self.config) > 0 {
+                    if class.effective_rpm(&self.config()) > 0 {
                         let now = Instant::now();
                         let mut entries = self.entries.lock();
                         if let Some(entry) = entries.iter_mut().find(|e| e.id == ctx.id) {
@@ -1322,7 +1337,7 @@ impl MultiTokenManager {
                 // 确实需要刷新
                 let effective_proxy = current_creds.effective_proxy(self.proxy.as_ref());
                 let new_creds =
-                    refresh_token(&current_creds, &self.config, effective_proxy.as_ref()).await?;
+                    refresh_token(&current_creds, &self.config(), effective_proxy.as_ref()).await?;
 
                 if is_token_expired(&new_creds) {
                     anyhow::bail!("刷新后的 Token 仍然无效或已过期");
@@ -1367,7 +1382,7 @@ impl MultiTokenManager {
         // 等接口要求必须携带。若缺失则通过 ListAvailableProfiles 获取并持久化。
         let creds = if creds.is_idc() && creds.profile_arn.is_none() {
             let effective_proxy = creds.effective_proxy(self.proxy.as_ref());
-            match list_available_profile(&creds, &self.config, &token, effective_proxy.as_ref())
+            match list_available_profile(&creds, &self.config(), &token, effective_proxy.as_ref())
                 .await
             {
                 Ok(Some((arn, arn_region))) => {
@@ -1849,10 +1864,10 @@ impl MultiTokenManager {
         let total = entries.len();
 
         // 预先计算各类别生效上限（对所有凭据一致）
-        let limit_opus = ModelClass::Opus.effective_rpm(&self.config);
-        let limit_sonnet = ModelClass::Sonnet.effective_rpm(&self.config);
-        let limit_haiku = ModelClass::Haiku.effective_rpm(&self.config);
-        let limit_other = ModelClass::Other.effective_rpm(&self.config);
+        let limit_opus = ModelClass::Opus.effective_rpm(&self.config());
+        let limit_sonnet = ModelClass::Sonnet.effective_rpm(&self.config());
+        let limit_haiku = ModelClass::Haiku.effective_rpm(&self.config());
+        let limit_other = ModelClass::Other.effective_rpm(&self.config());
         let now = Instant::now();
 
         let snapshots: Vec<CredentialEntrySnapshot> = entries
@@ -2050,7 +2065,7 @@ impl MultiTokenManager {
                 if is_token_expired(&current_creds) || is_token_expiring_soon(&current_creds) {
                     let effective_proxy = current_creds.effective_proxy(self.proxy.as_ref());
                     let new_creds =
-                        refresh_token(&current_creds, &self.config, effective_proxy.as_ref())
+                        refresh_token(&current_creds, &self.config(), effective_proxy.as_ref())
                             .await?;
                     {
                         let mut entries = self.entries.lock();
@@ -2087,7 +2102,7 @@ impl MultiTokenManager {
         };
 
         let effective_proxy = credentials.effective_proxy(self.proxy.as_ref());
-        let usage_limits = get_usage_limits(&credentials, &self.config, &token, effective_proxy.as_ref()).await?;
+        let usage_limits = get_usage_limits(&credentials, &self.config(), &token, effective_proxy.as_ref()).await?;
 
         // 更新订阅等级到凭据（仅在发生变化时持久化）
         if let Some(subscription_title) = usage_limits.subscription_title() {
@@ -2200,7 +2215,7 @@ impl MultiTokenManager {
             new_cred.clone()
         } else {
             let effective_proxy = new_cred.effective_proxy(self.proxy.as_ref());
-            refresh_token(&new_cred, &self.config, effective_proxy.as_ref()).await?
+            refresh_token(&new_cred, &self.config(), effective_proxy.as_ref()).await?
         };
 
         // 4. 分配新 ID
@@ -2339,7 +2354,7 @@ impl MultiTokenManager {
         // 无条件调用 refresh_token
         let effective_proxy = credentials.effective_proxy(self.proxy.as_ref());
         let new_creds =
-            refresh_token(&credentials, &self.config, effective_proxy.as_ref()).await?;
+            refresh_token(&credentials, &self.config(), effective_proxy.as_ref()).await?;
 
         // 更新 entries 中对应凭据
         {
@@ -2367,7 +2382,7 @@ impl MultiTokenManager {
     fn persist_load_balancing_mode(&self, mode: &str) -> anyhow::Result<()> {
         use anyhow::Context;
 
-        let config_path = match self.config.config_path() {
+        let config_path = match self.config().config_path() {
             Some(path) => path.to_path_buf(),
             None => {
                 tracing::warn!("配置文件路径未知，负载均衡模式仅在当前进程生效: {}", mode);
@@ -3360,5 +3375,23 @@ mod tests {
         // haiku/other 未单独配置且通用值为 0 → 不限制
         assert_eq!(item.rpm.limit_haiku, 0);
         assert_eq!(item.rpm.limit_other, 0);
+    }
+
+    #[test]
+    fn test_replace_config_hot_swaps_rpm_limits() {
+        // 初始无 RPM 限制，热替换为带 Opus 上限的配置后立即生效
+        let manager = make_manager_with_rpm(1, 0, 0);
+        assert_eq!(ModelClass::Opus.effective_rpm(&manager.config()), 0);
+
+        let mut new_config = Config::default();
+        new_config.credential_rpm = 7;
+        new_config.credential_rpm_opus = Some(3);
+        manager.replace_config(new_config);
+
+        // config() 快照立即反映新值
+        assert_eq!(ModelClass::Opus.effective_rpm(&manager.config()), 3);
+        // 未单独配置的类别回退到通用 credential_rpm
+        assert_eq!(ModelClass::Sonnet.effective_rpm(&manager.config()), 7);
+        assert_eq!(manager.config().credential_rpm, 7);
     }
 }

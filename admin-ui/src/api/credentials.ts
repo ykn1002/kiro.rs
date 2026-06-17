@@ -8,6 +8,8 @@ import type {
   SetPriorityRequest,
   AddCredentialRequest,
   AddCredentialResponse,
+  AppConfig,
+  UpdateAppConfigRequest,
 } from '@/types/api'
 
 // 创建 axios 实例
@@ -105,5 +107,17 @@ export async function getLoadBalancingMode(): Promise<{ mode: LoadBalancingMode 
 // 设置负载均衡模式
 export async function setLoadBalancingMode(mode: LoadBalancingMode): Promise<{ mode: LoadBalancingMode }> {
   const { data } = await api.put<{ mode: LoadBalancingMode }>('/config/load-balancing', { mode })
+  return data
+}
+
+// 获取应用配置（页面可编辑子集）
+export async function getAppConfig(): Promise<AppConfig> {
+  const { data } = await api.get<AppConfig>('/config/app')
+  return data
+}
+
+// 更新应用配置（回写文件并热生效）
+export async function updateAppConfig(req: UpdateAppConfigRequest): Promise<AppConfig> {
+  const { data } = await api.put<AppConfig>('/config/app', req)
   return data
 }

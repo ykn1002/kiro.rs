@@ -9,17 +9,24 @@ use axum::{
     middleware::Next,
     response::{IntoResponse, Json, Response},
 };
+use parking_lot::RwLock;
 
 use crate::common::auth;
 use crate::kiro::provider::KiroProvider;
 
 use super::types::ErrorResponse;
 
+/// 客户端 API 密钥的共享句柄
+///
+/// 用 `Arc<RwLock<String>>` 包裹以支持运行时热替换（Admin API 修改 `apiKey` 后
+/// 立即对后续请求生效，无需重启）。AppState 与 AdminService 共享同一句柄。
+pub type SharedApiKey = Arc<RwLock<String>>;
+
 /// 应用共享状态
 #[derive(Clone)]
 pub struct AppState {
-    /// API 密钥
-    pub api_key: String,
+    /// API 密钥（共享句柄，可热替换）
+    pub api_key: SharedApiKey,
     /// Kiro Provider（可选，用于实际 API 调用）
     /// 内部使用 MultiTokenManager，已支持线程安全的多凭据管理
     pub kiro_provider: Option<Arc<KiroProvider>>,
@@ -29,9 +36,9 @@ pub struct AppState {
 
 impl AppState {
     /// 创建新的应用状态
-    pub fn new(api_key: impl Into<String>, extract_thinking: bool) -> Self {
+    pub fn new(api_key: SharedApiKey, extract_thinking: bool) -> Self {
         Self {
-            api_key: api_key.into(),
+            api_key,
             kiro_provider: None,
             extract_thinking,
         }
@@ -50,8 +57,9 @@ pub async fn auth_middleware(
     request: Request<Body>,
     next: Next,
 ) -> Response {
+    let expected = state.api_key.read().clone();
     match auth::extract_api_key(&request) {
-        Some(key) if auth::constant_time_eq(&key, &state.api_key) => next.run(request).await,
+        Some(key) if auth::constant_time_eq(&key, &expected) => next.run(request).await,
         _ => {
             let error = ErrorResponse::authentication_error();
             (StatusCode::UNAUTHORIZED, Json(error)).into_response()
