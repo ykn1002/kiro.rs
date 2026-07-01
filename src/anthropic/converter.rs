@@ -21,6 +21,26 @@ use crate::model::config::{ModelDef, default_models};
 
 use super::types::{ContentBlock, MessagesRequest};
 
+/// 全局模型注册表设置（模型表 + 别名 + 默认回退）
+#[derive(Debug, Clone)]
+pub struct ModelRegistrySettings {
+    pub models: Vec<ModelDef>,
+    /// 客户端模型名（小写）→ 目标模型名
+    pub aliases: HashMap<String, String>,
+    /// 未匹配时的回退模型名
+    pub default_model: Option<String>,
+}
+
+impl Default for ModelRegistrySettings {
+    fn default() -> Self {
+        Self {
+            models: default_models(),
+            aliases: HashMap::new(),
+            default_model: None,
+        }
+    }
+}
+
 /// 全局模型注册表，由 `main.rs` 在启动时通过 `init_model_registry` 注入配置。
 ///
 /// 未初始化时（单元测试 / 直接调用 `map_model` 的场景）回退到内置默认表，
@@ -29,11 +49,11 @@ use super::types::{ContentBlock, MessagesRequest};
 ///
 /// 用 `RwLock<Arc<...>>` 包裹以支持运行时热替换（Admin API 修改 models 后无需重启）：
 /// 读多写少，读取时克隆 `Arc` 即可获得稳定快照，写入时整体替换。
-static MODEL_REGISTRY: OnceLock<RwLock<Arc<Vec<ModelDef>>>> = OnceLock::new();
+static MODEL_REGISTRY: OnceLock<RwLock<Arc<ModelRegistrySettings>>> = OnceLock::new();
 
 /// 获取（惰性初始化）注册表容器，未初始化时回退内置默认表。
-fn registry() -> &'static RwLock<Arc<Vec<ModelDef>>> {
-    MODEL_REGISTRY.get_or_init(|| RwLock::new(Arc::new(default_models())))
+fn registry() -> &'static RwLock<Arc<ModelRegistrySettings>> {
+    MODEL_REGISTRY.get_or_init(|| RwLock::new(Arc::new(ModelRegistrySettings::default())))
 }
 
 /// 使用配置的模型表初始化全局注册表。
@@ -41,25 +61,53 @@ fn registry() -> &'static RwLock<Arc<Vec<ModelDef>>> {
 /// 应在启动早期、任何请求进入前调用一次。若注册表尚未初始化则直接以注入值建立；
 /// 否则等价于一次热替换（见 [`set_model_registry`]）。
 pub fn init_model_registry(models: Vec<ModelDef>) {
+    init_model_mapping(models, HashMap::new(), None);
+}
+
+/// 初始化模型表、别名与默认回退（Codex / OpenAI 客户端模型名映射）
+pub fn init_model_mapping(
+    models: Vec<ModelDef>,
+    aliases: HashMap<String, String>,
+    default_model: Option<String>,
+) {
+    let settings = ModelRegistrySettings {
+        models,
+        aliases,
+        default_model,
+    };
     if MODEL_REGISTRY
-        .set(RwLock::new(Arc::new(models.clone())))
+        .set(RwLock::new(Arc::new(settings.clone())))
         .is_err()
     {
-        // 已初始化（极少见：测试中先触发了惰性默认表），改为热替换
-        set_model_registry(models);
+        set_model_registry_settings(settings);
     }
 }
 
 /// 运行时热替换全局模型表（Admin API 修改 models 后调用）。
 ///
-/// 立即对后续的 `map_model` / `get_context_window_size` / `registered_models` 生效。
+/// 保留现有 aliases / default_model 不变。
 pub fn set_model_registry(models: Vec<ModelDef>) {
-    *registry().write() = Arc::new(models);
+    let current = registry().read().clone();
+    set_model_registry_settings(ModelRegistrySettings {
+        models,
+        aliases: current.aliases.clone(),
+        default_model: current.default_model.clone(),
+    });
+}
+
+/// 运行时热替换完整模型注册表设置
+pub fn set_model_registry_settings(settings: ModelRegistrySettings) {
+    *registry().write() = Arc::new(settings);
+}
+
+/// 获取当前生效的注册表快照（克隆 `Arc`，廉价）。
+fn settings() -> Arc<ModelRegistrySettings> {
+    registry().read().clone()
 }
 
 /// 获取当前生效的模型表快照（克隆 `Arc`，廉价）。
 fn models() -> Arc<Vec<ModelDef>> {
-    registry().read().clone()
+    Arc::new(settings().models.clone())
 }
 
 /// 公开当前生效的模型表快照，供 `GET /v1/models` 生成展示列表。
@@ -67,15 +115,31 @@ pub fn registered_models() -> Arc<Vec<ModelDef>> {
     models()
 }
 
-/// 在小写模型名中按 family + version 模糊匹配一个模型定义。
-///
-/// 复现原 `map_model` 的语义：先匹配 `family`，若条目带 `version` 则同时尝试
-/// `4-6` / `4.6` 两种写法；不带 version（如 haiku）则 family 命中即可。
-/// 按表中顺序返回首个命中项（克隆，因注册表可热替换无法返回 `'static` 引用）。
-fn match_model_def(model: &str) -> Option<ModelDef> {
+/// 解析别名链，返回最终用于匹配的模型名
+fn resolve_aliases(model: &str) -> String {
+    let mut current = model.to_string();
+    for _ in 0..8 {
+        let key = current.to_lowercase();
+        match settings().aliases.get(&key) {
+            Some(next) if next.to_lowercase() != key => current = next.clone(),
+            _ => break,
+        }
+    }
+    current
+}
+
+/// 在模型表中查找定义：精确匹配 displayId/kiroId，再模糊 family+version
+fn lookup_model_def(model: &str) -> Option<ModelDef> {
     let model_lower = model.to_lowercase();
-    models()
-        .iter()
+    let list = &settings().models;
+
+    if let Some(def) = list.iter().find(|def| {
+        def.display_id.to_lowercase() == model_lower || def.kiro_id.to_lowercase() == model_lower
+    }) {
+        return Some(def.clone());
+    }
+
+    list.iter()
         .find(|def| {
             if !model_lower.contains(&def.family.to_lowercase()) {
                 return false;
@@ -89,6 +153,39 @@ fn match_model_def(model: &str) -> Option<ModelDef> {
             }
         })
         .cloned()
+}
+
+fn match_model_def(model: &str) -> Option<ModelDef> {
+    let resolved = resolve_aliases(model);
+    if let Some(def) = lookup_model_def(&resolved) {
+        if resolved.to_lowercase() != model.to_lowercase() {
+            tracing::debug!(
+                original = %model,
+                resolved = %resolved,
+                kiro_id = %def.kiro_id,
+                "模型映射: 别名命中"
+            );
+        }
+        return Some(def);
+    }
+
+    if let Some(default) = settings().default_model.clone() {
+        if default.to_lowercase() != model.to_lowercase()
+            && default.to_lowercase() != resolved.to_lowercase()
+        {
+            if let Some(def) = lookup_model_def(&resolve_aliases(&default)) {
+                tracing::debug!(
+                    original = %model,
+                    default = %default,
+                    kiro_id = %def.kiro_id,
+                    "模型映射: 使用 defaultModel 回退"
+                );
+                return Some(def);
+            }
+        }
+    }
+
+    None
 }
 
 /// 规范化 JSON Schema，修复 MCP 工具定义中常见的类型问题
@@ -969,6 +1066,10 @@ fn merge_assistant_messages(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+
+    /// 全局模型注册表测试互斥锁（避免并行测试互相覆盖）
+    static REGISTRY_TEST_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
     fn test_map_model_sonnet() {
@@ -1000,7 +1101,51 @@ mod tests {
 
     #[test]
     fn test_map_model_unsupported() {
+        let _lock = REGISTRY_TEST_LOCK.lock().unwrap();
+        set_model_registry_settings(ModelRegistrySettings {
+            models: default_models(),
+            aliases: HashMap::new(),
+            default_model: None,
+        });
         assert!(map_model("gpt-4").is_none());
+    }
+
+    #[test]
+    fn test_map_model_alias() {
+        let _lock = REGISTRY_TEST_LOCK.lock().unwrap();
+        let mut aliases = HashMap::new();
+        aliases.insert("gpt-5.5".to_string(), "claude-opus-4-6".to_string());
+        set_model_registry_settings(ModelRegistrySettings {
+            models: default_models(),
+            aliases,
+            default_model: None,
+        });
+        assert_eq!(map_model("gpt-5.5"), Some("claude-opus-4.6".to_string()));
+    }
+
+    #[test]
+    fn test_map_model_default_fallback() {
+        let _lock = REGISTRY_TEST_LOCK.lock().unwrap();
+        set_model_registry_settings(ModelRegistrySettings {
+            models: default_models(),
+            aliases: HashMap::new(),
+            default_model: Some("claude-sonnet-4-6".to_string()),
+        });
+        assert_eq!(map_model("gpt-5.5"), Some("claude-sonnet-4.6".to_string()));
+    }
+
+    #[test]
+    fn test_map_model_exact_display_id() {
+        let _lock = REGISTRY_TEST_LOCK.lock().unwrap();
+        set_model_registry_settings(ModelRegistrySettings {
+            models: default_models(),
+            aliases: HashMap::new(),
+            default_model: None,
+        });
+        assert_eq!(
+            map_model("claude-sonnet-4-6"),
+            Some("claude-sonnet-4.6".to_string())
+        );
     }
 
     #[test]

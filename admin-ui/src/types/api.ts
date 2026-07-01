@@ -129,6 +129,8 @@ export interface AppConfig {
   systemVersion: string
   nodeVersion: string
   models: ModelDef[]
+  defaultModel?: string | null
+  modelAliases: Record<string, string>
 }
 
 // 更新应用配置请求（全量替换可编辑子集）
@@ -142,4 +144,6 @@ export interface UpdateAppConfigRequest {
   systemVersion: string
   nodeVersion: string
   models: ModelDef[]
+  defaultModel?: string | null
+  modelAliases: Record<string, string>
 }

@@ -1,5 +1,7 @@
 //! Admin API 类型定义
 
+use std::collections::HashMap;
+
 use serde::{Deserialize, Serialize};
 
 use crate::model::config::ModelDef;
@@ -224,6 +226,11 @@ pub struct AppConfigResponse {
     pub node_version: String,
     /// 模型列表（生效值，缺省时为内置默认表）
     pub models: Vec<ModelDef>,
+    /// OpenAI/Codex 未识别模型名的回退目标（displayId / kiroId）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub default_model: Option<String>,
+    /// 客户端模型名 → 本服务模型名
+    pub model_aliases: HashMap<String, String>,
 }
 
 /// 更新应用配置请求（全量替换可编辑子集）
@@ -252,6 +259,12 @@ pub struct UpdateAppConfigRequest {
     pub node_version: String,
     /// 模型列表（至少一个）
     pub models: Vec<ModelDef>,
+    /// OpenAI/Codex 未识别模型名的回退目标
+    #[serde(default)]
+    pub default_model: Option<String>,
+    /// 客户端模型名 → 本服务模型名
+    #[serde(default)]
+    pub model_aliases: HashMap<String, String>,
 }
 
 // ============ 通用响应 ============

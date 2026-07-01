@@ -27,7 +27,27 @@ function parseOptionalRpm(value: string): number | null | undefined {
   return Number.isFinite(n) && n >= 0 ? n : null
 }
 
-// PLACEHOLDER_BODY
+
+interface ModelAliasRow {
+  from: string
+  to: string
+}
+
+function aliasesToRows(aliases: Record<string, string>): ModelAliasRow[] {
+  return Object.entries(aliases).map(([from, to]) => ({ from, to }))
+}
+
+function rowsToAliases(rows: ModelAliasRow[]): Record<string, string> {
+  const out: Record<string, string> = {}
+  for (const row of rows) {
+    const from = row.from.trim()
+    const to = row.to.trim()
+    if (from && to) {
+      out[from] = to
+    }
+  }
+  return out
+}
 
 export function SettingsDialog({ open, onOpenChange }: SettingsDialogProps) {
   const { data: config, isLoading, error } = useAppConfig()
@@ -44,6 +64,9 @@ export function SettingsDialog({ open, onOpenChange }: SettingsDialogProps) {
   const [nodeVersion, setNodeVersion] = useState('')
   const [models, setModels] = useState<ModelDef[]>([])
   const [modelsExpanded, setModelsExpanded] = useState(false)
+  const [defaultModel, setDefaultModel] = useState('')
+  const [modelAliases, setModelAliases] = useState<ModelAliasRow[]>([])
+  const [aliasesExpanded, setAliasesExpanded] = useState(true)
 
   // 打开对话框（或拉到数据）时用服务端值回填表单
   useEffect(() => {
@@ -58,6 +81,8 @@ export function SettingsDialog({ open, onOpenChange }: SettingsDialogProps) {
     setSystemVersion(config.systemVersion)
     setNodeVersion(config.nodeVersion)
     setModels(config.models.map((m) => ({ ...m })))
+    setDefaultModel(config.defaultModel ?? '')
+    setModelAliases(aliasesToRows(config.modelAliases ?? {}))
   }, [open, config])
 
   const updateModel = (index: number, patch: Partial<ModelDef>) => {
@@ -82,6 +107,18 @@ export function SettingsDialog({ open, onOpenChange }: SettingsDialogProps) {
 
   const removeModel = (index: number) => {
     setModels((prev) => prev.filter((_, i) => i !== index))
+  }
+
+  const addAlias = () => {
+    setModelAliases((prev) => [...prev, { from: '', to: '' }])
+  }
+
+  const updateAlias = (index: number, patch: Partial<ModelAliasRow>) => {
+    setModelAliases((prev) => prev.map((row, i) => (i === index ? { ...row, ...patch } : row)))
+  }
+
+  const removeAlias = (index: number) => {
+    setModelAliases((prev) => prev.filter((_, i) => i !== index))
   }
 
   const handleSubmit = (e: React.FormEvent) => {
@@ -114,6 +151,17 @@ export function SettingsDialog({ open, onOpenChange }: SettingsDialogProps) {
       }
     }
 
+    for (let i = 0; i < modelAliases.length; i++) {
+      const row = modelAliases[i]
+      const hasFrom = row.from.trim().length > 0
+      const hasTo = row.to.trim().length > 0
+      if (hasFrom !== hasTo) {
+        setAliasesExpanded(true)
+        toast.error(`第 ${i + 1} 条模型别名的「客户端名」和「映射目标」需同时填写或同时留空`)
+        return
+      }
+    }
+
     const cleanedModels: ModelDef[] = models.map((m) => ({
       family: m.family.trim(),
       version: m.version?.trim() ? m.version.trim() : null,
@@ -136,6 +184,8 @@ export function SettingsDialog({ open, onOpenChange }: SettingsDialogProps) {
         systemVersion: systemVersion.trim(),
         nodeVersion: nodeVersion.trim(),
         models: cleanedModels,
+        defaultModel: defaultModel.trim() || null,
+        modelAliases: rowsToAliases(modelAliases),
       },
       {
         onSuccess: () => {
@@ -276,6 +326,88 @@ export function SettingsDialog({ open, onOpenChange }: SettingsDialogProps) {
                 <p className="text-xs text-muted-foreground">
                   仅影响后续新发起的上游请求与 Token 刷新
                 </p>
+              </section>
+
+              {/* OpenAI/Codex 模型映射 */}
+              <section className="space-y-3">
+                <button
+                  type="button"
+                  onClick={() => setAliasesExpanded((v) => !v)}
+                  className="flex items-center gap-1 text-sm font-semibold hover:text-foreground/80"
+                >
+                  {aliasesExpanded ? (
+                    <ChevronDown className="h-4 w-4" />
+                  ) : (
+                    <ChevronRight className="h-4 w-4" />
+                  )}
+                  OpenAI / Codex 模型映射
+                  <span className="ml-1 text-xs font-normal text-muted-foreground">
+                    （{modelAliases.length} 个别名）
+                  </span>
+                </button>
+                {aliasesExpanded && (
+                  <>
+                    <div className="space-y-1">
+                      <label className="text-xs text-muted-foreground">defaultModel（未识别时回退）</label>
+                      <Input
+                        value={defaultModel}
+                        onChange={(e) => setDefaultModel(e.target.value)}
+                        disabled={isPending}
+                        placeholder="claude-opus-4-6"
+                        list="model-target-options"
+                      />
+                    </div>
+                    <p className="text-xs text-muted-foreground">
+                      Codex 发送 gpt-5.5 等 OpenAI 模型名时，通过别名或 defaultModel 映射到下方模型列表中的 displayId
+                    </p>
+                    <div className="space-y-2">
+                      {modelAliases.map((row, index) => (
+                        <div key={index} className="grid grid-cols-[1fr_1fr_auto] gap-2 items-end">
+                          <LabeledInput
+                            label="客户端模型名"
+                            value={row.from}
+                            disabled={isPending}
+                            onChange={(v) => updateAlias(index, { from: v })}
+                            placeholder="gpt-5.5"
+                          />
+                          <LabeledInput
+                            label="映射目标"
+                            value={row.to}
+                            disabled={isPending}
+                            onChange={(v) => updateAlias(index, { to: v })}
+                            placeholder="claude-opus-4-6"
+                          />
+                          <Button
+                            type="button"
+                            size="icon"
+                            variant="ghost"
+                            className="h-9 w-9 text-destructive hover:text-destructive shrink-0"
+                            onClick={() => removeAlias(index)}
+                            disabled={isPending}
+                          >
+                            <Trash2 className="h-4 w-4" />
+                          </Button>
+                        </div>
+                      ))}
+                    </div>
+                    <Button
+                      type="button"
+                      size="sm"
+                      variant="outline"
+                      className="w-full"
+                      onClick={addAlias}
+                      disabled={isPending}
+                    >
+                      <Plus className="h-4 w-4 mr-1" />
+                      添加别名
+                    </Button>
+                    <datalist id="model-target-options">
+                      {models.map((m) => (
+                        <option key={m.displayId} value={m.displayId} />
+                      ))}
+                    </datalist>
+                  </>
+                )}
               </section>
 
               {/* 模型列表 */}

@@ -9,6 +9,8 @@ use axum::{
 
 use crate::kiro::provider::KiroProvider;
 
+use crate::openai::{chat_completions, create_response};
+
 use super::{
     handlers::{count_tokens, get_models, post_messages, post_messages_cc},
     middleware::{AppState, SharedApiKey, auth_middleware, cors_layer},
@@ -49,6 +51,8 @@ pub fn create_router_with_provider(
         .route("/models", get(get_models))
         .route("/messages", post(post_messages))
         .route("/messages/count_tokens", post(count_tokens))
+        .route("/chat/completions", post(chat_completions))
+        .route("/responses", post(create_response))
         .layer(middleware::from_fn_with_state(
             state.clone(),
             auth_middleware,

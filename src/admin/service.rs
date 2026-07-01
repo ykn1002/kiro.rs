@@ -347,6 +347,8 @@ impl AdminService {
             system_version: config.system_version.clone(),
             node_version: config.node_version.clone(),
             models: config.effective_models(),
+            default_model: config.default_model.clone(),
+            model_aliases: config.model_aliases.clone(),
         }
     }
 
@@ -398,6 +400,29 @@ impl AdminService {
                 )));
             }
         }
+        for (from, to) in &req.model_aliases {
+            if from.trim().is_empty() || to.trim().is_empty() {
+                return Err(AdminServiceError::InvalidCredential(
+                    "modelAliases 的键和值均不能为空".to_string(),
+                ));
+            }
+        }
+        if req.default_model.as_ref().is_some_and(|s| s.trim().is_empty()) {
+            return Err(AdminServiceError::InvalidCredential(
+                "defaultModel 不能为空字符串".to_string(),
+            ));
+        }
+
+        let normalized_aliases: std::collections::HashMap<String, String> = req
+            .model_aliases
+            .iter()
+            .map(|(k, v)| (k.trim().to_lowercase(), v.trim().to_string()))
+            .collect();
+        let default_model = req
+            .default_model
+            .as_ref()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
 
         // ---- 读盘 → 改字段 → 回写 ----
         let config_path = self
@@ -424,6 +449,8 @@ impl AdminService {
         new_config.system_version = req.system_version.trim().to_string();
         new_config.node_version = req.node_version.trim().to_string();
         new_config.models = Some(req.models.clone());
+        new_config.model_aliases = normalized_aliases.clone();
+        new_config.default_model = default_model.clone();
 
         if config_path.is_some() {
             new_config.save().map_err(|e| {
@@ -435,7 +462,11 @@ impl AdminService {
 
         // ---- 热应用 ----
         *self.shared_api_key.write() = api_key.to_string();
-        crate::anthropic::set_model_registry(req.models);
+        crate::anthropic::init_model_mapping(
+            req.models,
+            normalized_aliases,
+            default_model,
+        );
         self.token_manager.replace_config(new_config);
 
         tracing::info!("应用配置已更新并热生效");

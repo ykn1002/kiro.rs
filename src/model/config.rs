@@ -188,6 +188,20 @@ pub struct Config {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub models: Option<Vec<ModelDef>>,
 
+    /// OpenAI/Codex 等客户端模型名 → 本服务模型名（displayId / kiroId / 别名）的显式映射。
+    ///
+    /// 键比较时不区分大小写。例如 Codex 发送 `gpt-5.5` 时可映射到 `claude-opus-4-6`。
+    #[serde(default)]
+    #[serde(skip_serializing_if = "HashMap::is_empty")]
+    pub model_aliases: HashMap<String, String>,
+
+    /// 未命中任何模型规则时的回退模型名（displayId / kiroId / 别名）。
+    ///
+    /// 适用于 Codex 等固定发送 `gpt-5.x` 但后端实际走 Claude/Kiro 的场景。
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub default_model: Option<String>,
+
     /// 配置文件路径（运行时元数据，不写入 JSON）
     #[serde(skip)]
     config_path: Option<PathBuf>,
@@ -348,6 +362,8 @@ impl Default for Config {
             default_endpoint: default_endpoint(),
             endpoints: HashMap::new(),
             models: None,
+            model_aliases: HashMap::new(),
+            default_model: None,
             config_path: None,
         }
     }
@@ -375,6 +391,14 @@ impl Config {
     /// 优先使用配置的 `models`，未配置时回退到内置默认表
     pub fn effective_models(&self) -> Vec<ModelDef> {
         self.models.clone().unwrap_or_else(default_models)
+    }
+
+    /// 模型别名表（键统一为小写）
+    pub fn effective_model_aliases(&self) -> HashMap<String, String> {
+        self.model_aliases
+            .iter()
+            .map(|(k, v)| (k.to_lowercase(), v.clone()))
+            .collect()
     }
 
     /// 从文件加载配置

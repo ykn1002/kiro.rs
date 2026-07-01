@@ -6,6 +6,12 @@
   "region": "us-east-1",
   "adminApiKey": "sk-admin-your-secret-key",
   "defaultEndpoint": "ide",
+  "defaultModel": "claude-opus-4-6",
+  "modelAliases": {
+    "gpt-5.5": "claude-opus-4-6",
+    "gpt-5.4": "claude-opus-4-6",
+    "gpt-5": "claude-sonnet-4-6"
+  },
   "credentialRpm": 5,
   "credentialRpmOpus": 5,
   "credentialRpmSonnet": 15,

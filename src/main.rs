@@ -2,6 +2,7 @@ mod admin;
 mod admin_ui;
 mod anthropic;
 mod common;
+mod openai;
 mod http_client;
 mod kiro;
 mod model;
@@ -42,7 +43,19 @@ async fn main() {
 
     // 初始化全局模型注册表（配置的 models 或内置默认表），供 map_model /
     // get_context_window_size / get_models 使用。须在任何请求进入前完成。
-    anthropic::init_model_registry(config.effective_models());
+    anthropic::init_model_mapping(
+        config.effective_models(),
+        config.effective_model_aliases(),
+        config.default_model.clone(),
+    );
+
+    if config.default_model.is_some() || !config.model_aliases.is_empty() {
+        tracing::info!(
+            default_model = ?config.default_model,
+            alias_count = config.model_aliases.len(),
+            "已加载 OpenAI/Codex 模型映射"
+        );
+    }
 
     // 加载凭证（支持单对象或数组格式）
     let credentials_path = args
@@ -205,12 +218,14 @@ async fn main() {
 
     // 启动服务器
     let addr = format!("{}:{}", config.host, config.port);
-    tracing::info!("启动 Anthropic API 端点: {}", addr);
+    tracing::info!("启动 API 端点: {}", addr);
     tracing::info!("API Key: {}***", &api_key[..(api_key.len() / 2)]);
     tracing::info!("可用 API:");
     tracing::info!("  GET  /v1/models");
     tracing::info!("  POST /v1/messages");
     tracing::info!("  POST /v1/messages/count_tokens");
+    tracing::info!("  POST /v1/chat/completions  (OpenAI Chat Completions)");
+    tracing::info!("  POST /v1/responses         (OpenAI Responses / Codex 原生)");
     if admin_key_valid {
         tracing::info!("Admin API:");
         tracing::info!("  GET  /api/admin/credentials");
