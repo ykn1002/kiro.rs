@@ -42,6 +42,7 @@ pub fn responses_to_anthropic(req: &ResponsesRequest) -> Result<MessagesRequest,
     }
 
     normalize_messages(&mut messages);
+    coalesce_consecutive_messages(&mut messages);
 
     if messages.is_empty() {
         return Err(ConversionError::EmptyMessages);
@@ -431,10 +432,101 @@ fn extract_output_value(value: &serde_json::Value) -> String {
         serde_json::Value::String(s) => s.clone(),
         serde_json::Value::Array(parts) => parts
             .iter()
-            .filter_map(|p| p.get("text").and_then(|t| t.as_str()))
+            .filter_map(|p| {
+                p.get("text")
+                    .and_then(|t| t.as_str())
+                    .map(str::to_string)
+                    .or_else(|| response_content_part_to_text(p))
+            })
             .collect::<Vec<_>>()
             .join("\n"),
+        serde_json::Value::Object(obj) => {
+            if let Some(text) = obj.get("content").and_then(|v| v.as_str()) {
+                return text.to_string();
+            }
+            if let Some(text) = obj.get("text").and_then(|v| v.as_str()) {
+                return text.to_string();
+            }
+            if let Some(items) = obj.get("content_items").or_else(|| obj.get("contentItems")) {
+                return extract_output_value(items);
+            }
+            if let Some(body) = obj.get("body") {
+                return extract_output_value(body);
+            }
+            value.to_string()
+        }
         other => other.to_string(),
+    }
+}
+
+/// 合并相邻同 role 消息（Codex 可能把多个 function_call_output 拆成多条 user）
+fn coalesce_consecutive_messages(messages: &mut Vec<Message>) {
+    if messages.len() < 2 {
+        return;
+    }
+    let mut merged: Vec<Message> = Vec::with_capacity(messages.len());
+    for msg in messages.drain(..) {
+        if let Some(last) = merged.last_mut() {
+            if last.role == msg.role && (last.role == "user" || last.role == "assistant") {
+                last.content = merge_message_content(&last.content, &msg.content);
+                continue;
+            }
+        }
+        merged.push(msg);
+    }
+    *messages = merged;
+}
+
+fn merge_message_content(
+    left: &serde_json::Value,
+    right: &serde_json::Value,
+) -> serde_json::Value {
+    use serde_json::json;
+    match (left, right) {
+        (serde_json::Value::String(a), serde_json::Value::String(b)) => {
+            if a.is_empty() {
+                json!(b)
+            } else if b.is_empty() {
+                json!(a)
+            } else {
+                json!(format!("{a}\n{b}"))
+            }
+        }
+        (serde_json::Value::Array(a), serde_json::Value::Array(b)) => {
+            let mut combined = a.clone();
+            combined.extend(b.clone());
+            json!(combined)
+        }
+        (serde_json::Value::String(text), serde_json::Value::Array(blocks))
+        | (serde_json::Value::Array(blocks), serde_json::Value::String(text)) => {
+            let mut combined = if text.is_empty() {
+                blocks.clone()
+            } else {
+                let mut v = vec![json!({"type": "text", "text": text})];
+                v.extend(blocks.clone());
+                v
+            };
+            if combined.len() == 1 {
+                if combined[0].get("type").and_then(|t| t.as_str()) == Some("text") {
+                    json!(combined[0]["text"].as_str().unwrap_or(""))
+                } else {
+                    json!(combined)
+                }
+            } else {
+                json!(combined)
+            }
+        }
+        (serde_json::Value::String(text), other) | (other, serde_json::Value::String(text)) => {
+            if text.is_empty() {
+                other.clone()
+            } else {
+                merge_message_content(&json!(text), other)
+            }
+        }
+        (serde_json::Value::Array(blocks), other) | (other, serde_json::Value::Array(blocks)) => {
+            merge_message_content(&json!(blocks), other)
+        }
+        _ => right.clone(),
     }
 }
 
@@ -783,6 +875,75 @@ mod tests {
         let anthropic = responses_to_anthropic(&req).unwrap();
         assert_eq!(anthropic.messages.len(), 1);
         assert_eq!(anthropic.messages[0].content.as_str().unwrap(), "keep me");
+    }
+
+    #[test]
+    fn test_coalesce_parallel_tool_outputs() {
+        setup();
+        let req = ResponsesRequest {
+            model: "claude-sonnet-4-6".to_string(),
+            instructions: None,
+            input: vec![
+                serde_json::json!({
+                    "type": "function_call",
+                    "call_id": "call_a",
+                    "name": "shell",
+                    "arguments": "{}"
+                }),
+                serde_json::json!({
+                    "type": "function_call",
+                    "call_id": "call_b",
+                    "name": "read",
+                    "arguments": "{}"
+                }),
+                serde_json::json!({
+                    "type": "function_call_output",
+                    "call_id": "call_a",
+                    "output": "out-a"
+                }),
+                serde_json::json!({
+                    "type": "function_call_output",
+                    "call_id": "call_b",
+                    "output": "out-b"
+                }),
+                serde_json::json!({
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "continue"}]
+                }),
+            ],
+            tools: None,
+            tool_choice: None,
+            stream: true,
+            max_output_tokens: None,
+            reasoning: None,
+            extra: HashMap::new(),
+        };
+        let anthropic = responses_to_anthropic(&req).unwrap();
+        // 两个 tool output 应合并；末尾用户文本可与 tool_result 同在最后一条 user
+        assert!(anthropic.messages.len() >= 2);
+        let tool_user = anthropic
+            .messages
+            .iter()
+            .find(|m| {
+                m.role == "user"
+                    && m.content
+                        .as_array()
+                        .is_some_and(|arr| arr.iter().any(|b| b.get("type") == Some(&serde_json::Value::String("tool_result".into()))))
+            })
+            .expect("应存在含 tool_result 的 user 消息");
+        let merged = tool_user.content.as_array().unwrap();
+        assert!(merged.len() >= 2);
+        assert!(
+            merged
+                .iter()
+                .any(|b| b.get("tool_use_id") == Some(&serde_json::Value::String("call_a".into())))
+        );
+        assert!(
+            merged
+                .iter()
+                .any(|b| b.get("tool_use_id") == Some(&serde_json::Value::String("call_b".into())))
+        );
     }
 
     #[test]

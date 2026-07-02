@@ -419,7 +419,7 @@ pub fn convert_request(req: &MessagesRequest) -> Result<ConversionResult, Conver
 
     // 5. 处理最后一条消息作为 current_message（经过 prefill 预处理，末尾必为 user）
     let last_message = messages.last().unwrap();
-    let (text_content, images, tool_results) = process_message_content(&last_message.content)?;
+    let (text_content, images, mut tool_results) = process_message_content(&last_message.content)?;
 
     // 6. 转换工具定义（超长名称自动缩短并记录映射）
     let mut tool_name_map = HashMap::new();
@@ -427,6 +427,10 @@ pub fn convert_request(req: &MessagesRequest) -> Result<ConversionResult, Conver
 
     // 7. 构建历史消息（需要先构建，以便收集历史中使用的工具）
     let mut history = build_history(req, messages, &model_id, &mut tool_name_map)?;
+
+    // 7.5. 将当前消息里属于上一轮 tool_use 的 tool_result 归并到历史 user 消息
+    // Bedrock 要求 tool_result 必须紧跟在含 tool_use 的 assistant 之后，不能拆到 currentMessage
+    reconcile_tool_results_with_history(&mut history, &model_id, &mut tool_results);
 
     // 8. 验证并过滤 tool_use/tool_result 配对
     // 移除孤立的 tool_result（没有对应的 tool_use）
@@ -668,6 +672,106 @@ fn validate_tool_pairing(
     }
 
     (filtered_results, unpaired_tool_use_ids)
+}
+
+/// 将 currentMessage 中的 tool_result 归并到历史中紧邻 assistant(tool_use) 的 user 消息
+///
+/// Codex Responses 可能把多个 function_call_output 拆成多条 user，最后一条留在 currentMessage，
+/// 导致 Bedrock 报错 TOOL_USE_RESULT_MISMATCH。
+fn reconcile_tool_results_with_history(
+    history: &mut Vec<Message>,
+    model_id: &str,
+    tool_results: &mut Vec<ToolResult>,
+) {
+    use std::collections::HashSet;
+
+    if tool_results.is_empty() {
+        return;
+    }
+
+    loop {
+        let Some(asst_idx) = history.iter().rposition(|msg| {
+            matches!(
+                msg,
+                Message::Assistant(a)
+                    if a.assistant_response_message
+                        .tool_uses
+                        .as_ref()
+                        .is_some_and(|uses| !uses.is_empty())
+            )
+        }) else {
+            break;
+        };
+
+        let tool_use_ids: HashSet<String> = match &history[asst_idx] {
+            Message::Assistant(a) => a
+                .assistant_response_message
+                .tool_uses
+                .as_ref()
+                .map(|uses| uses.iter().map(|u| u.tool_use_id.clone()).collect())
+                .unwrap_or_default(),
+            _ => break,
+        };
+
+        let mut existing_result_ids: HashSet<String> = HashSet::new();
+        if asst_idx + 1 < history.len() {
+            if let Message::User(user_msg) = &history[asst_idx + 1] {
+                for result in &user_msg
+                    .user_input_message
+                    .user_input_message_context
+                    .tool_results
+                {
+                    existing_result_ids.insert(result.tool_use_id.clone());
+                }
+            }
+        }
+
+        let missing_ids: HashSet<String> = tool_use_ids
+            .difference(&existing_result_ids)
+            .cloned()
+            .collect();
+        if missing_ids.is_empty() {
+            break;
+        }
+
+        let mut moved = Vec::new();
+        let mut retained = Vec::new();
+        for result in tool_results.drain(..) {
+            if missing_ids.contains(&result.tool_use_id)
+                && !existing_result_ids.contains(&result.tool_use_id)
+            {
+                moved.push(result);
+            } else {
+                retained.push(result);
+            }
+        }
+        *tool_results = retained;
+
+        if moved.is_empty() {
+            break;
+        }
+
+        if asst_idx + 1 < history.len() {
+            if let Message::User(user_msg) = &mut history[asst_idx + 1] {
+                let moved_count = moved.len();
+                user_msg
+                    .user_input_message
+                    .user_input_message_context
+                    .tool_results
+                    .extend(moved);
+                tracing::debug!("已将 {moved_count} 个 tool_result 归并到历史 user 消息");
+                continue;
+            }
+        }
+
+        let mut ctx = UserInputMessageContext::new();
+        ctx.tool_results = moved;
+        let user = HistoryUserMessage {
+            user_input_message: UserMessage::new(" ", model_id).with_context(ctx),
+        };
+        history.insert(asst_idx + 1, Message::User(user));
+        tracing::debug!("已在历史 assistant(tool_use) 后插入 user 消息承载 tool_result");
+    }
 }
 
 /// 从历史消息中移除孤立的 tool_use
@@ -1737,6 +1841,48 @@ mod tests {
         // 因为 tool-1 已经在历史中配对了
         assert!(filtered.is_empty());
         assert!(orphaned.is_empty());
+    }
+
+    #[test]
+    fn test_reconcile_tool_results_with_history() {
+        use crate::kiro::model::requests::tool::ToolUseEntry;
+
+        let mut assistant_msg = AssistantMessage::new(" ");
+        assistant_msg = assistant_msg.with_tool_uses(vec![
+            ToolUseEntry::new("call_a", "shell").with_input(serde_json::json!({})),
+            ToolUseEntry::new("call_b", "read").with_input(serde_json::json!({})),
+        ]);
+
+        let mut user_partial = UserMessage::new(" ", "claude-sonnet-4.5");
+        let mut ctx = UserInputMessageContext::new();
+        ctx = ctx.with_tool_results(vec![ToolResult::success("call_a", "out-a")]);
+        user_partial = user_partial.with_context(ctx);
+
+        let mut history = vec![
+            Message::Assistant(HistoryAssistantMessage {
+                assistant_response_message: assistant_msg,
+            }),
+            Message::User(HistoryUserMessage {
+                user_input_message: user_partial,
+            }),
+            Message::Assistant(HistoryAssistantMessage::new("OK")),
+        ];
+
+        let mut pending = vec![ToolResult::success("call_b", "out-b")];
+        reconcile_tool_results_with_history(&mut history, "claude-sonnet-4.5", &mut pending);
+
+        assert!(pending.is_empty(), "call_b 应被移入历史");
+        if let Message::User(user) = &history[1] {
+            let results = &user
+                .user_input_message
+                .user_input_message_context
+                .tool_results;
+            assert_eq!(results.len(), 2);
+            assert!(results.iter().any(|r| r.tool_use_id == "call_a"));
+            assert!(results.iter().any(|r| r.tool_use_id == "call_b"));
+        } else {
+            panic!("history[1] 应为 user");
+        }
     }
 
     #[test]
