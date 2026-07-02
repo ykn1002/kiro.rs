@@ -21,7 +21,7 @@ use std::time::Duration;
 use tokio::time::interval;
 use uuid::Uuid;
 
-use super::converter::{ConversionError, convert_request};
+use super::converter::{convert_request, conversion_error_parts};
 use super::middleware::AppState;
 use super::stream::{SseEvent, StreamContext};
 use super::types::{
@@ -194,14 +194,7 @@ pub async fn post_messages(
     let conversion_result = match convert_request(&payload) {
         Ok(result) => result,
         Err(e) => {
-            let (error_type, message) = match &e {
-                ConversionError::UnsupportedModel(model) => {
-                    ("invalid_request_error", format!("模型不支持: {}", model))
-                }
-                ConversionError::EmptyMessages => {
-                    ("invalid_request_error", "消息列表为空".to_string())
-                }
-            };
+            let (error_type, message) = conversion_error_parts(&e);
             tracing::warn!("请求转换失败: {}", e);
             return (
                 StatusCode::BAD_REQUEST,
@@ -370,6 +363,7 @@ fn create_sse_stream(
                         }
                         Some(Err(e)) => {
                             tracing::error!("读取响应流失败: {:?}", e);
+                            ctx.stream_failed = true;
                             let err = StreamContext::create_error_event(&format!(
                                 "Upstream stream error: {e}"
                             ));
@@ -528,9 +522,21 @@ async fn handle_non_stream_request(
                             )
                                 .into_response();
                         }
-                        Event::Exception { exception_type, .. } => {
+                        Event::Exception {
+                            exception_type,
+                            message,
+                        } => {
                             if exception_type == "ContentLengthExceededException" {
                                 stop_reason = "max_tokens".to_string();
+                            } else {
+                                return (
+                                    StatusCode::BAD_GATEWAY,
+                                    Json(ErrorResponse::new(
+                                        "api_error",
+                                        format!("{exception_type}: {message}"),
+                                    )),
+                                )
+                                    .into_response();
                             }
                         }
                         _ => {}
@@ -715,14 +721,7 @@ pub async fn post_messages_cc(
     let conversion_result = match convert_request(&payload) {
         Ok(result) => result,
         Err(e) => {
-            let (error_type, message) = match &e {
-                ConversionError::UnsupportedModel(model) => {
-                    ("invalid_request_error", format!("模型不支持: {}", model))
-                }
-                ConversionError::EmptyMessages => {
-                    ("invalid_request_error", "消息列表为空".to_string())
-                }
-            };
+            let (error_type, message) = conversion_error_parts(&e);
             tracing::warn!("请求转换失败: {}", e);
             return (
                 StatusCode::BAD_REQUEST,

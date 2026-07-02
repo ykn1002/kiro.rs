@@ -784,12 +784,15 @@ impl StreamContext {
                 exception_type,
                 message,
             } => {
-                // 处理 ContentLengthExceededException
                 if exception_type == "ContentLengthExceededException" {
                     self.state_manager.set_stop_reason("max_tokens");
+                    return Vec::new();
                 }
-                tracing::warn!("收到异常事件: {} - {}", exception_type, message);
-                Vec::new()
+                self.stream_failed = true;
+                tracing::error!("收到异常事件: {} - {}", exception_type, message);
+                vec![Self::create_error_event(&format!(
+                    "{exception_type}: {message}"
+                ))]
             }
             _ => Vec::new(),
         }

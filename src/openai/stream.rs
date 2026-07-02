@@ -133,11 +133,19 @@ impl OpenAiStreamContext {
                 }
                 Vec::new()
             }
-            Event::Exception { exception_type, .. } => {
+            Event::Exception {
+                exception_type,
+                message,
+            } => {
                 if exception_type == "ContentLengthExceededException" {
                     self.finish_reason = Some("length".to_string());
+                    return Vec::new();
                 }
-                Vec::new()
+                self.stream_failed = true;
+                tracing::error!("收到异常事件: {} - {}", exception_type, message);
+                vec![Self::create_error_chunk(&format!(
+                    "{exception_type}: {message}"
+                ))]
             }
             Event::Error {
                 error_code,

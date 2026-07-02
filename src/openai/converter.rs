@@ -2,7 +2,7 @@
 
 use std::collections::HashMap;
 
-use crate::anthropic::{ConversionError, map_model};
+use crate::anthropic::{ConversionError, map_model, metadata_from_openai_extra};
 use crate::anthropic::types::{Message, MessagesRequest, SystemMessage, Thinking, Tool};
 
 use super::types::ChatCompletionRequest;
@@ -37,7 +37,7 @@ pub fn to_anthropic_request(req: &ChatCompletionRequest) -> Result<MessagesReque
         tool_choice,
         thinking,
         output_config,
-        metadata: None,
+        metadata: metadata_from_openai_extra(&req.extra),
     })
 }
 
@@ -99,6 +99,7 @@ fn convert_messages(
     } else {
         Some(vec![SystemMessage {
             text: system_parts.join("\n\n"),
+            cache_control: None,
         }])
     };
 

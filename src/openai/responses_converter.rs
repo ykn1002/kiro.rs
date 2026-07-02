@@ -2,7 +2,7 @@
 
 use std::collections::HashMap;
 
-use crate::anthropic::{ConversionError, map_model};
+use crate::anthropic::{ConversionError, map_model, metadata_from_openai_extra};
 use crate::anthropic::types::{Message, MessagesRequest, SystemMessage, Thinking, Tool};
 
 use super::responses_types::ResponsesRequest;
@@ -62,6 +62,7 @@ pub fn responses_to_anthropic(req: &ResponsesRequest) -> Result<MessagesRequest,
     } else {
         Some(vec![SystemMessage {
             text: system_parts.join("\n\n"),
+            cache_control: None,
         }])
     };
 
@@ -79,7 +80,7 @@ pub fn responses_to_anthropic(req: &ResponsesRequest) -> Result<MessagesRequest,
         tool_choice,
         thinking,
         output_config,
-        metadata: None,
+        metadata: metadata_from_openai_extra(&req.extra),
     })
 }
 

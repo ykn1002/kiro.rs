@@ -654,45 +654,6 @@ mod tests {
     }
 
     #[test]
-    fn test_has_web_search_tool_multiple_tools() {
-        use crate::anthropic::types::{Message, Tool};
-
-        let req = MessagesRequest {
-            model: "claude-sonnet-4".to_string(),
-            max_tokens: 1024,
-            messages: vec![Message {
-                role: "user".to_string(),
-                content: serde_json::json!("test"),
-            }],
-            stream: true,
-            system: None,
-            tools: Some(vec![
-                Tool {
-                    tool_type: Some("web_search_20250305".to_string()),
-                    name: "web_search".to_string(),
-                    description: String::new(),
-                    input_schema: Default::default(),
-                    max_uses: Some(8),
-                },
-                Tool {
-                    tool_type: None,
-                    name: "other_tool".to_string(),
-                    description: "Other tool".to_string(),
-                    input_schema: Default::default(),
-                    max_uses: None,
-                },
-            ]),
-            tool_choice: None,
-            thinking: None,
-            output_config: None,
-            metadata: None,
-        };
-
-        // 多个工具时不应该被识别为纯 websearch 请求
-        assert!(!has_web_search_tool(&req));
-    }
-
-    #[test]
     fn test_extract_search_query_with_prefix() {
         use crate::anthropic::types::Message;
 

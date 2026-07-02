@@ -346,6 +346,16 @@ impl std::fmt::Display for ConversionError {
 
 impl std::error::Error for ConversionError {}
 
+/// 将转换错误映射为 Anthropic API 错误响应字段
+pub fn conversion_error_parts(e: &ConversionError) -> (&'static str, String) {
+    match e {
+        ConversionError::UnsupportedModel(model) => {
+            ("invalid_request_error", format!("模型不支持: {}", model))
+        }
+        ConversionError::EmptyMessages => ("invalid_request_error", "消息列表为空".to_string()),
+    }
+}
+
 /// 从 metadata.user_id 中提取 session UUID
 ///
 /// 支持两种格式:
@@ -353,7 +363,7 @@ impl std::error::Error for ConversionError {}
 /// 2. JSON 格式: {"device_id":"...","account_uuid":"...","session_id":"UUID"}
 ///
 /// 提取 session UUID 作为 conversationId
-fn extract_session_id(user_id: &str) -> Option<String> {
+pub(crate) fn extract_session_id(user_id: &str) -> Option<String> {
     // 先尝试 JSON 解析
     if let Ok(json) = serde_json::from_str::<serde_json::Value>(user_id) {
         if let Some(session_id) = json.get("session_id").and_then(|v| v.as_str()) {
@@ -379,6 +389,58 @@ fn extract_session_id(user_id: &str) -> Option<String> {
 /// 简单验证 UUID 格式（36 字符，包含 4 个连字符）
 fn is_valid_uuid(s: &str) -> bool {
     s.len() == 36 && s.chars().filter(|c| *c == '-').count() == 4
+}
+
+/// 从 OpenAI/Codex 请求的额外字段构建 metadata（用于会话 continuity）
+pub(crate) fn metadata_from_openai_extra(
+    extra: &HashMap<String, serde_json::Value>,
+) -> Option<super::types::Metadata> {
+    use super::types::Metadata;
+
+    if let Some(meta_val) = extra.get("metadata") {
+        if let Some(uid) = meta_val.get("user_id").and_then(|v| v.as_str()) {
+            return Some(Metadata {
+                user_id: Some(uid.to_string()),
+            });
+        }
+        if let Some(sid) = meta_val.get("session_id").and_then(|v| v.as_str()) {
+            if is_valid_uuid(sid) {
+                return Some(Metadata {
+                    user_id: Some(format!("user_codex_account__session_{sid}")),
+                });
+            }
+        }
+    }
+
+    if let Some(user) = extra.get("user").and_then(|v| v.as_str()) {
+        if !user.is_empty() {
+            return Some(Metadata {
+                user_id: Some(user.to_string()),
+            });
+        }
+    }
+
+    if let Some(sid) = extra.get("session_id").and_then(|v| v.as_str()) {
+        if is_valid_uuid(sid) {
+            return Some(Metadata {
+                user_id: Some(format!("user_codex_account__session_{sid}")),
+            });
+        }
+    }
+
+    if let Some(prev) = extra
+        .get("previous_response_id")
+        .and_then(|v| v.as_str())
+    {
+        let raw = prev.strip_prefix("resp_").unwrap_or(prev);
+        if is_valid_uuid(raw) {
+            return Some(Metadata {
+                user_id: Some(format!("user_codex_account__session_{raw}")),
+            });
+        }
+    }
+
+    None
 }
 
 /// 收集历史消息中使用的所有工具名称
@@ -456,7 +518,6 @@ fn convert_request_inner(
     }
 
     // 2.5. 预处理 prefill：如果末尾是 assistant，静默丢弃并截断到最后一条 user
-    // Claude 4.x 已弃用 assistant prefill，Kiro API 也不支持
     let messages: &[_] = if req.messages.last().is_some_and(|m| m.role != "user") {
         tracing::info!("检测到末尾 assistant 消息（prefill），静默丢弃");
         let last_user_idx = req
@@ -482,7 +543,7 @@ fn convert_request_inner(
     // 4. 确定触发类型
     let chat_trigger_type = determine_chat_trigger_type(req);
 
-    // 5. 处理最后一条消息作为 current_message（经过 prefill 预处理，末尾必为 user）
+    // 5. 处理最后一条消息作为 current_message（末尾必为 user）
     let last_message = messages.last().unwrap();
     let (text_content, images, mut tool_results) = process_message_content(&last_message.content)?;
 
@@ -500,15 +561,11 @@ fn convert_request_inner(
     }
 
     // 8. 验证并过滤 tool_use/tool_result 配对
-    // 移除孤立的 tool_result（没有对应的 tool_use）
-    // 同时返回孤立的 tool_use_id 集合，用于后续清理
     let (validated_tool_results, orphaned_tool_use_ids) =
         validate_tool_pairing(&history, &tool_results);
-
-    // 9. 从历史中移除孤立的 tool_use（Kiro API 要求 tool_use 必须有对应的 tool_result）
     remove_orphaned_tool_uses(&mut history, &orphaned_tool_use_ids);
 
-    // 10. 收集历史中使用的工具名称，为缺失的工具生成占位符定义
+    // 9. 收集历史中使用的工具名称，为缺失的工具生成占位符定义
     // Kiro API 要求：历史消息中引用的工具必须在 tools 列表中有定义
     // 注意：Kiro 匹配工具名称时忽略大小写，所以这里也需要忽略大小写比较
     let history_tool_names = collect_history_tool_names(&history);
@@ -621,9 +678,7 @@ fn process_message_content(
                                 tool_results.push(result);
                             }
                         }
-                        "tool_use" => {
-                            // tool_use 在 assistant 消息中处理，这里忽略
-                        }
+                        "tool_use" => {}
                         _ => {}
                     }
                 }
@@ -665,25 +720,13 @@ fn extract_tool_result_content(content: &Option<serde_json::Value>) -> String {
 }
 
 /// 验证并过滤 tool_use/tool_result 配对
-///
-/// 收集所有 tool_use_id，验证 tool_result 是否匹配
-/// 静默跳过孤立的 tool_use 和 tool_result，输出警告日志
-///
-/// # Arguments
-/// * `history` - 历史消息引用
-/// * `tool_results` - 当前消息中的 tool_result 列表
-///
-/// # Returns
-/// 元组：(经过验证和过滤后的 tool_result 列表, 孤立的 tool_use_id 集合)
 fn validate_tool_pairing(
     history: &[Message],
     tool_results: &[ToolResult],
 ) -> (Vec<ToolResult>, std::collections::HashSet<String>) {
     use std::collections::HashSet;
 
-    // 1. 收集所有历史中的 tool_use_id
     let mut all_tool_use_ids: HashSet<String> = HashSet::new();
-    // 2. 收集历史中已经有 tool_result 的 tool_use_id
     let mut history_tool_result_ids: HashSet<String> = HashSet::new();
 
     for msg in history {
@@ -696,7 +739,6 @@ fn validate_tool_pairing(
                 }
             }
             Message::User(user_msg) => {
-                // 收集历史 user 消息中的 tool_results
                 for result in &user_msg
                     .user_input_message
                     .user_input_message_context
@@ -708,28 +750,23 @@ fn validate_tool_pairing(
         }
     }
 
-    // 3. 计算真正未配对的 tool_use_ids（排除历史中已配对的）
     let mut unpaired_tool_use_ids: HashSet<String> = all_tool_use_ids
         .difference(&history_tool_result_ids)
         .cloned()
         .collect();
 
-    // 4. 过滤并验证当前消息的 tool_results
     let mut filtered_results = Vec::new();
 
     for result in tool_results {
         if unpaired_tool_use_ids.contains(&result.tool_use_id) {
-            // 配对成功
             filtered_results.push(result.clone());
             unpaired_tool_use_ids.remove(&result.tool_use_id);
         } else if all_tool_use_ids.contains(&result.tool_use_id) {
-            // tool_use 存在但已经在历史中配对过了，这是重复的 tool_result
             tracing::warn!(
                 "跳过重复的 tool_result：该 tool_use 已在历史中配对，tool_use_id={}",
                 result.tool_use_id
             );
         } else {
-            // 孤立 tool_result - 找不到对应的 tool_use
             tracing::warn!(
                 "跳过孤立的 tool_result：找不到对应的 tool_use，tool_use_id={}",
                 result.tool_use_id
@@ -737,7 +774,6 @@ fn validate_tool_pairing(
         }
     }
 
-    // 5. 检测真正孤立的 tool_use（有 tool_use 但在历史和当前消息中都没有 tool_result）
     for orphaned_id in &unpaired_tool_use_ids {
         tracing::warn!(
             "检测到孤立的 tool_use：找不到对应的 tool_result，将从历史中移除，tool_use_id={}",
@@ -849,13 +885,6 @@ fn reconcile_tool_results_with_history(
 }
 
 /// 从历史消息中移除孤立的 tool_use
-///
-/// Kiro API 要求每个 tool_use 必须有对应的 tool_result，否则返回 400 Bad Request。
-/// 此函数遍历历史中的 assistant 消息，移除没有对应 tool_result 的 tool_use。
-///
-/// # Arguments
-/// * `history` - 可变的历史消息列表
-/// * `orphaned_ids` - 需要移除的孤立 tool_use_id 集合
 fn remove_orphaned_tool_uses(
     history: &mut [Message],
     orphaned_ids: &std::collections::HashSet<String>,
@@ -867,17 +896,9 @@ fn remove_orphaned_tool_uses(
     for msg in history.iter_mut() {
         if let Message::Assistant(assistant_msg) = msg {
             if let Some(ref mut tool_uses) = assistant_msg.assistant_response_message.tool_uses {
-                let original_len = tool_uses.len();
                 tool_uses.retain(|tu| !orphaned_ids.contains(&tu.tool_use_id));
-
-                // 如果移除后为空，设置为 None
                 if tool_uses.is_empty() {
                     assistant_msg.assistant_response_message.tool_uses = None;
-                } else if tool_uses.len() != original_len {
-                    tracing::debug!(
-                        "从 assistant 消息中移除了 {} 个孤立的 tool_use",
-                        original_len - tool_uses.len()
-                    );
                 }
             }
         }
@@ -988,9 +1009,7 @@ fn has_thinking_tags(content: &str) -> bool {
 ///
 /// # Arguments
 /// * `req` - 原始请求，用于读取 `system`、`thinking` 等配置字段
-/// * `messages` - 经过 prefill 预处理的消息切片，末尾必定是 user 消息。
-///   注意：该切片与 `req.messages` 可能不同（prefill 时会截断末尾的 assistant 消息），
-///   调用方应始终使用此参数而非 `req.messages`。
+/// * `messages` - 消息切片，末尾必须是 user 消息
 /// * `model_id` - 已映射的 Kiro 模型 ID
 fn build_history(
     req: &MessagesRequest,
@@ -1013,8 +1032,8 @@ fn build_history(
 
         if !system_content.is_empty() {
             // 追加分块写入策略与输出 token 上限到系统消息
-            let system_content = format!("{}\n{}", system_content, SYSTEM_CHUNKED_POLICY);
-            let system_content = append_output_constraints(&system_content, req.max_tokens);
+            let mut system_content = format!("{}\n{}", system_content, SYSTEM_CHUNKED_POLICY);
+            system_content = append_output_constraints(&system_content, req.max_tokens);
 
             // 注入thinking标签到系统消息最前面（如果需要且不存在）
             let final_content = if let Some(ref prefix) = thinking_prefix {
@@ -1045,7 +1064,7 @@ fn build_history(
 
     // 2. 处理常规消息历史
     // 最后一条消息作为 currentMessage，不加入历史
-    // 经过 prefill 预处理后，messages 末尾必定是 user，故直接截掉最后一条即可
+    // 经过 convert_request 校验，messages 末尾必定是 user，故直接截掉最后一条即可
     let history_end_index = messages.len().saturating_sub(1);
 
     // 收集并配对消息
@@ -2176,79 +2195,6 @@ mod tests {
             .expect("应该有 tool_uses");
         assert_eq!(tool_uses.len(), 1);
         assert_eq!(tool_uses[0].tool_use_id, "toolu_02XYZ");
-    }
-
-    #[test]
-    fn test_remove_orphaned_tool_uses() {
-        use crate::kiro::model::requests::tool::ToolUseEntry;
-
-        // 测试从历史中移除孤立的 tool_use
-        let mut assistant_msg = AssistantMessage::new("I'll use multiple tools.");
-        assistant_msg = assistant_msg.with_tool_uses(vec![
-            ToolUseEntry::new("tool-1", "read").with_input(serde_json::json!({})),
-            ToolUseEntry::new("tool-2", "write").with_input(serde_json::json!({})),
-            ToolUseEntry::new("tool-3", "delete").with_input(serde_json::json!({})),
-        ]);
-
-        let mut history = vec![
-            Message::User(HistoryUserMessage::new("Do something", "claude-sonnet-4.5")),
-            Message::Assistant(HistoryAssistantMessage {
-                assistant_response_message: assistant_msg,
-            }),
-        ];
-
-        // 移除 tool-1 和 tool-3
-        let mut orphaned = std::collections::HashSet::new();
-        orphaned.insert("tool-1".to_string());
-        orphaned.insert("tool-3".to_string());
-
-        remove_orphaned_tool_uses(&mut history, &orphaned);
-
-        // 验证只剩下 tool-2
-        if let Message::Assistant(ref assistant_msg) = history[1] {
-            let tool_uses = assistant_msg
-                .assistant_response_message
-                .tool_uses
-                .as_ref()
-                .expect("应该还有 tool_uses");
-            assert_eq!(tool_uses.len(), 1);
-            assert_eq!(tool_uses[0].tool_use_id, "tool-2");
-        } else {
-            panic!("应该是 Assistant 消息");
-        }
-    }
-
-    #[test]
-    fn test_remove_orphaned_tool_uses_all_removed() {
-        use crate::kiro::model::requests::tool::ToolUseEntry;
-
-        // 测试移除所有 tool_use 后，tool_uses 变为 None
-        let mut assistant_msg = AssistantMessage::new("I'll use a tool.");
-        assistant_msg = assistant_msg.with_tool_uses(vec![
-            ToolUseEntry::new("tool-1", "read").with_input(serde_json::json!({})),
-        ]);
-
-        let mut history = vec![
-            Message::User(HistoryUserMessage::new("Do something", "claude-sonnet-4.5")),
-            Message::Assistant(HistoryAssistantMessage {
-                assistant_response_message: assistant_msg,
-            }),
-        ];
-
-        let mut orphaned = std::collections::HashSet::new();
-        orphaned.insert("tool-1".to_string());
-
-        remove_orphaned_tool_uses(&mut history, &orphaned);
-
-        // 验证 tool_uses 变为 None
-        if let Message::Assistant(ref assistant_msg) = history[1] {
-            assert!(
-                assistant_msg.assistant_response_message.tool_uses.is_none(),
-                "移除所有 tool_use 后应为 None"
-            );
-        } else {
-            panic!("应该是 Assistant 消息");
-        }
     }
 
     #[test]

@@ -14,7 +14,7 @@ use futures::{Stream, StreamExt, stream};
 use serde_json::json;
 use uuid::Uuid;
 
-use crate::anthropic::{AppState, ConversionError, get_context_window_size};
+use crate::anthropic::{AppState, conversion_error_parts, get_context_window_size};
 use crate::kiro::model::events::Event;
 use crate::kiro::model::requests::kiro::KiroRequest;
 use crate::kiro::parser::decoder::EventStreamDecoder;
@@ -55,14 +55,7 @@ pub async fn create_response(
     let mut anthropic_payload = match responses_to_anthropic(&payload) {
         Ok(p) => p,
         Err(e) => {
-            let (error_type, message) = match &e {
-                ConversionError::UnsupportedModel(model) => {
-                    ("invalid_request_error", format!("模型不支持: {}", model))
-                }
-                ConversionError::EmptyMessages => {
-                    ("invalid_request_error", "消息列表为空".to_string())
-                }
-            };
+            let (error_type, message) = conversion_error_parts(&e);
             return (
                 StatusCode::BAD_REQUEST,
                 Json(ErrorResponse::new(error_type, message)),
@@ -76,14 +69,7 @@ pub async fn create_response(
     let conversion_result = match crate::anthropic::convert_responses_request(&anthropic_payload) {
         Ok(r) => r,
         Err(e) => {
-            let (error_type, message) = match &e {
-                ConversionError::UnsupportedModel(model) => {
-                    ("invalid_request_error", format!("模型不支持: {}", model))
-                }
-                ConversionError::EmptyMessages => {
-                    ("invalid_request_error", "消息列表为空".to_string())
-                }
-            };
+            let (error_type, message) = conversion_error_parts(&e);
             return (
                 StatusCode::BAD_REQUEST,
                 Json(ErrorResponse::new(error_type, message)),
@@ -337,9 +323,21 @@ async fn handle_responses_non_stream(
                         )
                             .into_response();
                     }
-                    Event::Exception { exception_type, .. } => {
+                    Event::Exception {
+                        exception_type,
+                        message,
+                    } => {
                         if exception_type == "ContentLengthExceededException" {
                             status = "incomplete".to_string();
+                        } else {
+                            return (
+                                StatusCode::BAD_GATEWAY,
+                                Json(ErrorResponse::new(
+                                    "server_error",
+                                    format!("{exception_type}: {message}"),
+                                )),
+                            )
+                                .into_response();
                         }
                     }
                     _ => {}

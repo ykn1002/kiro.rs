@@ -237,11 +237,20 @@ impl ResponsesStreamContext {
                 }
                 Vec::new()
             }
-            Event::Exception { exception_type, .. } => {
+            Event::Exception {
+                exception_type,
+                message,
+            } => {
                 if exception_type == "ContentLengthExceededException" {
                     self.status = "incomplete".to_string();
+                    return Vec::new();
                 }
-                Vec::new()
+                self.stream_failed = true;
+                self.status = "failed".to_string();
+                tracing::error!("收到异常事件: {} - {}", exception_type, message);
+                vec![Self::create_error_event(&format!(
+                    "{exception_type}: {message}"
+                ))]
             }
             Event::Error {
                 error_code,
