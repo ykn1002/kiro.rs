@@ -44,6 +44,8 @@ pub struct Model {
     pub id: String,
     pub object: String,
     pub created: i64,
+    #[serde(rename = "created_at")]
+    pub created_at: i64,
     pub owned_by: String,
     pub display_name: String,
     #[serde(rename = "type")]

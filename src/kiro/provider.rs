@@ -88,8 +88,9 @@ impl KiroProvider {
         );
         let tls_backend = token_manager.config().tls_backend;
         // 预热：构建全局代理对应的 Client
-        let initial_client = build_client(proxy.as_ref(), 720, tls_backend)
-            .expect("创建 HTTP 客户端失败");
+        let initial_client = build_client(proxy.as_ref(), 720, tls_backend).unwrap_or_else(|e| {
+            panic!("创建 HTTP 客户端失败: {e}");
+        });
         let mut cache = HashMap::new();
         cache.insert(proxy.clone(), initial_client);
 

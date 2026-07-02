@@ -36,10 +36,13 @@ async fn main() {
     let config_path = args
         .config
         .unwrap_or_else(|| Config::default_config_path().to_string());
-    let config = Config::load(&config_path).unwrap_or_else(|e| {
+    let mut config = Config::load(&config_path).unwrap_or_else(|e| {
         tracing::error!("加载配置失败: {}", e);
         std::process::exit(1);
     });
+    let requested_tls = config.tls_backend;
+    config.tls_backend = http_client::effective_tls_backend(requested_tls);
+    http_client::warn_tls_backend_fallback(requested_tls, config.tls_backend);
 
     // 初始化全局模型注册表（配置的 models 或内置默认表），供 map_model /
     // get_context_window_size / get_models 使用。须在任何请求进入前完成。

@@ -188,6 +188,43 @@ fn match_model_def(model: &str) -> Option<ModelDef> {
     None
 }
 
+/// 追加 max_tokens 约束标签（Kiro 上游通过 XML 标签识别输出上限）
+fn append_output_constraints(content: &str, max_tokens: i32) -> String {
+    if max_tokens <= 0 || content.contains("<max_output_length>") {
+        return content.to_string();
+    }
+    format!("{content}\n<max_output_length>{max_tokens}</max_output_length>")
+}
+
+/// 根据 Anthropic tool_choice 过滤工具列表
+fn apply_tool_choice(
+    tool_choice: &Option<serde_json::Value>,
+    tools: Vec<Tool>,
+) -> Vec<Tool> {
+    let choice_type = tool_choice
+        .as_ref()
+        .and_then(|v| v.get("type"))
+        .and_then(|t| t.as_str());
+
+    match choice_type {
+        Some("none") => Vec::new(),
+        Some("tool") => {
+            let name = tool_choice
+                .as_ref()
+                .and_then(|v| v.get("name"))
+                .and_then(|n| n.as_str());
+            match name {
+                Some(n) => tools
+                    .into_iter()
+                    .filter(|t| t.tool_specification.name == n)
+                    .collect(),
+                None => tools,
+            }
+        }
+        _ => tools,
+    }
+}
+
 /// 规范化 JSON Schema，修复 MCP / Codex 工具定义中常见的类型问题
 pub(crate) fn normalize_tool_schema(schema: serde_json::Value) -> serde_json::Value {
     normalize_json_schema(schema)
@@ -452,6 +489,7 @@ fn convert_request_inner(
     // 6. 转换工具定义（超长名称自动缩短并记录映射）
     let mut tool_name_map = HashMap::new();
     let mut tools = convert_tools(&req.tools, &mut tool_name_map);
+    tools = apply_tool_choice(&req.tool_choice, tools);
 
     // 7. 构建历史消息（需要先构建，以便收集历史中使用的工具）
     let mut history = build_history(req, messages, &model_id, &mut tool_name_map)?;
@@ -974,8 +1012,9 @@ fn build_history(
             .join("\n");
 
         if !system_content.is_empty() {
-            // 追加分块写入策略到系统消息
+            // 追加分块写入策略与输出 token 上限到系统消息
             let system_content = format!("{}\n{}", system_content, SYSTEM_CHUNKED_POLICY);
+            let system_content = append_output_constraints(&system_content, req.max_tokens);
 
             // 注入thinking标签到系统消息最前面（如果需要且不存在）
             let final_content = if let Some(ref prefix) = thinking_prefix {

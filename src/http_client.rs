@@ -7,6 +7,34 @@ use std::time::Duration;
 
 use crate::model::config::TlsBackend;
 
+/// 解析当前构建实际可用的 TLS 后端（无日志）。
+pub fn effective_tls_backend(requested: TlsBackend) -> TlsBackend {
+    match requested {
+        TlsBackend::Rustls => TlsBackend::Rustls,
+        TlsBackend::NativeTls => {
+            #[cfg(feature = "native-tls")]
+            {
+                TlsBackend::NativeTls
+            }
+            #[cfg(not(feature = "native-tls"))]
+            {
+                TlsBackend::Rustls
+            }
+        }
+    }
+}
+
+/// 若配置与有效后端不一致，打一条 warn（供启动时调用一次）。
+pub fn warn_tls_backend_fallback(requested: TlsBackend, effective: TlsBackend) {
+    if requested != effective {
+        tracing::warn!(
+            "配置 tlsBackend 为 {:?}，但当前构建未包含 native-tls feature，已自动回退为 {:?}",
+            requested,
+            effective
+        );
+    }
+}
+
 /// 代理配置
 #[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
 pub struct ProxyConfig {
@@ -51,7 +79,7 @@ pub fn build_client(
 ) -> anyhow::Result<Client> {
     let mut builder = Client::builder().timeout(Duration::from_secs(timeout_secs));
 
-    match tls_backend {
+    match effective_tls_backend(tls_backend) {
         TlsBackend::Rustls => {
             builder = builder.use_rustls_tls();
         }
@@ -62,7 +90,7 @@ pub fn build_client(
             }
             #[cfg(not(feature = "native-tls"))]
             {
-                anyhow::bail!("此构建版本未包含 native-tls 后端，请在配置中改用 rustls");
+                builder = builder.use_rustls_tls();
             }
         }
     }
@@ -100,6 +128,23 @@ mod tests {
         assert_eq!(config.url, "socks5://127.0.0.1:1080");
         assert_eq!(config.username, Some("user".to_string()));
         assert_eq!(config.password, Some("pass".to_string()));
+    }
+
+    #[test]
+    fn test_effective_tls_backend_rustls() {
+        assert_eq!(
+            effective_tls_backend(TlsBackend::Rustls),
+            TlsBackend::Rustls
+        );
+    }
+
+    #[test]
+    fn test_effective_tls_backend_native_or_fallback() {
+        let effective = effective_tls_backend(TlsBackend::NativeTls);
+        #[cfg(feature = "native-tls")]
+        assert_eq!(effective, TlsBackend::NativeTls);
+        #[cfg(not(feature = "native-tls"))]
+        assert_eq!(effective, TlsBackend::Rustls);
     }
 
     #[test]

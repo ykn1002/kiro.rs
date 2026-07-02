@@ -13,7 +13,7 @@ pub enum TlsBackend {
 
 impl Default for TlsBackend {
     fn default() -> Self {
-        Self::Rustls
+        Self::NativeTls
     }
 }
 
@@ -237,7 +237,7 @@ fn default_count_tokens_auth_type() -> String {
 }
 
 fn default_tls_backend() -> TlsBackend {
-    TlsBackend::Rustls
+    TlsBackend::NativeTls
 }
 
 fn default_load_balancing_mode() -> String {

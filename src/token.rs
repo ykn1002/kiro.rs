@@ -207,6 +207,28 @@ fn count_all_tokens_local(
                 if let Some(text) = item.get("text").and_then(|v| v.as_str()) {
                     total += count_tokens(text);
                 }
+                if let Some(thinking) = item.get("thinking").and_then(|v| v.as_str()) {
+                    total += count_tokens(thinking);
+                }
+                if item.get("type").and_then(|v| v.as_str()) == Some("tool_use") {
+                    if let Some(input) = item.get("input") {
+                        let input_str = serde_json::to_string(input).unwrap_or_default();
+                        total += count_tokens(&input_str);
+                    }
+                }
+                if item.get("type").and_then(|v| v.as_str()) == Some("tool_result") {
+                    if let Some(content) = item.get("content") {
+                        if let Some(s) = content.as_str() {
+                            total += count_tokens(s);
+                        } else if let Some(arr) = content.as_array() {
+                            for block in arr {
+                                if let Some(text) = block.get("text").and_then(|v| v.as_str()) {
+                                    total += count_tokens(text);
+                                }
+                            }
+                        }
+                    }
+                }
             }
         }
     }

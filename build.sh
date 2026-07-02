@@ -7,6 +7,7 @@
 #   ./build.sh -t 2026.3.1              # 指定版本 tag
 #   ./build.sh --platform linux/amd64     # 指定平台（默认当前架构）
 #   ./build.sh --no-cache                 # 禁用构建缓存
+#   ./build.sh --rustls                   # 改用 rustls 构建（更小，默认 native-tls）
 #
 # 环境变量:
 #   IMAGE_REPO   完整镜像名，不含 tag（默认 ykn1002/kiro-rs）
@@ -22,6 +23,7 @@ TAG="latest"
 PUSH=true
 NO_CACHE=false
 PLATFORM=""
+RUSTLS=false
 
 usage() {
     sed -n '2,13p' "$0" | sed 's/^# \?//'
@@ -32,6 +34,7 @@ usage() {
     echo "      --no-push       仅构建，不推送"
     echo "      --platform PLAT docker build --platform（如 linux/amd64,linux/arm64）"
     echo "      --no-cache      禁用 Docker 构建缓存"
+    echo "      --rustls        构建时改用 rustls（默认 native-tls）"
     echo "  -h, --help          显示此帮助"
 }
 
@@ -55,6 +58,14 @@ while [[ $# -gt 0 ]]; do
             ;;
         --no-cache)
             NO_CACHE=true
+            shift
+            ;;
+        --native-tls)
+            # 兼容旧参数，默认已是 native-tls
+            shift
+            ;;
+        --rustls)
+            RUSTLS=true
             shift
             ;;
         -h|--help)
@@ -90,9 +101,18 @@ if [[ "$NO_CACHE" == true ]]; then
     BUILD_ARGS+=(--no-cache)
 fi
 
+if [[ "$RUSTLS" == true ]]; then
+    BUILD_ARGS+=(--build-arg ENABLE_NATIVE_TLS=false)
+fi
+
 echo "==> 构建镜像 ${FULL_IMAGE}"
 if [[ -n "$PLATFORM" ]]; then
     echo "    平台: ${PLATFORM}"
+fi
+if [[ "$RUSTLS" == true ]]; then
+    echo "    TLS: rustls"
+else
+    echo "    TLS: native-tls（默认）"
 fi
 
 docker build "${BUILD_ARGS[@]}" .

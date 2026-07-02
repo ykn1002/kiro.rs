@@ -5,9 +5,16 @@
 use std::collections::HashMap;
 
 use serde_json::json;
+use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use crate::kiro::model::events::Event;
+
+/// 为 extended thinking 块生成占位 signature（Kiro 上游不返回真实 signature）
+pub fn compute_thinking_signature(thinking: &str) -> String {
+    let hash = Sha256::digest(thinking.as_bytes());
+    hex::encode(hash)
+}
 
 /// 找到小于等于目标位置的最近有效UTF-8字符边界
 ///
@@ -542,6 +549,16 @@ pub struct StreamContext {
     /// 是否需要剥离 thinking 内容开头的换行符
     /// 模型输出 `<thinking>\n` 时，`\n` 可能与标签在同一 chunk 或下一 chunk
     strip_thinking_leading_newline: bool,
+    /// 是否延迟发送 message_start 直到收到 contextUsageEvent
+    delay_message_start: bool,
+    /// 延迟模式下尚未发送的事件（含 message_start）
+    pending_events: Vec<SseEvent>,
+    /// message_start 是否已释放给客户端
+    message_start_released: bool,
+    /// 是否已生成初始 SSE 状态
+    stream_initialized: bool,
+    /// 上游流是否已失败（不再发送正常结束事件）
+    pub stream_failed: bool,
 }
 
 impl StreamContext {
@@ -551,6 +568,7 @@ impl StreamContext {
         input_tokens: i32,
         thinking_enabled: bool,
         tool_name_map: HashMap<String, String>,
+        delay_message_start: bool,
     ) -> Self {
         Self {
             state_manager: SseStateManager::new(),
@@ -568,7 +586,105 @@ impl StreamContext {
             thinking_block_index: None,
             text_block_index: None,
             strip_thinking_leading_newline: false,
+            delay_message_start,
+            pending_events: Vec::new(),
+            message_start_released: false,
+            stream_initialized: false,
+            stream_failed: false,
         }
+    }
+
+    /// 创建 SSE 流内 error 事件
+    pub fn create_error_event(message: &str) -> SseEvent {
+        SseEvent::new(
+            "error",
+            json!({
+                "type": "error",
+                "error": {
+                    "type": "api_error",
+                    "message": message
+                }
+            }),
+        )
+    }
+
+    fn effective_input_tokens(&self) -> i32 {
+        self.context_input_tokens.unwrap_or(self.input_tokens)
+    }
+
+    fn patch_message_start_tokens(events: &mut [SseEvent], input_tokens: i32) {
+        for event in events.iter_mut() {
+            if event.event == "message_start" {
+                if let Some(message) = event.data.get_mut("message") {
+                    if let Some(usage) = message.get_mut("usage") {
+                        usage["input_tokens"] = json!(input_tokens);
+                    }
+                }
+            }
+        }
+    }
+
+    fn release_pending_events(&mut self) -> Vec<SseEvent> {
+        let input_tokens = self.effective_input_tokens();
+        Self::patch_message_start_tokens(&mut self.pending_events, input_tokens);
+        std::mem::take(&mut self.pending_events)
+    }
+
+    /// 处理 Kiro 事件；延迟模式下在 contextUsageEvent 之前只缓冲，之后实时转发
+    pub fn take_events_for_kiro(&mut self, event: &Event) -> Vec<SseEvent> {
+        if self.stream_failed {
+            return Vec::new();
+        }
+
+        if self.delay_message_start && !self.message_start_released {
+            if !self.stream_initialized {
+                self.pending_events = self.generate_initial_events();
+                self.stream_initialized = true;
+            }
+
+            if matches!(event, Event::ContextUsage(_)) {
+                let events = self.process_kiro_event(event);
+                let mut out = self.release_pending_events();
+                self.message_start_released = true;
+                out.extend(events);
+                return out;
+            }
+
+            let events = self.process_kiro_event(event);
+            if !events.is_empty() {
+                let mut out = self.release_pending_events();
+                self.message_start_released = true;
+                out.extend(events);
+                return out;
+            }
+            return Vec::new();
+        }
+
+        let mut out = Vec::new();
+        if !self.stream_initialized {
+            out.extend(self.generate_initial_events());
+            self.stream_initialized = true;
+        }
+        out.extend(self.process_kiro_event(event));
+        out
+    }
+
+    /// 流正常结束时生成剩余事件
+    pub fn finalize_stream(&mut self) -> Vec<SseEvent> {
+        if self.stream_failed {
+            return Vec::new();
+        }
+        let mut out = Vec::new();
+        if self.delay_message_start && !self.message_start_released {
+            if !self.stream_initialized {
+                out.extend(self.generate_initial_events());
+                self.stream_initialized = true;
+            }
+            out.extend(self.release_pending_events());
+            self.message_start_released = true;
+        }
+        out.extend(self.generate_final_events());
+        out
     }
 
     /// 生成 message_start 事件
@@ -584,7 +700,7 @@ impl StreamContext {
                 "stop_reason": null,
                 "stop_sequence": null,
                 "usage": {
-                    "input_tokens": self.input_tokens,
+                    "input_tokens": self.effective_input_tokens(),
                     "output_tokens": 1
                 }
             }
@@ -658,8 +774,11 @@ impl StreamContext {
                 error_code,
                 error_message,
             } => {
+                self.stream_failed = true;
                 tracing::error!("收到错误事件: {} - {}", error_code, error_message);
-                Vec::new()
+                vec![Self::create_error_event(&format!(
+                    "{error_code}: {error_message}"
+                ))]
             }
             Event::Exception {
                 exception_type,
@@ -773,33 +892,14 @@ impl StreamContext {
 
                 // 在 thinking 块内，查找 </thinking> 结束标签（跳过被反引号包裹的）
                 if let Some(end_pos) = find_real_thinking_end_tag(&self.thinking_buffer) {
-                    // 提取 thinking 内容
                     let thinking_content = self.thinking_buffer[..end_pos].to_string();
-                    if !thinking_content.is_empty() {
-                        if let Some(thinking_index) = self.thinking_block_index {
-                            events.push(
-                                self.create_thinking_delta_event(thinking_index, &thinking_content),
-                            );
-                        }
-                    }
-
-                    // 结束 thinking 块
                     self.in_thinking_block = false;
                     self.thinking_extracted = true;
 
-                    // 发送空的 thinking_delta 事件，然后发送 content_block_stop 事件
                     if let Some(thinking_index) = self.thinking_block_index {
-                        // 先发送空的 thinking_delta
-                        events.push(self.create_thinking_delta_event(thinking_index, ""));
-                        // 再发送 content_block_stop
-                        if let Some(stop_event) =
-                            self.state_manager.handle_content_block_stop(thinking_index)
-                        {
-                            events.push(stop_event);
-                        }
+                        events.extend(self.close_thinking_block(thinking_index, &thinking_content));
                     }
 
-                    // 剥离 `</thinking>\n\n`（find_real_thinking_end_tag 已确认 \n\n 存在）
                     self.thinking_buffer =
                         self.thinking_buffer[end_pos + "</thinking>\n\n".len()..].to_string();
                 } else {
@@ -916,6 +1016,38 @@ impl StreamContext {
         )
     }
 
+    /// 创建 signature_delta 事件（extended thinking 兼容）
+    fn create_signature_delta_event(&self, index: i32, signature: &str) -> SseEvent {
+        SseEvent::new(
+            "content_block_delta",
+            json!({
+                "type": "content_block_delta",
+                "index": index,
+                "delta": {
+                    "type": "signature_delta",
+                    "signature": signature
+                }
+            }),
+        )
+    }
+
+    /// 关闭 thinking 块：signature_delta + content_block_stop
+    fn close_thinking_block(&mut self, thinking_index: i32, thinking_content: &str) -> Vec<SseEvent> {
+        let mut events = Vec::new();
+        if !thinking_content.is_empty() {
+            events.push(self.create_thinking_delta_event(thinking_index, thinking_content));
+        }
+        events.push(self.create_thinking_delta_event(thinking_index, ""));
+        events.push(self.create_signature_delta_event(
+            thinking_index,
+            &compute_thinking_signature(thinking_content),
+        ));
+        if let Some(stop_event) = self.state_manager.handle_content_block_stop(thinking_index) {
+            events.push(stop_event);
+        }
+        events
+    }
+
     /// 处理工具使用事件
     fn process_tool_use(
         &mut self,
@@ -932,30 +1064,13 @@ impl StreamContext {
         if self.thinking_enabled && self.in_thinking_block {
             if let Some(end_pos) = find_real_thinking_end_tag_at_buffer_end(&self.thinking_buffer) {
                 let thinking_content = self.thinking_buffer[..end_pos].to_string();
-                if !thinking_content.is_empty() {
-                    if let Some(thinking_index) = self.thinking_block_index {
-                        events.push(
-                            self.create_thinking_delta_event(thinking_index, &thinking_content),
-                        );
-                    }
-                }
-
-                // 结束 thinking 块
                 self.in_thinking_block = false;
                 self.thinking_extracted = true;
 
                 if let Some(thinking_index) = self.thinking_block_index {
-                    // 先发送空的 thinking_delta
-                    events.push(self.create_thinking_delta_event(thinking_index, ""));
-                    // 再发送 content_block_stop
-                    if let Some(stop_event) =
-                        self.state_manager.handle_content_block_stop(thinking_index)
-                    {
-                        events.push(stop_event);
-                    }
+                    events.extend(self.close_thinking_block(thinking_index, &thinking_content));
                 }
 
-                // 把结束标签后的内容当作普通文本（通常为空或空白）
                 let after_pos = end_pos + "</thinking>".len();
                 let remaining = self.thinking_buffer[after_pos..].trim_start().to_string();
                 self.thinking_buffer.clear();
@@ -1052,25 +1167,10 @@ impl StreamContext {
                     find_real_thinking_end_tag_at_buffer_end(&self.thinking_buffer)
                 {
                     let thinking_content = self.thinking_buffer[..end_pos].to_string();
-                    if !thinking_content.is_empty() {
-                        if let Some(thinking_index) = self.thinking_block_index {
-                            events.push(
-                                self.create_thinking_delta_event(thinking_index, &thinking_content),
-                            );
-                        }
-                    }
-
-                    // 关闭 thinking 块：先发送空的 thinking_delta，再发送 content_block_stop
                     if let Some(thinking_index) = self.thinking_block_index {
-                        events.push(self.create_thinking_delta_event(thinking_index, ""));
-                        if let Some(stop_event) =
-                            self.state_manager.handle_content_block_stop(thinking_index)
-                        {
-                            events.push(stop_event);
-                        }
+                        events.extend(self.close_thinking_block(thinking_index, &thinking_content));
                     }
 
-                    // 把结束标签后的内容当作普通文本（通常为空或空白）
                     let after_pos = end_pos + "</thinking>".len();
                     let remaining = self.thinking_buffer[after_pos..].trim_start().to_string();
                     self.thinking_buffer.clear();
@@ -1080,22 +1180,9 @@ impl StreamContext {
                         events.extend(self.create_text_delta_events(&remaining));
                     }
                 } else {
-                    // 如果还在 thinking 块内，发送剩余内容作为 thinking_delta
                     if let Some(thinking_index) = self.thinking_block_index {
-                        events.push(
-                            self.create_thinking_delta_event(thinking_index, &self.thinking_buffer),
-                        );
-                    }
-                    // 关闭 thinking 块：先发送空的 thinking_delta，再发送 content_block_stop
-                    if let Some(thinking_index) = self.thinking_block_index {
-                        // 先发送空的 thinking_delta
-                        events.push(self.create_thinking_delta_event(thinking_index, ""));
-                        // 再发送 content_block_stop
-                        if let Some(stop_event) =
-                            self.state_manager.handle_content_block_stop(thinking_index)
-                        {
-                            events.push(stop_event);
-                        }
+                        let buffer = self.thinking_buffer.clone();
+                        events.extend(self.close_thinking_block(thinking_index, &buffer));
                     }
                 }
             } else {
@@ -1126,100 +1213,6 @@ impl StreamContext {
                 .generate_final_events(final_input_tokens, self.output_tokens),
         );
         events
-    }
-}
-
-/// 缓冲流处理上下文 - 用于 /cc/v1/messages 流式请求
-///
-/// 与 `StreamContext` 不同，此上下文会缓冲所有事件直到流结束，
-/// 然后用从 `contextUsageEvent` 计算的正确 `input_tokens` 更正 `message_start` 事件。
-///
-/// 工作流程：
-/// 1. 使用 `StreamContext` 正常处理所有 Kiro 事件
-/// 2. 把生成的 SSE 事件缓存起来（而不是立即发送）
-/// 3. 流结束时，找到 `message_start` 事件并更新其 `input_tokens`
-/// 4. 一次性返回所有事件
-pub struct BufferedStreamContext {
-    /// 内部流处理上下文（复用现有的事件处理逻辑）
-    inner: StreamContext,
-    /// 缓冲的所有事件（包括 message_start、content_block_start 等）
-    event_buffer: Vec<SseEvent>,
-    /// 估算的 input_tokens（用于回退）
-    estimated_input_tokens: i32,
-    /// 是否已经生成了初始事件
-    initial_events_generated: bool,
-}
-
-impl BufferedStreamContext {
-    /// 创建缓冲流上下文
-    pub fn new(
-        model: impl Into<String>,
-        estimated_input_tokens: i32,
-        thinking_enabled: bool,
-        tool_name_map: HashMap<String, String>,
-    ) -> Self {
-        let inner =
-            StreamContext::new_with_thinking(model, estimated_input_tokens, thinking_enabled, tool_name_map);
-        Self {
-            inner,
-            event_buffer: Vec::new(),
-            estimated_input_tokens,
-            initial_events_generated: false,
-        }
-    }
-
-    /// 处理 Kiro 事件并缓冲结果
-    ///
-    /// 复用 StreamContext 的事件处理逻辑，但把结果缓存而不是立即发送。
-    pub fn process_and_buffer(&mut self, event: &crate::kiro::model::events::Event) {
-        // 首次处理事件时，先生成初始事件（message_start 等）
-        if !self.initial_events_generated {
-            let initial_events = self.inner.generate_initial_events();
-            self.event_buffer.extend(initial_events);
-            self.initial_events_generated = true;
-        }
-
-        // 处理事件并缓冲结果
-        let events = self.inner.process_kiro_event(event);
-        self.event_buffer.extend(events);
-    }
-
-    /// 完成流处理并返回所有事件
-    ///
-    /// 此方法会：
-    /// 1. 生成最终事件（message_delta, message_stop）
-    /// 2. 用正确的 input_tokens 更正 message_start 事件
-    /// 3. 返回所有缓冲的事件
-    pub fn finish_and_get_all_events(&mut self) -> Vec<SseEvent> {
-        // 如果从未处理过事件，也要生成初始事件
-        if !self.initial_events_generated {
-            let initial_events = self.inner.generate_initial_events();
-            self.event_buffer.extend(initial_events);
-            self.initial_events_generated = true;
-        }
-
-        // 生成最终事件
-        let final_events = self.inner.generate_final_events();
-        self.event_buffer.extend(final_events);
-
-        // 获取正确的 input_tokens
-        let final_input_tokens = self
-            .inner
-            .context_input_tokens
-            .unwrap_or(self.estimated_input_tokens);
-
-        // 更正 message_start 事件中的 input_tokens
-        for event in &mut self.event_buffer {
-            if event.event == "message_start" {
-                if let Some(message) = event.data.get_mut("message") {
-                    if let Some(usage) = message.get_mut("usage") {
-                        usage["input_tokens"] = serde_json::json!(final_input_tokens);
-                    }
-                }
-            }
-        }
-
-        std::mem::take(&mut self.event_buffer)
     }
 }
 
@@ -1299,7 +1292,7 @@ mod tests {
         let mut map = HashMap::new();
         map.insert("short_abc12345".to_string(), "mcp__very_long_original_tool_name".to_string());
 
-        let mut ctx = StreamContext::new_with_thinking("test-model", 1, false, map);
+        let mut ctx = StreamContext::new_with_thinking("test-model", 1, false, map, false);
         let _ = ctx.generate_initial_events();
 
         // 模拟 Kiro 返回短名称的 tool_use
@@ -1323,7 +1316,7 @@ mod tests {
 
     #[test]
     fn test_text_delta_after_tool_use_restarts_text_block() {
-        let mut ctx = StreamContext::new_with_thinking("test-model", 1, false, HashMap::new());
+        let mut ctx = StreamContext::new_with_thinking("test-model", 1, false, HashMap::new(), false);
 
         let initial_events = ctx.generate_initial_events();
         assert!(
@@ -1384,7 +1377,7 @@ mod tests {
     fn test_tool_use_flushes_pending_thinking_buffer_text_before_tool_block() {
         // thinking 模式下，短文本可能被暂存在 thinking_buffer 以等待 `<thinking>` 的跨 chunk 匹配。
         // 当紧接着出现 tool_use 时，应先 flush 这段文本，再开始 tool_use block。
-        let mut ctx = StreamContext::new_with_thinking("test-model", 1, true, HashMap::new());
+        let mut ctx = StreamContext::new_with_thinking("test-model", 1, true, HashMap::new(), false);
         let _initial_events = ctx.generate_initial_events();
 
         // 两段短文本（各 2 个中文字符），总长度仍可能不足以满足 safe_len>0 的输出条件，
@@ -1591,7 +1584,7 @@ mod tests {
 
     #[test]
     fn test_tool_use_immediately_after_thinking_filters_end_tag_and_closes_thinking_block() {
-        let mut ctx = StreamContext::new_with_thinking("test-model", 1, true, HashMap::new());
+        let mut ctx = StreamContext::new_with_thinking("test-model", 1, true, HashMap::new(), false);
         let _initial_events = ctx.generate_initial_events();
 
         let mut all_events = Vec::new();
@@ -1643,7 +1636,7 @@ mod tests {
 
     #[test]
     fn test_final_flush_filters_standalone_thinking_end_tag() {
-        let mut ctx = StreamContext::new_with_thinking("test-model", 1, true, HashMap::new());
+        let mut ctx = StreamContext::new_with_thinking("test-model", 1, true, HashMap::new(), false);
         let _initial_events = ctx.generate_initial_events();
 
         let mut all_events = Vec::new();
@@ -1663,7 +1656,7 @@ mod tests {
     #[test]
     fn test_thinking_strips_leading_newline_same_chunk() {
         // <thinking>\n 在同一个 chunk 中，\n 应被剥离
-        let mut ctx = StreamContext::new_with_thinking("test-model", 1, true, HashMap::new());
+        let mut ctx = StreamContext::new_with_thinking("test-model", 1, true, HashMap::new(), false);
         let _initial_events = ctx.generate_initial_events();
 
         let events = ctx.process_assistant_response("<thinking>\nHello world");
@@ -1692,7 +1685,7 @@ mod tests {
     #[test]
     fn test_thinking_strips_leading_newline_cross_chunk() {
         // <thinking> 在第一个 chunk 末尾，\n 在第二个 chunk 开头
-        let mut ctx = StreamContext::new_with_thinking("test-model", 1, true, HashMap::new());
+        let mut ctx = StreamContext::new_with_thinking("test-model", 1, true, HashMap::new(), false);
         let _initial_events = ctx.generate_initial_events();
 
         let events1 = ctx.process_assistant_response("<thinking>");
@@ -1724,7 +1717,7 @@ mod tests {
     #[test]
     fn test_thinking_no_strip_when_no_leading_newline() {
         // <thinking> 后直接跟内容（无 \n），内容应完整保留
-        let mut ctx = StreamContext::new_with_thinking("test-model", 1, true, HashMap::new());
+        let mut ctx = StreamContext::new_with_thinking("test-model", 1, true, HashMap::new(), false);
         let _initial_events = ctx.generate_initial_events();
 
         let events = ctx.process_assistant_response("<thinking>abc</thinking>\n\ntext");
@@ -1748,7 +1741,7 @@ mod tests {
     #[test]
     fn test_text_after_thinking_strips_leading_newlines() {
         // `</thinking>\n\n` 后的文本不应以 \n\n 开头
-        let mut ctx = StreamContext::new_with_thinking("test-model", 1, true, HashMap::new());
+        let mut ctx = StreamContext::new_with_thinking("test-model", 1, true, HashMap::new(), false);
         let _initial_events = ctx.generate_initial_events();
 
         let events =
@@ -1801,7 +1794,7 @@ mod tests {
     fn test_end_tag_newlines_split_across_events() {
         // `</thinking>\n` 在 chunk 1，`\n` 在 chunk 2，`text` 在 chunk 3
         // 确保 `</thinking>` 不会被部分当作 thinking 内容发出
-        let mut ctx = StreamContext::new_with_thinking("test-model", 1, true, HashMap::new());
+        let mut ctx = StreamContext::new_with_thinking("test-model", 1, true, HashMap::new(), false);
         let _initial_events = ctx.generate_initial_events();
 
         let mut all = Vec::new();
@@ -1820,7 +1813,7 @@ mod tests {
     #[test]
     fn test_end_tag_alone_in_chunk_then_newlines_in_next() {
         // `</thinking>` 单独在一个 chunk，`\n\ntext` 在下一个 chunk
-        let mut ctx = StreamContext::new_with_thinking("test-model", 1, true, HashMap::new());
+        let mut ctx = StreamContext::new_with_thinking("test-model", 1, true, HashMap::new(), false);
         let _initial_events = ctx.generate_initial_events();
 
         let mut all = Vec::new();
@@ -1838,7 +1831,7 @@ mod tests {
     #[test]
     fn test_start_tag_newline_split_across_events() {
         // `\n\n` 在 chunk 1，`<thinking>` 在 chunk 2，`\n` 在 chunk 3
-        let mut ctx = StreamContext::new_with_thinking("test-model", 1, true, HashMap::new());
+        let mut ctx = StreamContext::new_with_thinking("test-model", 1, true, HashMap::new(), false);
         let _initial_events = ctx.generate_initial_events();
 
         let mut all = Vec::new();
@@ -1858,7 +1851,7 @@ mod tests {
     #[test]
     fn test_full_flow_maximally_split() {
         // 极端拆分：每个关键边界都在不同 chunk
-        let mut ctx = StreamContext::new_with_thinking("test-model", 1, true, HashMap::new());
+        let mut ctx = StreamContext::new_with_thinking("test-model", 1, true, HashMap::new(), false);
         let _initial_events = ctx.generate_initial_events();
 
         let mut all = Vec::new();
@@ -1887,7 +1880,7 @@ mod tests {
     #[test]
     fn test_thinking_only_sets_max_tokens_stop_reason() {
         // 整个流只有 thinking 块，没有 text 也没有 tool_use，stop_reason 应为 max_tokens
-        let mut ctx = StreamContext::new_with_thinking("test-model", 1, true, HashMap::new());
+        let mut ctx = StreamContext::new_with_thinking("test-model", 1, true, HashMap::new(), false);
         let _initial_events = ctx.generate_initial_events();
 
         let mut all_events = Vec::new();
@@ -1942,7 +1935,7 @@ mod tests {
     #[test]
     fn test_thinking_with_text_keeps_end_turn_stop_reason() {
         // thinking + text 的情况，stop_reason 应为 end_turn
-        let mut ctx = StreamContext::new_with_thinking("test-model", 1, true, HashMap::new());
+        let mut ctx = StreamContext::new_with_thinking("test-model", 1, true, HashMap::new(), false);
         let _initial_events = ctx.generate_initial_events();
 
         let mut all_events = Vec::new();
@@ -1963,7 +1956,7 @@ mod tests {
     #[test]
     fn test_thinking_with_tool_use_keeps_tool_use_stop_reason() {
         // thinking + tool_use 的情况，stop_reason 应为 tool_use
-        let mut ctx = StreamContext::new_with_thinking("test-model", 1, true, HashMap::new());
+        let mut ctx = StreamContext::new_with_thinking("test-model", 1, true, HashMap::new(), false);
         let _initial_events = ctx.generate_initial_events();
 
         let mut all_events = Vec::new();

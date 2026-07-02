@@ -9,6 +9,9 @@ RUN pnpm build
 
 FROM rust:1.92-alpine AS builder
 
+# TLS 后端：true = native-tls（默认，代理/token 刷新更稳）；false = rustls（镜像更小）
+ARG ENABLE_NATIVE_TLS=true
+
 RUN apk add --no-cache musl-dev perl make
 
 WORKDIR /app
@@ -16,7 +19,11 @@ COPY Cargo.toml Cargo.lock* ./
 COPY src ./src
 COPY --from=frontend-builder /app/admin-ui/dist /app/admin-ui/dist
 
-RUN cargo build --release --no-default-features
+RUN if [ "$ENABLE_NATIVE_TLS" = "true" ]; then \
+      cargo build --release --features native-tls; \
+    else \
+      cargo build --release --no-default-features; \
+    fi
 
 FROM alpine:3.21
 
