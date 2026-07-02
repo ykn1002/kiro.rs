@@ -381,8 +381,34 @@ fn create_placeholder_tool(name: &str) -> Tool {
     }
 }
 
-/// 将 Anthropic 请求转换为 Kiro 请求
+/// 将 Anthropic 请求转换为 Kiro 请求（Claude /v1/messages 等原生路径）
 pub fn convert_request(req: &MessagesRequest) -> Result<ConversionResult, ConversionError> {
+    convert_request_inner(req, ConvertRequestOptions::default())
+}
+
+/// Codex Responses 路径：额外做 tool_result 归并，必要时填充占位 content
+pub(crate) fn convert_responses_request(
+    req: &MessagesRequest,
+) -> Result<ConversionResult, ConversionError> {
+    convert_request_inner(
+        req,
+        ConvertRequestOptions {
+            reconcile_tool_results: true,
+            allow_tool_continuation_placeholder: true,
+        },
+    )
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct ConvertRequestOptions {
+    reconcile_tool_results: bool,
+    allow_tool_continuation_placeholder: bool,
+}
+
+fn convert_request_inner(
+    req: &MessagesRequest,
+    options: ConvertRequestOptions,
+) -> Result<ConversionResult, ConversionError> {
     // 1. 映射模型
     let model_id = map_model(&req.model)
         .ok_or_else(|| ConversionError::UnsupportedModel(req.model.clone()))?;
@@ -430,9 +456,10 @@ pub fn convert_request(req: &MessagesRequest) -> Result<ConversionResult, Conver
     // 7. 构建历史消息（需要先构建，以便收集历史中使用的工具）
     let mut history = build_history(req, messages, &model_id, &mut tool_name_map)?;
 
-    // 7.5. 将当前消息里属于上一轮 tool_use 的 tool_result 归并到历史 user 消息
-    // Bedrock 要求 tool_result 必须紧跟在含 tool_use 的 assistant 之后，不能拆到 currentMessage
-    reconcile_tool_results_with_history(&mut history, &model_id, &mut tool_results);
+    // 7.5. Codex Responses：将 current 中属于上一轮 tool_use 的 tool_result 归并到 history
+    if options.reconcile_tool_results {
+        reconcile_tool_results_with_history(&mut history, &model_id, &mut tool_results);
+    }
 
     // 8. 验证并过滤 tool_use/tool_result 配对
     // 移除孤立的 tool_result（没有对应的 tool_use）
@@ -468,12 +495,15 @@ pub fn convert_request(req: &MessagesRequest) -> Result<ConversionResult, Conver
     }
 
     // 12. 构建当前消息
-    // 保留文本内容，即使有工具结果也不丢弃用户文本
-    // Kiro 要求 content 非空；工具调用轮次在 tool_result 归入 history 后 current 可能为空
-    let mut content = text_content;
-    if content.trim().is_empty() {
-        content = " ".to_string();
-    }
+    let content = if options.allow_tool_continuation_placeholder
+        && text_content.trim().is_empty()
+        && context.tool_results.is_empty()
+    {
+        // Codex 工具轮次：tool_result 已全部归入 history，Kiro 要求 current content 非空
+        " ".to_string()
+    } else {
+        text_content
+    };
 
     let mut user_input = UserInputMessage::new(content, &model_id)
         .with_context(context)
@@ -1043,10 +1073,7 @@ fn merge_user_messages(
         all_tool_results.extend(tool_results);
     }
 
-    let mut content = content_parts.join("\n");
-    if content.trim().is_empty() && !all_tool_results.is_empty() {
-        content = " ".to_string();
-    }
+    let content = content_parts.join("\n");
     // 保留文本内容，即使有工具结果也不丢弃用户文本
     let mut user_msg = UserMessage::new(&content, model_id);
 
@@ -1853,15 +1880,7 @@ mod tests {
     }
 
     #[test]
-    fn test_convert_request_tool_only_last_message_uses_placeholder_content() {
-        use crate::kiro::model::requests::tool::ToolUseEntry;
-
-        let mut assistant_msg = AssistantMessage::new(" ");
-        assistant_msg = assistant_msg.with_tool_uses(vec![
-            ToolUseEntry::new("call_shell", "shell")
-                .with_input(serde_json::json!({"command": "curl example.com"})),
-        ]);
-
+    fn test_convert_responses_request_tool_only_last_message_uses_placeholder_content() {
         let req = MessagesRequest {
             model: "claude-sonnet-4-6".to_string(),
             max_tokens: 1024,
@@ -1897,13 +1916,15 @@ mod tests {
             metadata: None,
         };
 
-        let result = convert_request(&req).unwrap();
-        let current = &result
-            .conversation_state
-            .current_message
-            .user_input_message
-            .content;
-        assert_eq!(current, " ");
+        let result = convert_responses_request(&req).unwrap();
+        assert_eq!(
+            result
+                .conversation_state
+                .current_message
+                .user_input_message
+                .content,
+            " "
+        );
         assert!(result
             .conversation_state
             .current_message
@@ -1911,26 +1932,63 @@ mod tests {
             .user_input_message_context
             .tool_results
             .is_empty());
-        let history_user = result
-            .conversation_state
-            .history
-            .iter()
-            .find_map(|msg| match msg {
-                Message::User(u) if !u
-                    .user_input_message
-                    .user_input_message_context
-                    .tool_results
-                    .is_empty() =>
-                {
-                    Some(u)
-                }
-                _ => None,
-            })
-            .expect("tool_result 应进入 history");
+    }
+
+    #[test]
+    fn test_convert_request_keeps_tool_results_in_current_message() {
+        let req = MessagesRequest {
+            model: "claude-sonnet-4-6".to_string(),
+            max_tokens: 1024,
+            messages: vec![
+                super::super::types::Message {
+                    role: "user".to_string(),
+                    content: serde_json::json!("查天气"),
+                },
+                super::super::types::Message {
+                    role: "assistant".to_string(),
+                    content: serde_json::json!([{
+                        "type": "tool_use",
+                        "id": "call_shell",
+                        "name": "shell",
+                        "input": {"command": "curl example.com"}
+                    }]),
+                },
+                super::super::types::Message {
+                    role: "user".to_string(),
+                    content: serde_json::json!([{
+                        "type": "tool_result",
+                        "tool_use_id": "call_shell",
+                        "content": "Weather: 28C"
+                    }]),
+                },
+            ],
+            stream: true,
+            system: None,
+            tools: None,
+            tool_choice: None,
+            thinking: None,
+            output_config: None,
+            metadata: None,
+        };
+
+        let result = convert_request(&req).unwrap();
         assert_eq!(
-            history_user.user_input_message.user_input_message_context.tool_results[0]
-                .tool_use_id,
-            "call_shell"
+            result
+                .conversation_state
+                .current_message
+                .user_input_message
+                .content,
+            ""
+        );
+        assert_eq!(
+            result
+                .conversation_state
+                .current_message
+                .user_input_message
+                .user_input_message_context
+                .tool_results
+                .len(),
+            1
         );
     }
 

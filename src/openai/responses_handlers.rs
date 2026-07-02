@@ -14,7 +14,7 @@ use futures::{Stream, StreamExt, stream};
 use serde_json::json;
 use uuid::Uuid;
 
-use crate::anthropic::{AppState, ConversionError, convert_request, get_context_window_size};
+use crate::anthropic::{AppState, ConversionError, get_context_window_size};
 use crate::kiro::model::events::Event;
 use crate::kiro::model::requests::kiro::KiroRequest;
 use crate::kiro::parser::decoder::EventStreamDecoder;
@@ -73,7 +73,7 @@ pub async fn create_response(
 
     override_thinking_from_model_name(&mut anthropic_payload);
 
-    let conversion_result = match convert_request(&anthropic_payload) {
+    let conversion_result = match crate::anthropic::convert_responses_request(&anthropic_payload) {
         Ok(r) => r,
         Err(e) => {
             let (error_type, message) = match &e {
