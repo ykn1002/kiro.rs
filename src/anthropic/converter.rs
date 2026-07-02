@@ -188,10 +188,12 @@ fn match_model_def(model: &str) -> Option<ModelDef> {
     None
 }
 
+/// 规范化 JSON Schema，修复 MCP / Codex 工具定义中常见的类型问题
+pub(crate) fn normalize_tool_schema(schema: serde_json::Value) -> serde_json::Value {
+    normalize_json_schema(schema)
+}
+
 /// 规范化 JSON Schema，修复 MCP 工具定义中常见的类型问题
-///
-/// Claude Code / MCP 工具定义偶尔会出现 `required: null`、`properties: null` 等，
-/// 导致上游返回 400 "Improperly formed request"。
 fn normalize_json_schema(schema: serde_json::Value) -> serde_json::Value {
     let serde_json::Value::Object(mut obj) = schema else {
         return serde_json::json!({
@@ -467,7 +469,11 @@ pub fn convert_request(req: &MessagesRequest) -> Result<ConversionResult, Conver
 
     // 12. 构建当前消息
     // 保留文本内容，即使有工具结果也不丢弃用户文本
-    let content = text_content;
+    // Kiro 要求 content 非空；工具调用轮次在 tool_result 归入 history 后 current 可能为空
+    let mut content = text_content;
+    if content.trim().is_empty() {
+        content = " ".to_string();
+    }
 
     let mut user_input = UserInputMessage::new(content, &model_id)
         .with_context(context)
@@ -1037,7 +1043,10 @@ fn merge_user_messages(
         all_tool_results.extend(tool_results);
     }
 
-    let content = content_parts.join("\n");
+    let mut content = content_parts.join("\n");
+    if content.trim().is_empty() && !all_tool_results.is_empty() {
+        content = " ".to_string();
+    }
     // 保留文本内容，即使有工具结果也不丢弃用户文本
     let mut user_msg = UserMessage::new(&content, model_id);
 
@@ -1841,6 +1850,88 @@ mod tests {
         // 因为 tool-1 已经在历史中配对了
         assert!(filtered.is_empty());
         assert!(orphaned.is_empty());
+    }
+
+    #[test]
+    fn test_convert_request_tool_only_last_message_uses_placeholder_content() {
+        use crate::kiro::model::requests::tool::ToolUseEntry;
+
+        let mut assistant_msg = AssistantMessage::new(" ");
+        assistant_msg = assistant_msg.with_tool_uses(vec![
+            ToolUseEntry::new("call_shell", "shell")
+                .with_input(serde_json::json!({"command": "curl example.com"})),
+        ]);
+
+        let req = MessagesRequest {
+            model: "claude-sonnet-4-6".to_string(),
+            max_tokens: 1024,
+            messages: vec![
+                super::super::types::Message {
+                    role: "user".to_string(),
+                    content: serde_json::json!("今天新加坡天气"),
+                },
+                super::super::types::Message {
+                    role: "assistant".to_string(),
+                    content: serde_json::json!([{
+                        "type": "tool_use",
+                        "id": "call_shell",
+                        "name": "shell",
+                        "input": {"command": "curl example.com"}
+                    }]),
+                },
+                super::super::types::Message {
+                    role: "user".to_string(),
+                    content: serde_json::json!([{
+                        "type": "tool_result",
+                        "tool_use_id": "call_shell",
+                        "content": "Weather: 28C"
+                    }]),
+                },
+            ],
+            stream: true,
+            system: None,
+            tools: None,
+            tool_choice: None,
+            thinking: None,
+            output_config: None,
+            metadata: None,
+        };
+
+        let result = convert_request(&req).unwrap();
+        let current = &result
+            .conversation_state
+            .current_message
+            .user_input_message
+            .content;
+        assert_eq!(current, " ");
+        assert!(result
+            .conversation_state
+            .current_message
+            .user_input_message
+            .user_input_message_context
+            .tool_results
+            .is_empty());
+        let history_user = result
+            .conversation_state
+            .history
+            .iter()
+            .find_map(|msg| match msg {
+                Message::User(u) if !u
+                    .user_input_message
+                    .user_input_message_context
+                    .tool_results
+                    .is_empty() =>
+                {
+                    Some(u)
+                }
+                _ => None,
+            })
+            .expect("tool_result 应进入 history");
+        assert_eq!(
+            history_user.user_input_message.user_input_message_context.tool_results[0]
+                .tool_use_id,
+            "call_shell"
+        );
     }
 
     #[test]

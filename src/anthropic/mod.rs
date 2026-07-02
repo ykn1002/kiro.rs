@@ -34,7 +34,7 @@ pub(crate) use stream::extract_thinking_from_complete_text;
 mod websearch;
 
 pub use converter::{init_model_mapping, init_model_registry, set_model_registry};
-pub(crate) use converter::{ConversionError, convert_request, get_context_window_size, map_model};
+pub(crate) use converter::{ConversionError, convert_request, get_context_window_size, map_model, normalize_tool_schema};
 pub use middleware::SharedApiKey;
 pub(crate) use middleware::AppState;
 pub use router::create_router_with_provider;

@@ -379,12 +379,36 @@ fn convert_response_assistant(item: &serde_json::Value) -> Message {
 }
 
 fn convert_function_call_item(item: &serde_json::Value) -> Message {
+    let item_type = item
+        .get("type")
+        .and_then(|v| v.as_str())
+        .unwrap_or("function_call");
+
     let call_id = item
         .get("call_id")
         .or_else(|| item.get("id"))
         .and_then(|v| v.as_str())
         .unwrap_or("unknown")
         .to_string();
+
+    let (name, input) = match item_type {
+        "local_shell_call" => extract_local_shell_tool(item),
+        "custom_tool_call" => extract_custom_tool_call(item),
+        _ => extract_function_tool(item),
+    };
+
+    Message {
+        role: "assistant".to_string(),
+        content: serde_json::json!([{
+            "type": "tool_use",
+            "id": call_id,
+            "name": name,
+            "input": input
+        }]),
+    }
+}
+
+fn extract_function_tool(item: &serde_json::Value) -> (String, serde_json::Value) {
     let name = item
         .get("name")
         .and_then(|v| v.as_str())
@@ -395,17 +419,64 @@ fn convert_function_call_item(item: &serde_json::Value) -> Message {
         .and_then(|v| v.as_str())
         .or_else(|| item.get("input").and_then(|v| v.as_str()))
         .unwrap_or("{}");
-    let input: serde_json::Value =
-        serde_json::from_str(arguments).unwrap_or(serde_json::json!({}));
+    let input = serde_json::from_str(arguments).unwrap_or(serde_json::json!({}));
+    (name, input)
+}
 
-    Message {
-        role: "assistant".to_string(),
-        content: serde_json::json!([{
-            "type": "tool_use",
-            "id": call_id,
-            "name": name,
-            "input": input
-        }]),
+fn extract_custom_tool_call(item: &serde_json::Value) -> (String, serde_json::Value) {
+    let name = item
+        .get("name")
+        .and_then(|v| v.as_str())
+        .unwrap_or("custom")
+        .to_string();
+    let input = match item.get("input") {
+        Some(serde_json::Value::String(raw)) => {
+            serde_json::from_str(raw).unwrap_or_else(|_| serde_json::json!({ "input": raw }))
+        }
+        Some(other) => other.clone(),
+        None => serde_json::json!({}),
+    };
+    (name, input)
+}
+
+fn extract_local_shell_tool(item: &serde_json::Value) -> (String, serde_json::Value) {
+    let name = item
+        .get("name")
+        .and_then(|v| v.as_str())
+        .unwrap_or("shell")
+        .to_string();
+
+    let Some(action) = item.get("action") else {
+        return (name, serde_json::json!({}));
+    };
+
+    let input = match action.get("type").and_then(|v| v.as_str()) {
+        Some("exec") => {
+            let command = action.get("command").map(format_shell_command).unwrap_or_default();
+            let mut obj = serde_json::Map::new();
+            obj.insert("command".to_string(), serde_json::Value::String(command));
+            if let Some(timeout) = action.get("timeout_ms") {
+                obj.insert("timeout_ms".to_string(), timeout.clone());
+            }
+            if let Some(cwd) = action.get("working_directory") {
+                obj.insert("working_directory".to_string(), cwd.clone());
+            }
+            serde_json::Value::Object(obj)
+        }
+        _ => action.clone(),
+    };
+    (name, input)
+}
+
+fn format_shell_command(value: &serde_json::Value) -> String {
+    match value {
+        serde_json::Value::String(s) => s.clone(),
+        serde_json::Value::Array(parts) => parts
+            .iter()
+            .filter_map(|v| v.as_str())
+            .collect::<Vec<_>>()
+            .join(" "),
+        _ => value.to_string(),
     }
 }
 
@@ -565,7 +636,8 @@ fn convert_response_tools(tools: &Option<Vec<serde_json::Value>>) -> Option<Vec<
                     .or_else(|| tool.get("function").and_then(|f| f.get("parameters")))
                     .cloned()
                     .unwrap_or(serde_json::json!({}));
-                let input_schema = if let serde_json::Value::Object(obj) = params {
+                let normalized = crate::anthropic::normalize_tool_schema(params);
+                let input_schema = if let serde_json::Value::Object(obj) = normalized {
                     obj.into_iter().collect()
                 } else {
                     HashMap::new()
@@ -944,6 +1016,53 @@ mod tests {
                 .iter()
                 .any(|b| b.get("tool_use_id") == Some(&serde_json::Value::String("call_b".into())))
         );
+    }
+
+    #[test]
+    fn test_local_shell_call_roundtrip() {
+        setup();
+        let req = ResponsesRequest {
+            model: "claude-sonnet-4-6".to_string(),
+            instructions: None,
+            input: vec![
+                serde_json::json!({
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "今天新加坡天气"}]
+                }),
+                serde_json::json!({
+                    "type": "local_shell_call",
+                    "call_id": "call_shell_1",
+                    "action": {
+                        "type": "exec",
+                        "command": ["curl", "-s", "https://wttr.in/Singapore?lang=zh", "-m", "10"]
+                    }
+                }),
+                serde_json::json!({
+                    "type": "function_call_output",
+                    "call_id": "call_shell_1",
+                    "output": "Singapore: 28°C"
+                }),
+            ],
+            tools: None,
+            tool_choice: None,
+            stream: true,
+            max_output_tokens: None,
+            reasoning: None,
+            extra: HashMap::new(),
+        };
+        let anthropic = responses_to_anthropic(&req).unwrap();
+        let tool_msg = anthropic
+            .messages
+            .iter()
+            .find(|m| m.role == "assistant")
+            .expect("assistant tool_use");
+        let tool_use = tool_msg.content.as_array().unwrap()[0].clone();
+        assert_eq!(tool_use["name"], "shell");
+        assert!(tool_use["input"]["command"]
+            .as_str()
+            .unwrap()
+            .contains("wttr.in"));
     }
 
     #[test]
