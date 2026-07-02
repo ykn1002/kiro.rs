@@ -49,6 +49,7 @@ pub struct OpenAiStreamContext {
     text_buffer: String,
     in_thinking: bool,
     thinking_extracted: bool,
+    pub stream_failed: bool,
 }
 
 impl OpenAiStreamContext {
@@ -74,6 +75,19 @@ impl OpenAiStreamContext {
             text_buffer: String::new(),
             in_thinking: false,
             thinking_extracted: false,
+            stream_failed: false,
+        }
+    }
+
+    pub fn create_error_chunk(message: &str) -> OpenAiChunk {
+        OpenAiChunk {
+            data: json!({
+                "error": {
+                    "message": message,
+                    "type": "server_error",
+                    "code": "upstream_error"
+                }
+            }),
         }
     }
 
@@ -124,6 +138,16 @@ impl OpenAiStreamContext {
                     self.finish_reason = Some("length".to_string());
                 }
                 Vec::new()
+            }
+            Event::Error {
+                error_code,
+                error_message,
+            } => {
+                self.stream_failed = true;
+                tracing::error!("收到错误事件: {} - {}", error_code, error_message);
+                vec![Self::create_error_chunk(&format!(
+                    "{error_code}: {error_message}"
+                ))]
             }
             _ => Vec::new(),
         }
@@ -317,6 +341,12 @@ impl OpenAiStreamContext {
     }
 
     pub fn generate_final_chunks(&mut self, include_usage: bool) -> Vec<OpenAiChunk> {
+        if self.stream_failed {
+            return vec![OpenAiChunk {
+                data: serde_json::Value::String("[DONE]".to_string()),
+            }];
+        }
+
         let mut chunks = Vec::new();
 
         // flush 剩余 buffer

@@ -23,7 +23,7 @@ use crate::kiro::parser::decoder::EventStreamDecoder;
 use crate::token;
 
 use super::converter::to_anthropic_request;
-use super::stream::{OpenAiStreamContext, done_sse};
+use super::stream::{OpenAiChunk, OpenAiStreamContext, done_sse};
 use super::types::{
     AssistantMessage, ChatCompletionChoice, ChatCompletionRequest, ChatCompletionResponse,
     ErrorResponse, FunctionCall, ResponseToolCall, Usage,
@@ -150,13 +150,12 @@ pub async fn chat_completions(
         )
         .await
     } else {
-        let extract_thinking = state.extract_thinking && thinking_enabled;
         handle_non_stream_request(
             provider,
             &request_body,
             &payload.model,
             input_tokens,
-            extract_thinking,
+            thinking_enabled,
             tool_name_map,
         )
         .await
@@ -261,25 +260,28 @@ fn create_openai_sse_stream(
                                 .map(|s| Ok(Bytes::from(s)))
                                 .collect();
 
-                            Some((stream::iter(bytes), (body_stream, ctx, decoder, false, ping_interval, include_usage)))
+                            let stream_failed = ctx.stream_failed;
+                            Some((stream::iter(bytes), (body_stream, ctx, decoder, stream_failed, ping_interval, include_usage)))
                         }
                         Some(Err(e)) => {
                             tracing::error!("读取响应流失败: {:?}", e);
-                            let final_chunks = ctx.generate_final_chunks(include_usage);
-                            let bytes: Vec<Result<Bytes, Infallible>> = final_chunks
-                                .into_iter()
-                                .map(|c| {
-                                    if c.data == serde_json::Value::String("[DONE]".to_string()) {
-                                        Ok(Bytes::from(done_sse()))
-                                    } else {
-                                        Ok(Bytes::from(c.to_sse_string()))
-                                    }
-                                })
-                                .collect();
+                            let err = OpenAiStreamContext::create_error_chunk(&format!(
+                                "Upstream stream error: {e}"
+                            ));
+                            let bytes = vec![
+                                Ok(Bytes::from(err.to_sse_string())),
+                                Ok(Bytes::from(done_sse())),
+                            ];
                             Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, include_usage)))
                         }
                         None => {
-                            let final_chunks = ctx.generate_final_chunks(include_usage);
+                            let final_chunks = if ctx.stream_failed {
+                                vec![OpenAiChunk {
+                                    data: serde_json::Value::String("[DONE]".to_string()),
+                                }]
+                            } else {
+                                ctx.generate_final_chunks(include_usage)
+                            };
                             let bytes: Vec<Result<Bytes, Infallible>> = final_chunks
                                 .into_iter()
                                 .map(|c| {
@@ -309,7 +311,7 @@ async fn handle_non_stream_request(
     request_body: &str,
     model: &str,
     input_tokens: i32,
-    extract_thinking: bool,
+    thinking_enabled: bool,
     tool_name_map: std::collections::HashMap<String, String>,
 ) -> Response {
     let response = match provider.call_api(request_body).await {
@@ -365,6 +367,19 @@ async fn handle_non_stream_request(
                             finish_reason = "length".to_string();
                         }
                     }
+                    Event::Error {
+                        error_code,
+                        error_message,
+                    } => {
+                        return (
+                            StatusCode::BAD_GATEWAY,
+                            Json(ErrorResponse::new(
+                                "server_error",
+                                format!("{error_code}: {error_message}"),
+                            )),
+                        )
+                            .into_response();
+                    }
                     Event::Exception { exception_type, .. } => {
                         if exception_type == "ContentLengthExceededException" {
                             finish_reason = "length".to_string();
@@ -379,13 +394,13 @@ async fn handle_non_stream_request(
     let mut reasoning_content: Option<String> = None;
     let mut content_text = text_content.clone();
 
-    if extract_thinking {
+    if thinking_enabled {
         let (thinking, remaining) =
             crate::anthropic::extract_thinking_from_complete_text(&text_content);
         reasoning_content = thinking;
         content_text = remaining;
     } else if content_text.contains("<thinking>") {
-        // 默认剥离 thinking 标签
+        // 未启用 thinking 时仍剥离标签，避免泄露给客户端
         let (_, remaining) =
             crate::anthropic::extract_thinking_from_complete_text(&text_content);
         content_text = remaining;

@@ -143,7 +143,7 @@ pub async fn create_response(
             &request_body,
             &payload.model,
             input_tokens,
-            state.extract_thinking && thinking_enabled,
+            thinking_enabled,
             tool_name_map,
         )
         .await
@@ -218,19 +218,23 @@ fn create_responses_sse_stream(
                         .map(|s| Ok(Bytes::from(s)))
                         .collect();
 
-                    Some((stream::iter(bytes), (body_stream, ctx, decoder, false)))
+                            let stream_failed = ctx.stream_failed;
+                            Some((stream::iter(bytes), (body_stream, ctx, decoder, stream_failed)))
                 }
                 Some(Err(e)) => {
                     tracing::error!("读取响应流失败: {:?}", e);
-                    let final_events = ctx.generate_final_events();
-                    let bytes: Vec<Result<Bytes, Infallible>> = final_events
-                        .into_iter()
-                        .map(|e| Ok(Bytes::from(e.to_sse_string())))
-                        .collect();
+                    let err = super::responses_stream::ResponsesStreamContext::create_error_event(
+                        &format!("Upstream stream error: {e}"),
+                    );
+                    let bytes = vec![Ok(Bytes::from(err.to_sse_string()))];
                     Some((stream::iter(bytes), (body_stream, ctx, decoder, true)))
                 }
                 None => {
-                    let final_events = ctx.generate_final_events();
+                    let final_events = if ctx.stream_failed {
+                        Vec::new()
+                    } else {
+                        ctx.generate_final_events()
+                    };
                     let bytes: Vec<Result<Bytes, Infallible>> = final_events
                         .into_iter()
                         .map(|e| Ok(Bytes::from(e.to_sse_string())))
@@ -250,7 +254,7 @@ async fn handle_responses_non_stream(
     request_body: &str,
     model: &str,
     input_tokens: i32,
-    extract_thinking: bool,
+    thinking_enabled: bool,
     tool_name_map: std::collections::HashMap<String, String>,
 ) -> Response {
     let response = match provider.call_api(request_body).await {
@@ -320,6 +324,19 @@ async fn handle_responses_non_stream(
                             status = "incomplete".to_string();
                         }
                     }
+                    Event::Error {
+                        error_code,
+                        error_message,
+                    } => {
+                        return (
+                            StatusCode::BAD_GATEWAY,
+                            Json(ErrorResponse::new(
+                                "server_error",
+                                format!("{error_code}: {error_message}"),
+                            )),
+                        )
+                            .into_response();
+                    }
                     Event::Exception { exception_type, .. } => {
                         if exception_type == "ContentLengthExceededException" {
                             status = "incomplete".to_string();
@@ -331,14 +348,28 @@ async fn handle_responses_non_stream(
         }
     }
 
+    let mut reasoning_text: Option<String> = None;
     let mut content_text = text_content.clone();
-    if extract_thinking || content_text.contains("<thinking>") {
+    if thinking_enabled {
+        let (reasoning, remaining) =
+            crate::anthropic::extract_thinking_from_complete_text(&text_content);
+        reasoning_text = reasoning;
+        content_text = remaining;
+    } else if content_text.contains("<thinking>") {
         let (_, remaining) =
             crate::anthropic::extract_thinking_from_complete_text(&text_content);
         content_text = remaining;
     }
 
     let mut output = Vec::new();
+    if let Some(reasoning) = reasoning_text.filter(|s| !s.is_empty()) {
+        output.push(json!({
+            "id": format!("rs_{}", Uuid::new_v4().simple()),
+            "type": "reasoning",
+            "status": "completed",
+            "summary": [{"type": "summary_text", "text": reasoning}]
+        }));
+    }
     if !content_text.is_empty() || tool_items.is_empty() {
         output.push(json!({
             "id": format!("msg_{}", Uuid::new_v4().simple()),

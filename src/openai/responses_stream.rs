@@ -62,6 +62,7 @@ pub struct ResponsesStreamContext {
     in_thinking: bool,
     thinking_extracted: bool,
     reasoning_text: String,
+    pub stream_failed: bool,
 }
 
 impl ResponsesStreamContext {
@@ -96,6 +97,21 @@ impl ResponsesStreamContext {
             in_thinking: false,
             thinking_extracted: false,
             reasoning_text: String::new(),
+            stream_failed: false,
+        }
+    }
+
+    pub fn create_error_event(message: &str) -> ResponsesSseEvent {
+        ResponsesSseEvent {
+            event_type: "error".to_string(),
+            data: json!({
+                "type": "error",
+                "error": {
+                    "message": message,
+                    "type": "server_error",
+                    "code": "upstream_error"
+                }
+            }),
         }
     }
 
@@ -226,6 +242,17 @@ impl ResponsesStreamContext {
                     self.status = "incomplete".to_string();
                 }
                 Vec::new()
+            }
+            Event::Error {
+                error_code,
+                error_message,
+            } => {
+                self.stream_failed = true;
+                self.status = "failed".to_string();
+                tracing::error!("收到错误事件: {} - {}", error_code, error_message);
+                vec![Self::create_error_event(&format!(
+                    "{error_code}: {error_message}"
+                ))]
             }
             _ => Vec::new(),
         }
@@ -484,6 +511,10 @@ impl ResponsesStreamContext {
     }
 
     pub fn generate_final_events(&mut self) -> Vec<ResponsesSseEvent> {
+        if self.stream_failed {
+            return Vec::new();
+        }
+
         let mut events = Vec::new();
 
         // flush thinking buffer
