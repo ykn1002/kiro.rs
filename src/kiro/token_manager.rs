@@ -104,6 +104,26 @@ impl fmt::Display for RefreshTokenInvalidError {
 
 impl std::error::Error for RefreshTokenInvalidError {}
 
+/// 凭据级 RPM 已达配置上限，本地拒绝放行（应对客户端返回 429）
+#[derive(Debug, Clone)]
+pub(crate) struct CredentialRpmExceeded {
+    pub limit: u32,
+    pub retry_after: StdDuration,
+}
+
+impl fmt::Display for CredentialRpmExceeded {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "凭据 RPM 已达上限（{} req/min），请在 {} 秒后重试",
+            self.limit,
+            self.retry_after.as_secs().max(1)
+        )
+    }
+}
+
+impl std::error::Error for CredentialRpmExceeded {}
+
 /// 刷新 Token
 pub(crate) async fn refresh_token(
     credentials: &KiroCredentials,
@@ -1018,23 +1038,12 @@ impl MultiTokenManager {
             true
         };
 
-        // 优先选择该模型类别下未达到 RPM 上限的凭据；若全部达到上限则回退到全部可用凭据，
-        // 避免因节流导致请求直接失败（节流的目的是分流而非拒绝）。
-        let available: Vec<&CredentialEntry> = {
-            let not_capped: Vec<&CredentialEntry> = entries
-                .iter()
-                .filter(|e| base_available(e))
-                .filter(|e| {
-                    rpm == 0 || (e.request_times_len(class) as u32) < rpm
-                })
-                .collect();
-
-            if !not_capped.is_empty() {
-                not_capped
-            } else {
-                entries.iter().filter(|e| base_available(e)).collect()
-            }
-        };
+        // 仅选择该模型类别下尚未达到 RPM 上限的凭据；全部打满时返回 None（由 acquire_context 回 429）。
+        let available: Vec<&CredentialEntry> = entries
+            .iter()
+            .filter(|e| base_available(e))
+            .filter(|e| rpm == 0 || (e.request_times_len(class) as u32) < rpm)
+            .collect();
 
         if available.is_empty() {
             return None;
@@ -1078,6 +1087,30 @@ impl MultiTokenManager {
     ///
     /// 仅基于「禁用状态 / opus 订阅」做基础可用过滤，与 `select_next_credential`
     /// 的过滤口径保持一致。无任何可用凭据时返回 None，把"全灭"交给后续报错逻辑处理。
+    /// 统计基础可用凭据数（未禁用且满足 opus 订阅要求），与 `select_next_credential` 口径一致。
+    fn count_base_available_credentials(&self, model: Option<&str>) -> usize {
+        let is_opus = model
+            .map(|m| m.to_lowercase().contains("opus"))
+            .unwrap_or(false);
+        self.entries
+            .lock()
+            .iter()
+            .filter(|e| {
+                !e.disabled && !(is_opus && !e.credentials.supports_opus())
+            })
+            .count()
+    }
+
+    /// 所有基础可用凭据均已达到 RPM 上限时，构造本地 429 错误。
+    fn credential_rpm_exceeded_error(&self, model: Option<&str>) -> CredentialRpmExceeded {
+        let class = ModelClass::from_model(model);
+        let limit = class.effective_rpm(&self.config());
+        let retry_after = self
+            .rpm_wait_for_slot(model, Instant::now())
+            .unwrap_or_else(|| StdDuration::from_secs(60));
+        CredentialRpmExceeded { limit, retry_after }
+    }
+
     fn rpm_wait_for_slot(&self, model: Option<&str>, now: Instant) -> Option<StdDuration> {
         let class = ModelClass::from_model(model);
         let rpm = class.effective_rpm(&self.config());
@@ -1141,10 +1174,8 @@ impl MultiTokenManager {
                 );
             }
 
-            // 凭据级 RPM 平滑：当所有可用凭据都已打满该模型类别的 RPM 上限时，
-            // 等待最早一个槽位滑出 60s 窗口再放行（最多等待 credential_rpm_max_wait_ms）。
-            // 主要服务于单凭据场景——此时 RPM 上限本会被回退放行而形同虚设。
-            // 等满上限后仍走原有 fallback 放行，保证不会无限阻塞。
+            // 凭据级 RPM 平滑：全部打满时可选等待（最多 credential_rpm_max_wait_ms），
+            // 仍无空位则返回 CredentialRpmExceeded（客户端 429）。
             let max_wait_ms = self.config().credential_rpm_max_wait_ms;
             if max_wait_ms > 0 {
                 let now = Instant::now();
@@ -1222,6 +1253,14 @@ impl MultiTokenManager {
                         let mut current_id = self.current_id.lock();
                         *current_id = new_id;
                         (new_id, new_creds)
+                    } else if self.count_base_available_credentials(model) > 0 {
+                        let class = ModelClass::from_model(model);
+                        if class.effective_rpm(&self.config()) > 0 {
+                            return Err(self.credential_rpm_exceeded_error(model).into());
+                        }
+                        let entries = self.entries.lock();
+                        let available = entries.iter().filter(|e| !e.disabled).count();
+                        anyhow::bail!("所有凭据均已禁用（{}/{}）", available, total);
                     } else {
                         let entries = self.entries.lock();
                         // 注意：必须在 bail! 之前计算 available_count，
@@ -1233,18 +1272,23 @@ impl MultiTokenManager {
                 }
             };
 
+            // 占位 RPM 槽位（在 Token 刷新前完成，减少并发穿透）
+            let class = ModelClass::from_model(model);
+            let rpm_limit = class.effective_rpm(&self.config());
+            if rpm_limit > 0 {
+                let now = Instant::now();
+                let mut entries = self.entries.lock();
+                if let Some(entry) = entries.iter_mut().find(|e| e.id == id) {
+                    if entry.is_rpm_exceeded(class, rpm_limit, now) {
+                        return Err(self.credential_rpm_exceeded_error(model).into());
+                    }
+                    entry.record_request(class, now);
+                }
+            }
+
             // 尝试获取/刷新 Token
             match self.try_ensure_token(id, &credentials).await {
                 Ok(ctx) => {
-                    // 记录一次请求，用于凭据级 RPM 滑动窗口统计（按模型类别）
-                    let class = ModelClass::from_model(model);
-                    if class.effective_rpm(&self.config()) > 0 {
-                        let now = Instant::now();
-                        let mut entries = self.entries.lock();
-                        if let Some(entry) = entries.iter_mut().find(|e| e.id == ctx.id) {
-                            entry.record_request(class, now);
-                        }
-                    }
                     return Ok(ctx);
                 }
                 Err(e) => {
@@ -3233,6 +3277,39 @@ mod tests {
             .collect();
 
         MultiTokenManager::new(config, creds, None, None, false).unwrap()
+    }
+
+    #[test]
+    fn test_select_next_credential_returns_none_when_all_rpm_capped() {
+        let manager = make_manager_with_rpm(1, 2, 0);
+        let now = Instant::now();
+        {
+            let mut entries = manager.entries.lock();
+            for _ in 0..2 {
+                entries[0].record_request(ModelClass::Other, now);
+            }
+        }
+        assert!(manager.select_next_credential(None).is_none());
+    }
+
+    #[tokio::test]
+    async fn test_acquire_context_returns_rpm_exceeded_when_capped() {
+        let manager = make_manager_with_rpm(1, 1, 0);
+        let now = Instant::now();
+        {
+            let mut entries = manager.entries.lock();
+            entries[0].record_request(ModelClass::Other, now);
+        }
+        match manager.acquire_context(None).await {
+            Err(e) => assert!(e.downcast_ref::<CredentialRpmExceeded>().is_some()),
+            Ok(_) => panic!("expected CredentialRpmExceeded"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_acquire_context_allows_request_under_rpm_limit() {
+        let manager = make_manager_with_rpm(1, 2, 0);
+        manager.acquire_context(None).await.unwrap();
     }
 
     #[test]

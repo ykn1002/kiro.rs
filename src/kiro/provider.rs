@@ -16,7 +16,7 @@ use crate::http_client::{ProxyConfig, build_client};
 use crate::kiro::endpoint::{KiroEndpoint, RequestContext};
 use crate::kiro::machine_id;
 use crate::kiro::model::credentials::KiroCredentials;
-use crate::kiro::token_manager::MultiTokenManager;
+use crate::kiro::token_manager::{CredentialRpmExceeded, MultiTokenManager};
 use crate::model::config::TlsBackend;
 use parking_lot::Mutex;
 
@@ -40,6 +40,14 @@ impl fmt::Display for UpstreamApiError {
 }
 
 impl std::error::Error for UpstreamApiError {}
+
+fn local_rpm_limit_error(rpm: &CredentialRpmExceeded) -> anyhow::Error {
+    UpstreamApiError {
+        status: 429,
+        message: rpm.to_string(),
+    }
+    .into()
+}
 
 /// 每个凭据的最大重试次数
 const MAX_RETRIES_PER_CREDENTIAL: usize = 3;
@@ -159,6 +167,11 @@ impl KiroProvider {
             // MCP 调用（WebSearch 等工具）不涉及模型选择，无需按模型过滤凭据
             let ctx = match self.token_manager.acquire_context(None).await {
                 Ok(c) => c,
+                Err(e) if e.downcast_ref::<CredentialRpmExceeded>().is_some() => {
+                    return Err(local_rpm_limit_error(
+                        e.downcast_ref::<CredentialRpmExceeded>().unwrap(),
+                    ));
+                }
                 Err(e) => {
                     last_error = Some(e);
                     continue;
@@ -326,6 +339,11 @@ impl KiroProvider {
             // 获取调用上下文（绑定 index、credentials、token）
             let ctx = match self.token_manager.acquire_context(model.as_deref()).await {
                 Ok(c) => c,
+                Err(e) if e.downcast_ref::<CredentialRpmExceeded>().is_some() => {
+                    return Err(local_rpm_limit_error(
+                        e.downcast_ref::<CredentialRpmExceeded>().unwrap(),
+                    ));
+                }
                 Err(e) => {
                     last_error = Some(e);
                     continue;

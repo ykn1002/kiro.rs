@@ -190,11 +190,11 @@ docker-compose up
 | `proxyPassword` | string | - | 代理密码 |
 | `adminApiKey` | string | - | Admin API 密钥，配置后启用凭据管理 API 和 Web 管理界面 |
 | `loadBalancingMode` | string | `priority` | 负载均衡模式：`priority`（按优先级，主备式黏住最高优先级凭据）、`balanced`（按累计成功数 least-used 均衡）或 `round-robin`（真·轮询，在可用凭据间严格依次轮转，不看使用次数） |
-| `credentialRpm` | number | `0` | 单凭据目标 RPM（每分钟请求数），用于凭据级节流/分流；某凭据在最近 60 秒内请求数达到该值时会在选择时被跳过并分流到其他凭据；`0` 或未配置表示不限制。作为 Opus/Sonnet 未单独配置时的兜底值 |
+| `credentialRpm` | number | `0` | 单凭据目标 RPM（60 秒滑动窗口内请求数）；达到上限时跳过该凭据并分流到其他凭据；**全部打满时向客户端返回 429**；`0` 表示不限制。作为 Opus/Sonnet/Haiku 未单独配置时的兜底值 |
 | `credentialRpmOpus` | number | - | 单凭据 Opus 模型专用 RPM，未配置时回退到 `credentialRpm` |
 | `credentialRpmSonnet` | number | - | 单凭据 Sonnet 模型专用 RPM，未配置时回退到 `credentialRpm` |
 | `credentialRpmHaiku` | number | - | 单凭据 Haiku 模型专用 RPM，未配置时回退到 `credentialRpm` |
-| `credentialRpmMaxWaitMs` | number | `0` | 当所有可用凭据都达到 RPM 上限时，请求发出前最多等待的毫秒数（平滑突发）。`0` 表示关闭等待，沿用"全部超限即直接分流放行"的行为。单凭据场景下尤其有用：此时 RPM 上限本会被回退放行而形同虚设，开启后可把突发压到上游限速以内、主动规避上游 429。等待发生在请求发出之前，不消耗重试次数；等满上限仍无空位时仍会 best-effort 放行，不会无限阻塞 |
+| `credentialRpmMaxWaitMs` | number | `0` | 当所有可用凭据都达到 RPM 上限时，请求发出前最多等待的毫秒数（平滑突发）。`0` 表示不等待，立即向客户端返回 **429**。大于 0 时先等待至多该时长，仍无空位再返回 429。等待不消耗上游重试次数 |
 | `extractThinking` | boolean | `true` | 非流式响应的 thinking 块提取。启用后 `<thinking>` 标签会被解析为独立的 `thinking` 内容块 |
 | `defaultEndpoint` | string | `ide` | 默认 Kiro 端点。凭据未显式指定 `endpoint` 时使用。当前支持：`ide` |
 | `models` | array | 内置默认表 | 模型列表（驱动 `/v1/models` 展示、模型名映射、上下文窗口判断）。未配置时使用内置默认表，**完全向后兼容**；一旦提供则整张表以配置为准。每项字段见下方说明 |
