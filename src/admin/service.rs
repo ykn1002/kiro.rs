@@ -348,6 +348,7 @@ impl AdminService {
             machine_id: config.machine_id.clone(),
             system_version: config.system_version.clone(),
             node_version: config.node_version.clone(),
+            streaming_sdk_version: config.streaming_sdk_version.clone(),
             models: config.effective_models(),
             default_model: config.default_model.clone(),
             model_aliases: config.model_aliases.clone(),
@@ -374,9 +375,11 @@ impl AdminService {
         if req.kiro_version.trim().is_empty()
             || req.system_version.trim().is_empty()
             || req.node_version.trim().is_empty()
+            || req.streaming_sdk_version.trim().is_empty()
         {
             return Err(AdminServiceError::InvalidCredential(
-                "kiroVersion / systemVersion / nodeVersion 均不能为空".to_string(),
+                "kiroVersion / systemVersion / nodeVersion / streamingSdkVersion 均不能为空"
+                    .to_string(),
             ));
         }
         if req.models.is_empty() {
@@ -468,6 +471,7 @@ impl AdminService {
         new_config.kiro_version = req.kiro_version.trim().to_string();
         new_config.system_version = req.system_version.trim().to_string();
         new_config.node_version = req.node_version.trim().to_string();
+        new_config.streaming_sdk_version = req.streaming_sdk_version.trim().to_string();
         new_config.models = Some(req.models.clone());
         new_config.model_aliases = normalized_aliases.clone();
         new_config.default_model = default_model.clone();

@@ -14,9 +14,6 @@ use super::{KiroEndpoint, RequestContext};
 /// Kiro IDE 端点名称
 pub const IDE_ENDPOINT_NAME: &str = "ide";
 
-/// 与 Kiro IDE 内置 `@aws/codewhisperer-streaming-client` 版本对齐
-const CODEWHISPERER_STREAMING_SDK_VERSION: &str = "1.0.39";
-
 /// Kiro IDE 端点
 pub struct IdeEndpoint;
 
@@ -36,7 +33,7 @@ impl IdeEndpoint {
     fn x_amz_user_agent(&self, ctx: &RequestContext<'_>) -> String {
         format!(
             "aws-sdk-js/{} KiroIDE-{}-{}",
-            CODEWHISPERER_STREAMING_SDK_VERSION,
+            ctx.config.streaming_sdk_version,
             ctx.config.kiro_version,
             ctx.machine_id
         )
@@ -45,10 +42,10 @@ impl IdeEndpoint {
     fn user_agent(&self, ctx: &RequestContext<'_>) -> String {
         format!(
             "aws-sdk-js/{} ua/2.1 os/{} lang/js md/nodejs#{} api/codewhispererstreaming#{} m/E KiroIDE-{}-{}",
-            CODEWHISPERER_STREAMING_SDK_VERSION,
+            ctx.config.streaming_sdk_version,
             ctx.config.system_version,
             ctx.config.node_version,
-            CODEWHISPERER_STREAMING_SDK_VERSION,
+            ctx.config.streaming_sdk_version,
             ctx.config.kiro_version,
             ctx.machine_id
         )

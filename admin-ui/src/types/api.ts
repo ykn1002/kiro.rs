@@ -130,6 +130,7 @@ export interface AppConfig {
   machineId?: string | null
   systemVersion: string
   nodeVersion: string
+  streamingSdkVersion: string
   models: ModelDef[]
   defaultModel?: string | null
   modelAliases: Record<string, string>
@@ -147,6 +148,7 @@ export interface UpdateAppConfigRequest {
   machineId?: string | null
   systemVersion: string
   nodeVersion: string
+  streamingSdkVersion: string
   models: ModelDef[]
   defaultModel?: string | null
   modelAliases: Record<string, string>

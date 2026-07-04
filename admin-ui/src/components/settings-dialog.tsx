@@ -65,6 +65,7 @@ export function SettingsDialog({ open, onOpenChange }: SettingsDialogProps) {
   const [machineId, setMachineId] = useState('')
   const [systemVersion, setSystemVersion] = useState('')
   const [nodeVersion, setNodeVersion] = useState('')
+  const [streamingSdkVersion, setStreamingSdkVersion] = useState('')
   const [models, setModels] = useState<ModelDef[]>([])
   const [modelsExpanded, setModelsExpanded] = useState(false)
   const [defaultModel, setDefaultModel] = useState('')
@@ -85,6 +86,7 @@ export function SettingsDialog({ open, onOpenChange }: SettingsDialogProps) {
     setMachineId(config.machineId ?? '')
     setSystemVersion(config.systemVersion)
     setNodeVersion(config.nodeVersion)
+    setStreamingSdkVersion(config.streamingSdkVersion)
     setModels(config.models.map((m) => ({ ...m })))
     setDefaultModel(config.defaultModel ?? '')
     setModelAliases(aliasesToRows(config.modelAliases ?? {}))
@@ -133,7 +135,12 @@ export function SettingsDialog({ open, onOpenChange }: SettingsDialogProps) {
       toast.error('apiKey 不能为空')
       return
     }
-    if (!kiroVersion.trim() || !systemVersion.trim() || !nodeVersion.trim()) {
+    if (
+      !kiroVersion.trim() ||
+      !systemVersion.trim() ||
+      !nodeVersion.trim() ||
+      !streamingSdkVersion.trim()
+    ) {
       toast.error('版本信息均不能为空')
       return
     }
@@ -190,6 +197,7 @@ export function SettingsDialog({ open, onOpenChange }: SettingsDialogProps) {
         machineId: machineId.trim(),
         systemVersion: systemVersion.trim(),
         nodeVersion: nodeVersion.trim(),
+        streamingSdkVersion: streamingSdkVersion.trim(),
         models: cleanedModels,
         defaultModel: defaultModel.trim() || null,
         modelAliases: rowsToAliases(modelAliases),
@@ -317,7 +325,7 @@ export function SettingsDialog({ open, onOpenChange }: SettingsDialogProps) {
               {/* 版本信息 */}
               <section className="space-y-2">
                 <h3 className="text-sm font-semibold">版本信息（上游指纹）</h3>
-                <div className="grid grid-cols-1 gap-3 md:grid-cols-3">
+                <div className="grid grid-cols-1 gap-3 md:grid-cols-2 lg:grid-cols-4">
                   <div className="space-y-1">
                     <label className="text-xs text-muted-foreground">kiroVersion</label>
                     <Input
@@ -342,7 +350,16 @@ export function SettingsDialog({ open, onOpenChange }: SettingsDialogProps) {
                       disabled={isPending}
                     />
                   </div>
-                  <div className="space-y-1 md:col-span-3">
+                  <div className="space-y-1">
+                    <label className="text-xs text-muted-foreground">streamingSdkVersion</label>
+                    <Input
+                      value={streamingSdkVersion}
+                      onChange={(e) => setStreamingSdkVersion(e.target.value)}
+                      disabled={isPending}
+                      placeholder="1.0.39"
+                    />
+                  </div>
+                  <div className="space-y-1 md:col-span-2 lg:col-span-4">
                     <label className="text-xs text-muted-foreground">machineId（全局默认）</label>
                     <Input
                       value={machineId}
@@ -352,6 +369,9 @@ export function SettingsDialog({ open, onOpenChange }: SettingsDialogProps) {
                     />
                   </div>
                 </div>
+                <p className="text-xs text-muted-foreground">
+                  streamingSdkVersion 对应 Kiro IDE 内置 <code className="text-foreground/80">@aws/codewhisperer-streaming-client</code> 版本，用于主 API / MCP 的 aws-sdk-js User-Agent。
+                </p>
                 <MachineIdHint scope="global" />
               </section>
 

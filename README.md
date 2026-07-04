@@ -181,6 +181,7 @@ docker-compose up
 | `machineId` | string | - | 全局设备 ID（64 位 hex 或 UUID）。未配置时按凭据 refreshToken 派生。从本机 Kiro IDE 读取：macOS `~/Library/Application Support/Kiro/machineid`；Windows `%APPDATA%\Kiro\machineId`；Linux `~/.config/Kiro/machineid` |
 | `systemVersion` | string | 随机 | 系统版本标识 |
 | `nodeVersion` | string | `22.21.1` | Node.js 版本标识 |
+| `streamingSdkVersion` | string | `1.0.39` | `@aws/codewhisperer-streaming-client` 版本，用于主 API / MCP 的 aws-sdk-js User-Agent。获取方式见下方 [上游指纹获取](#上游指纹获取) |
 | `tlsBackend` | string | `rustls` | TLS 后端：`rustls` 或 `native-tls` |
 | `countTokensApiUrl` | string | - | 外部 count_tokens API 地址 |
 | `countTokensApiKey` | string | - | 外部 count_tokens API 密钥 |
@@ -214,6 +215,44 @@ docker-compose up
 | `maxTokens` | number | `/v1/models` 的 max_tokens |
 | `contextWindow` | number | 上下文窗口大小，如 `200000` / `1000000` |
 
+#### 上游指纹获取
+
+以下字段用于对齐 Kiro IDE 发往 AWS 的请求指纹，建议从**已安装 Kiro IDE 的本机**读取，并在 Kiro 升级后重新核对。
+
+**`streamingSdkVersion`**（`@aws/codewhisperer-streaming-client`）
+
+Kiro 将该 SDK 版本打进扩展 bundle，路径因平台而异（`extension.js` 位于 Kiro 安装目录下）：
+
+| 平台 | `extension.js` 路径 |
+| --- | --- |
+| macOS | `/Applications/Kiro.app/Contents/Resources/app/extensions/kiro.kiro-agent/dist/extension.js` |
+| Windows | `%LOCALAPPDATA%\Programs\Kiro\resources\app\extensions\kiro.kiro-agent\dist\extension.js`（例：`C:\Users\你\AppData\Local\Programs\Kiro\...`） |
+| Linux | `/usr/share/kiro/resources/app/extensions/kiro.kiro-agent/dist/extension.js` 或 `~/.local/share/Kiro/resources/app/extensions/kiro.kiro-agent/dist/extension.js`（视安装方式而定） |
+
+命令行提取版本（将 `$EXT` 换成上表实际路径）：
+
+```bash
+# macOS / Linux
+grep -A6 'codewhisperer-streaming-client/package.json' "$EXT" | grep 'version:'
+```
+
+```powershell
+# Windows PowerShell
+Select-String -Path "$env:LOCALAPPDATA\Programs\Kiro\resources\app\extensions\kiro.kiro-agent\dist\extension.js" -Pattern 'codewhisperer-streaming-client/package.json' -Context 0,6 | Select-String 'version:'
+```
+
+输出中的 `version: "1.0.39"` 即为 `streamingSdkVersion` 应填写的值（引号内 semver）。
+
+若无法访问安装目录，可在 Kiro IDE 里发一条对话后抓包，从请求头 `User-Agent` 中读取 `api/codewhispererstreaming#1.0.39` 的 `#` 后缀。
+
+**其他指纹字段（简要）**
+
+| 字段 | 获取方式 |
+| --- | --- |
+| `kiroVersion` | Kiro「关于」页面显示的版本号；或读取安装目录下 `resources/app/package.json` 的 `version` |
+| `machineId` | 见上表 `machineId` 行（macOS / Windows / Linux 配置文件路径） |
+| `systemVersion` / `nodeVersion` | 抓包看 Kiro IDE 请求的 `User-Agent`：`os/darwin#25.4.0`、`md/nodejs#22.22.0` 两段 |
+
 > 匹配按数组顺序取首个命中项，请把同族不同版本按区分度排列。客户端传入的模型名（含日期后缀、`-thinking` 后缀）通过 `family` + `version` 模糊命中对应项。
 
 完整配置示例：
@@ -229,6 +268,7 @@ docker-compose up
    "machineId": "64位十六进制机器码",
    "systemVersion": "darwin#24.6.0",
    "nodeVersion": "22.21.1",
+   "streamingSdkVersion": "1.0.39",
    "authRegion": "us-east-1",
    "apiRegion": "us-east-1",
    "countTokensApiUrl": "https://api.example.com/v1/messages/count_tokens",

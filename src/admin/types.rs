@@ -229,6 +229,8 @@ pub struct AppConfigResponse {
     pub system_version: String,
     /// Node 版本
     pub node_version: String,
+    /// CodeWhisperer Streaming SDK 版本（`@aws/codewhisperer-streaming-client`）
+    pub streaming_sdk_version: String,
     /// 模型列表（生效值，缺省时为内置默认表）
     pub models: Vec<ModelDef>,
     /// OpenAI/Codex 未识别模型名的回退目标（displayId / kiroId）
@@ -267,6 +269,8 @@ pub struct UpdateAppConfigRequest {
     pub system_version: String,
     /// Node 版本（不能为空）
     pub node_version: String,
+    /// CodeWhisperer Streaming SDK 版本（不能为空）
+    pub streaming_sdk_version: String,
     /// 模型列表（至少一个）
     pub models: Vec<ModelDef>,
     /// OpenAI/Codex 未识别模型名的回退目标

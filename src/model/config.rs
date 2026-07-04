@@ -93,6 +93,10 @@ pub struct Config {
     #[serde(default = "default_node_version")]
     pub node_version: String,
 
+    /// `@aws/codewhisperer-streaming-client` 版本，用于主 API / MCP 的 aws-sdk-js User-Agent
+    #[serde(default = "default_streaming_sdk_version")]
+    pub streaming_sdk_version: String,
+
     #[serde(default = "default_tls_backend")]
     pub tls_backend: TlsBackend,
 
@@ -230,6 +234,10 @@ fn default_node_version() -> String {
     "22.22.0".to_string()
 }
 
+fn default_streaming_sdk_version() -> String {
+    "1.0.39".to_string()
+}
+
 fn default_count_tokens_auth_type() -> String {
     "x-api-key".to_string()
 }
@@ -342,6 +350,7 @@ impl Default for Config {
             api_key: None,
             system_version: default_system_version(),
             node_version: default_node_version(),
+            streaming_sdk_version: default_streaming_sdk_version(),
             tls_backend: default_tls_backend(),
             count_tokens_api_url: None,
             count_tokens_api_key: None,
