@@ -521,7 +521,7 @@ impl ResponsesStreamContext {
 
     pub fn generate_final_events(&mut self) -> Vec<ResponsesSseEvent> {
         if self.stream_failed {
-            return Vec::new();
+            return self.finalize_stream_on_failure();
         }
 
         let mut events = Vec::new();
@@ -633,6 +633,36 @@ impl ResponsesStreamContext {
 
         events
     }
+
+    /// 流异常结束时发送 response.completed（status=failed）
+    pub fn finalize_stream_on_failure(&mut self) -> Vec<ResponsesSseEvent> {
+        let mut events = Vec::new();
+        if !self.initialized {
+            events.extend(self.generate_initial_events());
+        }
+
+        self.status = "failed".to_string();
+
+        let usage = json!({
+            "input_tokens": self.input_tokens,
+            "output_tokens": self.output_tokens.max(1),
+            "total_tokens": self.input_tokens + self.output_tokens.max(1)
+        });
+
+        let mut final_response = self.response_shell();
+        final_response["usage"] = usage;
+        final_response["status"] = Value::String("failed".to_string());
+
+        events.push(self.event(
+            "response.completed",
+            json!({
+                "type": "response.completed",
+                "response": final_response
+            }),
+        ));
+
+        events
+    }
 }
 
 #[cfg(test)]
@@ -654,6 +684,35 @@ mod tests {
         let final_events = ctx.generate_final_events();
         assert!(
             final_events
+                .iter()
+                .any(|e| e.event_type == "response.completed")
+        );
+    }
+
+    #[test]
+    fn test_finalize_stream_on_failure_emits_failed_completed() {
+        let mut ctx = ResponsesStreamContext::new("claude-sonnet-4-6", 10, false, HashMap::new());
+        ctx.stream_failed = true;
+        let events = ctx.finalize_stream_on_failure();
+        assert!(
+            events
+                .iter()
+                .any(|e| e.event_type == "response.completed")
+        );
+        let completed = events
+            .iter()
+            .find(|e| e.event_type == "response.completed")
+            .unwrap();
+        assert_eq!(completed.data["response"]["status"], json!("failed"));
+    }
+
+    #[test]
+    fn test_generate_final_events_on_failure() {
+        let mut ctx = ResponsesStreamContext::new("claude-sonnet-4-6", 10, false, HashMap::new());
+        ctx.stream_failed = true;
+        let events = ctx.generate_final_events();
+        assert!(
+            events
                 .iter()
                 .any(|e| e.event_type == "response.completed")
         );

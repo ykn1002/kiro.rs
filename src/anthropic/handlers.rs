@@ -396,7 +396,10 @@ fn handle_stream_decode_error(
     ctx: &mut StreamContext,
     e: &ParseError,
 ) {
-    if matches!(e, ParseError::TooManyErrors { .. }) {
+    if matches!(
+        e,
+        ParseError::TooManyErrors { .. } | ParseError::BufferOverflow { .. }
+    ) {
         tracing::error!("解码器停止: {}", e);
         ctx.stream_failed = true;
         crate::metrics::inc_stream_decode_failure();
@@ -432,11 +435,11 @@ fn create_sse_stream(
                 chunk_result = body_stream.next() => {
                     match chunk_result {
                         Some(Ok(chunk)) => {
+                            let mut events = Vec::new();
                             if let Err(e) = decoder.feed(&chunk) {
-                                tracing::warn!("缓冲区溢出: {}", e);
+                                handle_stream_decode_error(&mut events, &mut ctx, &e);
                             }
 
-                            let mut events = Vec::new();
                             for result in decoder.decode_iter() {
                                 match result {
                                     Ok(frame) => {

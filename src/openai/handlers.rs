@@ -172,6 +172,52 @@ pub(crate) fn override_thinking_from_model_name(payload: &mut crate::anthropic::
     }
 }
 
+fn openai_chunks_to_sse_strings(chunks: Vec<OpenAiChunk>) -> Vec<String> {
+    chunks
+        .into_iter()
+        .map(|c| {
+            if c.data == serde_json::Value::String("[DONE]".to_string()) {
+                done_sse()
+            } else {
+                c.to_sse_string()
+            }
+        })
+        .collect()
+}
+
+fn append_openai_failure_tail(
+    ctx: &mut OpenAiStreamContext,
+    sse_parts: &mut Vec<String>,
+    include_usage: bool,
+) {
+    sse_parts.extend(openai_chunks_to_sse_strings(
+        ctx.finalize_stream_on_failure(include_usage),
+    ));
+}
+
+fn handle_openai_decode_failure(
+    ctx: &mut OpenAiStreamContext,
+    sse_parts: &mut Vec<String>,
+    e: &ParseError,
+    include_usage: bool,
+) {
+    if matches!(
+        e,
+        ParseError::TooManyErrors { .. } | ParseError::BufferOverflow { .. }
+    ) {
+        tracing::error!("解码器停止: {}", e);
+        ctx.stream_failed = true;
+        crate::metrics::inc_stream_decode_failure();
+        sse_parts.push(
+            OpenAiStreamContext::create_error_chunk(&format!("Stream decode failed: {e}"))
+                .to_sse_string(),
+        );
+        append_openai_failure_tail(ctx, sse_parts, include_usage);
+    } else {
+        tracing::warn!("解码事件失败: {}", e);
+    }
+}
+
 async fn handle_stream_request(
     provider: std::sync::Arc<crate::kiro::provider::KiroProvider>,
     request_body: &str,
@@ -223,11 +269,11 @@ fn create_openai_sse_stream(
                 chunk_result = body_stream.next() => {
                     match chunk_result {
                         Some(Ok(chunk)) => {
+                            let mut sse_parts = Vec::new();
                             if let Err(e) = decoder.feed(&chunk) {
-                                tracing::warn!("缓冲区溢出: {}", e);
+                                handle_openai_decode_failure(&mut ctx, &mut sse_parts, &e, include_usage);
                             }
 
-                            let mut sse_parts = Vec::new();
                             for result in decoder.decode_iter() {
                                 match result {
                                     Ok(frame) => {
@@ -242,18 +288,7 @@ fn create_openai_sse_stream(
                                         }
                                     }
                                     Err(e) => {
-                                        if matches!(e, ParseError::TooManyErrors { .. }) {
-                                            tracing::error!("解码器停止: {}", e);
-                                            ctx.stream_failed = true;
-                                            crate::metrics::inc_stream_decode_failure();
-                                            let err = OpenAiStreamContext::create_error_chunk(
-                                                &format!("Stream decode failed: {e}"),
-                                            );
-                                            sse_parts.push(err.to_sse_string());
-                                            sse_parts.push(done_sse());
-                                        } else {
-                                            tracing::warn!("解码事件失败: {}", e);
-                                        }
+                                        handle_openai_decode_failure(&mut ctx, &mut sse_parts, &e, include_usage);
                                     }
                                 }
                             }
@@ -268,23 +303,22 @@ fn create_openai_sse_stream(
                         }
                         Some(Err(e)) => {
                             tracing::error!("读取响应流失败: {:?}", e);
-                            let err = OpenAiStreamContext::create_error_chunk(&format!(
-                                "Upstream stream error: {e}"
-                            ));
-                            let bytes = vec![
-                                Ok(Bytes::from(err.to_sse_string())),
-                                Ok(Bytes::from(done_sse())),
+                            ctx.stream_failed = true;
+                            let mut sse_parts = vec![
+                                OpenAiStreamContext::create_error_chunk(&format!(
+                                    "Upstream stream error: {e}"
+                                ))
+                                .to_sse_string(),
                             ];
+                            append_openai_failure_tail(&mut ctx, &mut sse_parts, include_usage);
+                            let bytes: Vec<Result<Bytes, Infallible>> = sse_parts
+                                .into_iter()
+                                .map(|s| Ok(Bytes::from(s)))
+                                .collect();
                             Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, include_usage)))
                         }
                         None => {
-                            let final_chunks = if ctx.stream_failed {
-                                vec![OpenAiChunk {
-                                    data: serde_json::Value::String("[DONE]".to_string()),
-                                }]
-                            } else {
-                                ctx.generate_final_chunks(include_usage)
-                            };
+                            let final_chunks = ctx.generate_final_chunks(include_usage);
                             let bytes: Vec<Result<Bytes, Infallible>> = final_chunks
                                 .into_iter()
                                 .map(|c| {

@@ -350,9 +350,7 @@ impl OpenAiStreamContext {
 
     pub fn generate_final_chunks(&mut self, include_usage: bool) -> Vec<OpenAiChunk> {
         if self.stream_failed {
-            return vec![OpenAiChunk {
-                data: serde_json::Value::String("[DONE]".to_string()),
-            }];
+            return self.finalize_stream_on_failure(include_usage);
         }
 
         let mut chunks = Vec::new();
@@ -410,6 +408,35 @@ impl OpenAiStreamContext {
         });
         chunks
     }
+
+    /// 流异常结束时补全 finish_reason + [DONE]
+    pub fn finalize_stream_on_failure(&mut self, include_usage: bool) -> Vec<OpenAiChunk> {
+        let mut chunks = Vec::new();
+        if !self.sent_role {
+            chunks.push(self.initial_chunk());
+        }
+
+        let mut final_chunk = self.base_chunk();
+        final_chunk["choices"] = json!([{
+            "index": 0,
+            "delta": {},
+            "finish_reason": "stop"
+        }]);
+
+        if include_usage {
+            final_chunk["usage"] = json!({
+                "prompt_tokens": self.prompt_tokens,
+                "completion_tokens": self.completion_tokens.max(1),
+                "total_tokens": self.prompt_tokens + self.completion_tokens.max(1)
+            });
+        }
+
+        chunks.push(OpenAiChunk { data: final_chunk });
+        chunks.push(OpenAiChunk {
+            data: serde_json::Value::String("[DONE]".to_string()),
+        });
+        chunks
+    }
 }
 
 /// 将 [DONE] 标记转为 SSE 字符串
@@ -436,6 +463,32 @@ mod tests {
                 .contains("Hello")
         });
         assert!(has_hello);
+    }
+
+    #[test]
+    fn test_finalize_stream_on_failure_emits_finish_and_done() {
+        let mut ctx = OpenAiStreamContext::new("claude-sonnet-4-6", 10, false, HashMap::new());
+        ctx.stream_failed = true;
+        let chunks = ctx.finalize_stream_on_failure(false);
+        assert!(
+            chunks
+                .iter()
+                .any(|c| c.data["choices"][0]["finish_reason"] == json!("stop"))
+        );
+        assert!(chunks.iter().any(|c| c.data == json!("[DONE]")));
+    }
+
+    #[test]
+    fn test_generate_final_chunks_on_failure() {
+        let mut ctx = OpenAiStreamContext::new("claude-sonnet-4-6", 10, false, HashMap::new());
+        ctx.stream_failed = true;
+        let chunks = ctx.generate_final_chunks(false);
+        assert!(
+            chunks
+                .iter()
+                .any(|c| c.data["choices"][0]["finish_reason"] == json!("stop"))
+        );
+        assert!(chunks.iter().any(|c| c.data == json!("[DONE]")));
     }
 
     #[test]

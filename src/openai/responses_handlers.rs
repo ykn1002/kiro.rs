@@ -27,6 +27,35 @@ use super::responses_stream::ResponsesStreamContext;
 use super::responses_types::ResponsesRequest;
 use super::types::ErrorResponse;
 
+fn append_responses_failure_tail(
+    ctx: &mut ResponsesStreamContext,
+    sse_parts: &mut Vec<String>,
+) {
+    for ev in ctx.finalize_stream_on_failure() {
+        sse_parts.push(ev.to_sse_string());
+    }
+}
+
+fn handle_responses_decode_failure(
+    ctx: &mut ResponsesStreamContext,
+    sse_parts: &mut Vec<String>,
+    e: &ParseError,
+) {
+    if matches!(
+        e,
+        ParseError::TooManyErrors { .. } | ParseError::BufferOverflow { .. }
+    ) {
+        tracing::error!("解码器停止: {}", e);
+        ctx.stream_failed = true;
+        crate::metrics::inc_stream_decode_failure();
+        let err = ResponsesStreamContext::create_error_event(&format!("Stream decode failed: {e}"));
+        sse_parts.push(err.to_sse_string());
+        append_responses_failure_tail(ctx, sse_parts);
+    } else {
+        tracing::warn!("解码事件失败: {}", e);
+    }
+}
+
 /// POST /v1/responses
 pub async fn create_response(
     State(state): State<AppState>,
@@ -185,11 +214,11 @@ fn create_responses_sse_stream(
 
             match body_stream.next().await {
                 Some(Ok(chunk)) => {
+                    let mut sse_parts = Vec::new();
                     if let Err(e) = decoder.feed(&chunk) {
-                        tracing::warn!("缓冲区溢出: {}", e);
+                        handle_responses_decode_failure(&mut ctx, &mut sse_parts, &e);
                     }
 
-                    let mut sse_parts = Vec::new();
                     for result in decoder.decode_iter() {
                         match result {
                             Ok(frame) => {
@@ -200,18 +229,7 @@ fn create_responses_sse_stream(
                                 }
                             }
                             Err(e) => {
-                                if matches!(e, ParseError::TooManyErrors { .. }) {
-                                    tracing::error!("解码器停止: {}", e);
-                                    ctx.stream_failed = true;
-                                    crate::metrics::inc_stream_decode_failure();
-                                    let err =
-                                        super::responses_stream::ResponsesStreamContext::create_error_event(
-                                            &format!("Stream decode failed: {e}"),
-                                        );
-                                    sse_parts.push(err.to_sse_string());
-                                } else {
-                                    tracing::warn!("解码事件失败: {}", e);
-                                }
+                                handle_responses_decode_failure(&mut ctx, &mut sse_parts, &e);
                             }
                         }
                     }
@@ -221,23 +239,27 @@ fn create_responses_sse_stream(
                         .map(|s| Ok(Bytes::from(s)))
                         .collect();
 
-                            let stream_failed = ctx.stream_failed;
-                            Some((stream::iter(bytes), (body_stream, ctx, decoder, stream_failed)))
+                    let stream_failed = ctx.stream_failed;
+                    Some((stream::iter(bytes), (body_stream, ctx, decoder, stream_failed)))
                 }
                 Some(Err(e)) => {
                     tracing::error!("读取响应流失败: {:?}", e);
-                    let err = super::responses_stream::ResponsesStreamContext::create_error_event(
-                        &format!("Upstream stream error: {e}"),
-                    );
-                    let bytes = vec![Ok(Bytes::from(err.to_sse_string()))];
+                    ctx.stream_failed = true;
+                    let mut sse_parts = vec![
+                        ResponsesStreamContext::create_error_event(&format!(
+                            "Upstream stream error: {e}"
+                        ))
+                        .to_sse_string(),
+                    ];
+                    append_responses_failure_tail(&mut ctx, &mut sse_parts);
+                    let bytes: Vec<Result<Bytes, Infallible>> = sse_parts
+                        .into_iter()
+                        .map(|s| Ok(Bytes::from(s)))
+                        .collect();
                     Some((stream::iter(bytes), (body_stream, ctx, decoder, true)))
                 }
                 None => {
-                    let final_events = if ctx.stream_failed {
-                        Vec::new()
-                    } else {
-                        ctx.generate_final_events()
-                    };
+                    let final_events = ctx.generate_final_events();
                     let bytes: Vec<Result<Bytes, Infallible>> = final_events
                         .into_iter()
                         .map(|e| Ok(Bytes::from(e.to_sse_string())))
