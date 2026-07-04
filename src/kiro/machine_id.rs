@@ -42,6 +42,11 @@ fn normalize_machine_id(machine_id: &str) -> Option<String> {
     None
 }
 
+/// 校验并标准化用户配置的 machineId（供 Admin / 凭据配置使用）
+pub fn parse_configured_machine_id(machine_id: &str) -> Option<String> {
+    normalize_machine_id(machine_id.trim())
+}
+
 /// 根据凭证信息生成唯一的 Machine ID
 ///
 /// 优先级：

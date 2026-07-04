@@ -61,6 +61,7 @@ export function SettingsDialog({ open, onOpenChange }: SettingsDialogProps) {
   const [rpmHaiku, setRpmHaiku] = useState('')
   const [rpmMaxWaitMs, setRpmMaxWaitMs] = useState('0')
   const [kiroVersion, setKiroVersion] = useState('')
+  const [machineId, setMachineId] = useState('')
   const [systemVersion, setSystemVersion] = useState('')
   const [nodeVersion, setNodeVersion] = useState('')
   const [models, setModels] = useState<ModelDef[]>([])
@@ -80,6 +81,7 @@ export function SettingsDialog({ open, onOpenChange }: SettingsDialogProps) {
     setRpmHaiku(config.credentialRpmHaiku == null ? '' : String(config.credentialRpmHaiku))
     setRpmMaxWaitMs(String(config.credentialRpmMaxWaitMs ?? 0))
     setKiroVersion(config.kiroVersion)
+    setMachineId(config.machineId ?? '')
     setSystemVersion(config.systemVersion)
     setNodeVersion(config.nodeVersion)
     setModels(config.models.map((m) => ({ ...m })))
@@ -184,6 +186,7 @@ export function SettingsDialog({ open, onOpenChange }: SettingsDialogProps) {
         credentialRpmHaiku: parseOptionalRpm(rpmHaiku),
         credentialRpmMaxWaitMs: Math.max(0, parseInt(rpmMaxWaitMs, 10) || 0),
         kiroVersion: kiroVersion.trim(),
+        machineId: machineId.trim(),
         systemVersion: systemVersion.trim(),
         nodeVersion: nodeVersion.trim(),
         models: cleanedModels,
@@ -338,9 +341,19 @@ export function SettingsDialog({ open, onOpenChange }: SettingsDialogProps) {
                       disabled={isPending}
                     />
                   </div>
+                  <div className="space-y-1 md:col-span-3">
+                    <label className="text-xs text-muted-foreground">machineId（全局默认）</label>
+                    <Input
+                      value={machineId}
+                      onChange={(e) => setMachineId(e.target.value)}
+                      disabled={isPending}
+                      placeholder="64 位 hex 或 UUID；留空则清除，新增凭据时回退到 refreshToken 派生"
+                    />
+                  </div>
                 </div>
                 <p className="text-xs text-muted-foreground">
-                  仅影响后续新发起的上游请求与 Token 刷新
+                  对齐本机 Kiro：macOS 可读 ~/Library/Application Support/Kiro/machineid。
+                  凭据级 machineId 优先于全局。仅影响后续新发起的上游请求与 Token 刷新
                 </p>
               </section>
 

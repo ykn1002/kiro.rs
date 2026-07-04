@@ -222,6 +222,9 @@ pub struct AppConfigResponse {
     pub credential_rpm_max_wait_ms: u64,
     /// Kiro 客户端版本
     pub kiro_version: String,
+    /// 全局 machineId（未配置凭据级时使用）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub machine_id: Option<String>,
     /// 系统版本指纹
     pub system_version: String,
     /// Node 版本
@@ -257,6 +260,9 @@ pub struct UpdateAppConfigRequest {
     pub credential_rpm_max_wait_ms: Option<u64>,
     /// Kiro 客户端版本（不能为空）
     pub kiro_version: String,
+    /// 全局 machineId（空字符串表示清除；字段缺失则不更新，兼容旧 UI）
+    #[serde(default)]
+    pub machine_id: Option<String>,
     /// 系统版本指纹（不能为空）
     pub system_version: String,
     /// Node 版本（不能为空）

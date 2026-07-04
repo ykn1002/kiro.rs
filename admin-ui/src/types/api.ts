@@ -127,6 +127,7 @@ export interface AppConfig {
   credentialRpmHaiku?: number | null
   credentialRpmMaxWaitMs: number
   kiroVersion: string
+  machineId?: string | null
   systemVersion: string
   nodeVersion: string
   models: ModelDef[]
@@ -143,6 +144,7 @@ export interface UpdateAppConfigRequest {
   credentialRpmHaiku?: number | null
   credentialRpmMaxWaitMs: number
   kiroVersion: string
+  machineId?: string | null
   systemVersion: string
   nodeVersion: string
   models: ModelDef[]

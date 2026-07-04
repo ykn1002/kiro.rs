@@ -345,6 +345,7 @@ impl AdminService {
             credential_rpm_haiku: config.credential_rpm_haiku,
             credential_rpm_max_wait_ms: config.credential_rpm_max_wait_ms,
             kiro_version: config.kiro_version.clone(),
+            machine_id: config.machine_id.clone(),
             system_version: config.system_version.clone(),
             node_version: config.node_version.clone(),
             models: config.effective_models(),
@@ -448,6 +449,21 @@ impl AdminService {
         new_config.credential_rpm_haiku = req.credential_rpm_haiku;
         if let Some(max_wait_ms) = req.credential_rpm_max_wait_ms {
             new_config.credential_rpm_max_wait_ms = max_wait_ms;
+        }
+        if let Some(ref raw_machine_id) = req.machine_id {
+            let trimmed = raw_machine_id.trim();
+            new_config.machine_id = if trimmed.is_empty() {
+                None
+            } else {
+                Some(
+                    crate::kiro::machine_id::parse_configured_machine_id(trimmed)
+                        .ok_or_else(|| {
+                            AdminServiceError::InvalidCredential(
+                                "machineId 格式无效（需 64 位十六进制或 UUID）".to_string(),
+                            )
+                        })?,
+                )
+            };
         }
         new_config.kiro_version = req.kiro_version.trim().to_string();
         new_config.system_version = req.system_version.trim().to_string();
