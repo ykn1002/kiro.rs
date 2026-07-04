@@ -125,6 +125,7 @@ export interface AppConfig {
   credentialRpmOpus?: number | null
   credentialRpmSonnet?: number | null
   credentialRpmHaiku?: number | null
+  credentialRpmMaxWaitMs: number
   kiroVersion: string
   systemVersion: string
   nodeVersion: string
@@ -140,6 +141,7 @@ export interface UpdateAppConfigRequest {
   credentialRpmOpus?: number | null
   credentialRpmSonnet?: number | null
   credentialRpmHaiku?: number | null
+  credentialRpmMaxWaitMs: number
   kiroVersion: string
   systemVersion: string
   nodeVersion: string

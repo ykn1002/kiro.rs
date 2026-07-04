@@ -218,6 +218,8 @@ pub struct AppConfigResponse {
     pub credential_rpm_sonnet: Option<u32>,
     /// Haiku 专用 RPM
     pub credential_rpm_haiku: Option<u32>,
+    /// RPM 打满时最多等待毫秒数（0 = 立即 429）
+    pub credential_rpm_max_wait_ms: u64,
     /// Kiro 客户端版本
     pub kiro_version: String,
     /// 系统版本指纹
@@ -251,6 +253,9 @@ pub struct UpdateAppConfigRequest {
     /// Haiku 专用 RPM
     #[serde(default)]
     pub credential_rpm_haiku: Option<u32>,
+    /// RPM 打满时最多等待毫秒数（0 = 立即 429）
+    #[serde(default)]
+    pub credential_rpm_max_wait_ms: u64,
     /// Kiro 客户端版本（不能为空）
     pub kiro_version: String,
     /// 系统版本指纹（不能为空）

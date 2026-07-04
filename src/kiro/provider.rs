@@ -16,7 +16,7 @@ use crate::http_client::{ProxyConfig, build_client};
 use crate::kiro::endpoint::{KiroEndpoint, RequestContext};
 use crate::kiro::machine_id;
 use crate::kiro::model::credentials::KiroCredentials;
-use crate::kiro::token_manager::{CredentialRpmExceeded, MultiTokenManager};
+use crate::kiro::token_manager::{CredentialRpmExceeded, MultiTokenManager, RpmChargeMode};
 use crate::model::config::TlsBackend;
 use parking_lot::Mutex;
 
@@ -31,6 +31,8 @@ pub(crate) struct UpstreamApiError {
     pub status: u16,
     /// 用于日志/错误信息的完整描述
     pub message: String,
+    /// 429 限流时建议客户端等待时长（本地 RPM 或上游 Retry-After）
+    pub retry_after: Option<Duration>,
 }
 
 impl fmt::Display for UpstreamApiError {
@@ -45,6 +47,7 @@ fn local_rpm_limit_error(rpm: &CredentialRpmExceeded) -> anyhow::Error {
     UpstreamApiError {
         status: 429,
         message: rpm.to_string(),
+        retry_after: Some(rpm.retry_after),
     }
     .into()
 }
@@ -54,6 +57,17 @@ const MAX_RETRIES_PER_CREDENTIAL: usize = 3;
 
 /// 总重试次数硬上限（避免无限重试）
 const MAX_TOTAL_RETRIES: usize = 9;
+
+fn record_request_failure_metrics(last_error: &Option<anyhow::Error>) {
+    crate::metrics::inc_request_error();
+    if let Some(e) = last_error {
+        if e.downcast_ref::<UpstreamApiError>()
+            .is_some_and(|a| a.status == 429)
+        {
+            crate::metrics::inc_upstream_rate_limited();
+        }
+    }
+}
 
 /// Kiro API Provider
 ///
@@ -142,13 +156,36 @@ impl KiroProvider {
     /// 发送非流式 API 请求
     ///
     /// 支持多凭据故障转移（见 [`Self::call_api_with_retry`]）
-    pub async fn call_api(&self, request_body: &str) -> anyhow::Result<reqwest::Response> {
-        self.call_api_with_retry(request_body, false).await
+    /// 获取可用凭据数量（未禁用）
+    pub fn available_credentials(&self) -> usize {
+        self.token_manager.available_count()
+    }
+
+    /// 获取凭据总数
+    pub fn total_credentials(&self) -> usize {
+        self.token_manager.total_count()
+    }
+
+    /// 发送非流式 API 请求
+    ///
+    /// `model_hint` 若提供则跳过从 request_body 解析 modelId（用于 RPM 凭据选择）。
+    pub async fn call_api(
+        &self,
+        request_body: &str,
+        model_hint: Option<&str>,
+    ) -> anyhow::Result<reqwest::Response> {
+        self.call_api_with_retry(request_body, false, model_hint)
+            .await
     }
 
     /// 发送流式 API 请求
-    pub async fn call_api_stream(&self, request_body: &str) -> anyhow::Result<reqwest::Response> {
-        self.call_api_with_retry(request_body, true).await
+    pub async fn call_api_stream(
+        &self,
+        request_body: &str,
+        model_hint: Option<&str>,
+    ) -> anyhow::Result<reqwest::Response> {
+        self.call_api_with_retry(request_body, true, model_hint)
+            .await
     }
 
     /// 发送 MCP API 请求（WebSearch 等工具调用）
@@ -162,12 +199,17 @@ impl KiroProvider {
         let max_retries = (total_credentials * MAX_RETRIES_PER_CREDENTIAL).min(MAX_TOTAL_RETRIES);
         let mut last_error: Option<anyhow::Error> = None;
         let mut force_refreshed: HashSet<u64> = HashSet::new();
+        let mut rpm_reserved: Option<u64> = None;
 
         for attempt in 0..max_retries {
             // MCP 调用（WebSearch 等工具）不涉及模型选择，无需按模型过滤凭据
-            let ctx = match self.token_manager.acquire_context(None).await {
+            let rpm_mode = rpm_reserved
+                .map(RpmChargeMode::Reuse)
+                .unwrap_or(RpmChargeMode::Charge);
+            let ctx = match self.token_manager.acquire_context(None, rpm_mode).await {
                 Ok(c) => c,
                 Err(e) if e.downcast_ref::<CredentialRpmExceeded>().is_some() => {
+                    crate::metrics::inc_local_rpm_rejected();
                     return Err(local_rpm_limit_error(
                         e.downcast_ref::<CredentialRpmExceeded>().unwrap(),
                     ));
@@ -177,6 +219,9 @@ impl KiroProvider {
                     continue;
                 }
             };
+            if rpm_reserved.is_none() {
+                rpm_reserved = Some(ctx.id);
+            }
 
             let config = self.token_manager.config();
             let machine_id = machine_id::generate_from_credentials(&ctx.credentials, &config);
@@ -231,6 +276,7 @@ impl KiroProvider {
             // 成功响应
             if status.is_success() {
                 self.token_manager.report_success(ctx.id);
+                crate::metrics::inc_request_success();
                 return Ok(response);
             }
 
@@ -310,6 +356,7 @@ impl KiroProvider {
             }
         }
 
+        record_request_failure_metrics(&last_error);
         Err(last_error.unwrap_or_else(|| {
             anyhow::anyhow!("MCP 请求失败：已达到最大重试次数（{}次）", max_retries)
         }))
@@ -325,21 +372,29 @@ impl KiroProvider {
         &self,
         request_body: &str,
         is_stream: bool,
+        model_hint: Option<&str>,
     ) -> anyhow::Result<reqwest::Response> {
         let total_credentials = self.token_manager.total_count();
         let max_retries = (total_credentials * MAX_RETRIES_PER_CREDENTIAL).min(MAX_TOTAL_RETRIES);
         let mut last_error: Option<anyhow::Error> = None;
         let mut force_refreshed: HashSet<u64> = HashSet::new();
+        let mut rpm_reserved: Option<u64> = None;
         let api_type = if is_stream { "流式" } else { "非流式" };
 
-        // 尝试从请求体中提取模型信息
-        let model = Self::extract_model_from_request(request_body);
+        // 优先使用 handler 传入的 model，避免重复解析 JSON
+        let model = model_hint
+            .map(|s| s.to_string())
+            .or_else(|| Self::extract_model_from_request(request_body));
 
         for attempt in 0..max_retries {
+            let rpm_mode = rpm_reserved
+                .map(RpmChargeMode::Reuse)
+                .unwrap_or(RpmChargeMode::Charge);
             // 获取调用上下文（绑定 index、credentials、token）
-            let ctx = match self.token_manager.acquire_context(model.as_deref()).await {
+            let ctx = match self.token_manager.acquire_context(model.as_deref(), rpm_mode).await {
                 Ok(c) => c,
                 Err(e) if e.downcast_ref::<CredentialRpmExceeded>().is_some() => {
+                    crate::metrics::inc_local_rpm_rejected();
                     return Err(local_rpm_limit_error(
                         e.downcast_ref::<CredentialRpmExceeded>().unwrap(),
                     ));
@@ -349,6 +404,9 @@ impl KiroProvider {
                     continue;
                 }
             };
+            if rpm_reserved.is_none() {
+                rpm_reserved = Some(ctx.id);
+            }
 
             let config = self.token_manager.config();
             let machine_id = machine_id::generate_from_credentials(&ctx.credentials, &config);
@@ -404,6 +462,7 @@ impl KiroProvider {
             // 成功响应
             if status.is_success() {
                 self.token_manager.report_success(ctx.id);
+                crate::metrics::inc_request_success();
                 return Ok(response);
             }
 
@@ -431,12 +490,14 @@ impl KiroProvider {
                             "{} API 请求失败（所有凭据已用尽）: {} {}",
                             api_type, status, body
                         ),
+                        retry_after: None,
                     }));
                 }
 
                 last_error = Some(anyhow::Error::new(UpstreamApiError {
                     status: 402,
                     message: format!("{} API 请求失败: {} {}", api_type, status, body),
+                    retry_after: None,
                 }));
                 continue;
             }
@@ -499,6 +560,11 @@ impl KiroProvider {
                 last_error = Some(anyhow::Error::new(UpstreamApiError {
                     status: status.as_u16(),
                     message: format!("{} API 请求失败: {} {}", api_type, status, body),
+                    retry_after: if status.as_u16() == 429 {
+                        retry_after
+                    } else {
+                        None
+                    },
                 }));
                 if attempt + 1 < max_retries {
                     // 429 限流走专用指数退避（优先 Retry-After），其余瞬态错误走默认退避
@@ -537,6 +603,7 @@ impl KiroProvider {
         }
 
         // 所有重试都失败
+        record_request_failure_metrics(&last_error);
         Err(last_error.unwrap_or_else(|| {
             anyhow::anyhow!(
                 "{} API 请求失败：已达到最大重试次数（{}次）",

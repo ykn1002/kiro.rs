@@ -456,9 +456,8 @@ RUST_LOG=debug ./target/release/kiro-rs
 | `/cc/v1/messages/count_tokens` | POST | 估算 Token 数量（与 `/v1` 相同） |
 
 > **`/cc/v1/messages` 与 `/v1/messages` 的区别**：
-> - `/v1/messages`：实时流式返回，`message_start` 中的 `input_tokens` 是估算值
-> - `/cc/v1/messages`：缓冲模式，等待上游流完成后，用从 `contextUsageEvent` 计算的准确 `input_tokens` 更正 `message_start`，然后一次性返回所有事件
-> - 等待期间会每 25 秒发送 `ping` 事件保活
+> - `/v1/messages`：立即发送 `message_start`（`input_tokens` 为估算值），正文实时流式
+> - `/cc/v1/messages`：等待 `contextUsageEvent` 后再发送 `message_start`（准确 `input_tokens`），之后实时流式；等待期间每 25 秒发送 `ping` 保活
 
 ### Thinking 模式
 

@@ -124,6 +124,15 @@ impl fmt::Display for CredentialRpmExceeded {
 
 impl std::error::Error for CredentialRpmExceeded {}
 
+/// RPM 占位策略（`acquire_context` 使用）
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RpmChargeMode {
+    /// 新请求或切换到新凭据：正常校验并占位
+    Charge,
+    /// 同一逻辑 API 请求的重试：已占位凭据不再重复计数
+    Reuse(u64),
+}
+
 /// 刷新 Token
 pub(crate) async fn refresh_token(
     credentials: &KiroCredentials,
@@ -812,8 +821,8 @@ pub struct MultiTokenManager {
     entries: Mutex<Vec<CredentialEntry>>,
     /// 当前活动凭据 ID
     current_id: Mutex<u64>,
-    /// Token 刷新锁，确保同一时间只有一个刷新操作
-    refresh_lock: TokioMutex<()>,
+    /// 按凭据 ID 的 Token 刷新锁（不同凭据可并行刷新）
+    refresh_locks: Mutex<HashMap<u64, Arc<TokioMutex<()>>>>,
     /// 凭据文件路径（用于回写）
     credentials_path: Option<PathBuf>,
     /// 是否为多凭据格式（数组格式才回写）
@@ -950,7 +959,7 @@ impl MultiTokenManager {
             proxy,
             entries: Mutex::new(entries),
             current_id: Mutex::new(initial_id),
-            refresh_lock: TokioMutex::new(()),
+            refresh_locks: Mutex::new(HashMap::new()),
             credentials_path,
             is_multiple_format,
             load_balancing_mode: Mutex::new(load_balancing_mode),
@@ -1150,6 +1159,32 @@ impl MultiTokenManager {
         }
     }
 
+    /// Reuse 模式下优先选中已占位凭据（即使 RPM 窗口已满，不再重复计数）
+    fn try_select_reserved_credential(
+        &self,
+        model: Option<&str>,
+        reserved_id: u64,
+    ) -> Option<(u64, KiroCredentials)> {
+        let is_opus = model
+            .map(|m| m.to_lowercase().contains("opus"))
+            .unwrap_or(false);
+        let entries = self.entries.lock();
+        entries
+            .iter()
+            .find(|e| e.id == reserved_id && !e.disabled)
+            .filter(|e| !is_opus || e.credentials.supports_opus())
+            .map(|e| (e.id, e.credentials.clone()))
+    }
+
+    /// 获取指定凭据的刷新锁（同凭据串行，不同凭据并行）
+    fn refresh_lock_for(&self, id: u64) -> Arc<TokioMutex<()>> {
+        let mut locks = self.refresh_locks.lock();
+        locks
+            .entry(id)
+            .or_insert_with(|| Arc::new(TokioMutex::new(())))
+            .clone()
+    }
+
     /// 获取 API 调用上下文
     ///
     /// 返回绑定了 id、credentials 和 token 的调用上下文
@@ -1160,10 +1195,16 @@ impl MultiTokenManager {
     ///
     /// # 参数
     /// - `model`: 可选的模型名称，用于过滤支持该模型的凭据（如 opus 模型需要付费订阅）
-    pub async fn acquire_context(&self, model: Option<&str>) -> anyhow::Result<CallContext> {
+    /// - `rpm_mode`: RPM 占位策略；provider 重试同一凭据时传 `Reuse(id)` 避免重复占槽
+    pub async fn acquire_context(
+        &self,
+        model: Option<&str>,
+        rpm_mode: RpmChargeMode,
+    ) -> anyhow::Result<CallContext> {
         let total = self.total_count();
         let max_attempts = (total * MAX_FAILURES_PER_CREDENTIAL as usize).max(1);
         let mut attempt_count = 0;
+        let mut rpm_charged_in_call: Option<u64> = None;
 
         loop {
             if attempt_count >= max_attempts {
@@ -1176,8 +1217,9 @@ impl MultiTokenManager {
 
             // 凭据级 RPM 平滑：全部打满时可选等待（最多 credential_rpm_max_wait_ms），
             // 仍无空位则返回 CredentialRpmExceeded（客户端 429）。
+            // Reuse 重试时不等待 RPM 空位：占位已在首次 acquire 完成
             let max_wait_ms = self.config().credential_rpm_max_wait_ms;
-            if max_wait_ms > 0 {
+            if max_wait_ms > 0 && !matches!(rpm_mode, RpmChargeMode::Reuse(_)) {
                 let now = Instant::now();
                 if let Some(wait) = self.rpm_wait_for_slot(model, now) {
                     let wait = wait.min(StdDuration::from_millis(max_wait_ms));
@@ -1200,6 +1242,13 @@ impl MultiTokenManager {
                     "balanced" | "round-robin"
                 );
 
+                let reuse_hit = match rpm_mode {
+                    RpmChargeMode::Reuse(reserved_id) => {
+                        self.try_select_reserved_credential(model, reserved_id)
+                    }
+                    RpmChargeMode::Charge => None,
+                };
+
                 let current_hit = if reselect_each_time {
                     None
                 } else {
@@ -1221,7 +1270,9 @@ impl MultiTokenManager {
                         })
                 };
 
-                if let Some(hit) = current_hit {
+                if let Some(hit) = reuse_hit {
+                    hit
+                } else if let Some(hit) = current_hit {
                     hit
                 } else {
                     // 当前凭据不可用或 balanced 模式，根据负载均衡策略选择
@@ -1279,10 +1330,15 @@ impl MultiTokenManager {
                 let now = Instant::now();
                 let mut entries = self.entries.lock();
                 if let Some(entry) = entries.iter_mut().find(|e| e.id == id) {
-                    if entry.is_rpm_exceeded(class, rpm_limit, now) {
-                        return Err(self.credential_rpm_exceeded_error(model).into());
+                    let skip_charge = rpm_charged_in_call == Some(id)
+                        || matches!(rpm_mode, RpmChargeMode::Reuse(r) if r == id);
+                    if !skip_charge {
+                        if entry.is_rpm_exceeded(class, rpm_limit, now) {
+                            return Err(self.credential_rpm_exceeded_error(model).into());
+                        }
+                        entry.record_request(class, now);
+                        rpm_charged_in_call = Some(id);
                     }
-                    entry.record_request(class, now);
                 }
             }
 
@@ -1365,7 +1421,8 @@ impl MultiTokenManager {
 
         let creds = if needs_refresh {
             // 获取刷新锁，确保同一时间只有一个刷新操作
-            let _guard = self.refresh_lock.lock().await;
+            let refresh_lock = self.refresh_lock_for(id);
+            let _guard = refresh_lock.lock().await;
 
             // 第二次检查：获取锁后重新读取凭据，因为其他请求可能已经完成刷新
             let current_creds = {
@@ -2096,7 +2153,8 @@ impl MultiTokenManager {
                 is_token_expired(&credentials) || is_token_expiring_soon(&credentials);
 
             if needs_refresh {
-                let _guard = self.refresh_lock.lock().await;
+                let refresh_lock = self.refresh_lock_for(id);
+            let _guard = refresh_lock.lock().await;
                 let current_creds = {
                     let entries = self.entries.lock();
                     entries
@@ -2371,6 +2429,8 @@ impl MultiTokenManager {
         // 持久化更改
         self.persist_credentials()?;
 
+        self.refresh_locks.lock().remove(&id);
+
         // 立即回写统计数据，清除已删除凭据的残留条目
         self.save_stats();
 
@@ -2393,7 +2453,8 @@ impl MultiTokenManager {
         };
 
         // 获取刷新锁防止并发刷新
-        let _guard = self.refresh_lock.lock().await;
+        let refresh_lock = self.refresh_lock_for(id);
+        let _guard = refresh_lock.lock().await;
 
         // 无条件调用 refresh_token
         let effective_proxy = credentials.effective_proxy(self.proxy.as_ref());
@@ -2991,7 +3052,7 @@ mod tests {
         assert_eq!(manager.available_count(), 0);
 
         // 应触发自愈：重置失败计数并重新启用，避免必须重启进程
-        let ctx = manager.acquire_context(None).await.unwrap();
+        let ctx = manager.acquire_context(None, RpmChargeMode::Charge).await.unwrap();
         assert!(ctx.token == "t1" || ctx.token == "t2");
         assert_eq!(manager.available_count(), 2);
     }
@@ -3013,7 +3074,7 @@ mod tests {
         let manager =
             MultiTokenManager::new(config, vec![bad_cred, good_cred], None, None, false).unwrap();
 
-        let ctx = manager.acquire_context(None).await.unwrap();
+        let ctx = manager.acquire_context(None, RpmChargeMode::Charge).await.unwrap();
         assert_eq!(ctx.id, 2);
         assert_eq!(ctx.token, "good-token");
     }
@@ -3058,7 +3119,7 @@ mod tests {
         }
         assert_eq!(manager.available_count(), 0);
 
-        let err = manager.acquire_context(None).await.err().unwrap().to_string();
+        let err = manager.acquire_context(None, RpmChargeMode::Charge).await.err().unwrap().to_string();
         assert!(
             err.contains("所有凭据均已禁用"),
             "错误应提示所有凭据禁用，实际: {}",
@@ -3098,7 +3159,7 @@ mod tests {
         manager.report_quota_exhausted(2);
         assert_eq!(manager.available_count(), 0);
 
-        let err = manager.acquire_context(None).await.err().unwrap().to_string();
+        let err = manager.acquire_context(None, RpmChargeMode::Charge).await.err().unwrap().to_string();
         assert!(
             err.contains("所有凭据均已禁用"),
             "错误应提示所有凭据禁用，实际: {}",
@@ -3300,7 +3361,7 @@ mod tests {
             let mut entries = manager.entries.lock();
             entries[0].record_request(ModelClass::Other, now);
         }
-        match manager.acquire_context(None).await {
+        match manager.acquire_context(None, RpmChargeMode::Charge).await {
             Err(e) => assert!(e.downcast_ref::<CredentialRpmExceeded>().is_some()),
             Ok(_) => panic!("expected CredentialRpmExceeded"),
         }
@@ -3309,7 +3370,46 @@ mod tests {
     #[tokio::test]
     async fn test_acquire_context_allows_request_under_rpm_limit() {
         let manager = make_manager_with_rpm(1, 2, 0);
-        manager.acquire_context(None).await.unwrap();
+        manager.acquire_context(None, RpmChargeMode::Charge).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_acquire_context_reuse_skips_rpm_charge_on_retry() {
+        let manager = make_manager_with_rpm(1, 1, 0);
+        let ctx = manager
+            .acquire_context(None, RpmChargeMode::Charge)
+            .await
+            .unwrap();
+        // 同一逻辑请求重试：Reuse 不再占槽，窗口仍有余量
+        manager
+            .acquire_context(None, RpmChargeMode::Reuse(ctx.id))
+            .await
+            .unwrap();
+        // 新请求再次 Charge 应触发 RPM 上限
+        match manager.acquire_context(None, RpmChargeMode::Charge).await {
+            Err(e) => assert!(e.downcast_ref::<CredentialRpmExceeded>().is_some()),
+            Ok(_) => panic!("expected CredentialRpmExceeded"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_acquire_context_reuse_failover_charges_new_credential() {
+        let manager = make_manager_with_rpm(2, 1, 0);
+        let ctx = manager
+            .acquire_context(None, RpmChargeMode::Charge)
+            .await
+            .unwrap();
+        // 禁用首张凭据，Reuse 模式下应切换到第二张并正常占位
+        {
+            let mut entries = manager.entries.lock();
+            if let Some(e) = entries.iter_mut().find(|e| e.id == ctx.id) {
+                e.disabled = true;
+            }
+        }
+        manager
+            .acquire_context(None, RpmChargeMode::Reuse(ctx.id))
+            .await
+            .unwrap();
     }
 
     #[test]

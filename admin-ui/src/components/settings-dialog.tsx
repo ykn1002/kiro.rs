@@ -59,6 +59,7 @@ export function SettingsDialog({ open, onOpenChange }: SettingsDialogProps) {
   const [rpmOpus, setRpmOpus] = useState('')
   const [rpmSonnet, setRpmSonnet] = useState('')
   const [rpmHaiku, setRpmHaiku] = useState('')
+  const [rpmMaxWaitMs, setRpmMaxWaitMs] = useState('0')
   const [kiroVersion, setKiroVersion] = useState('')
   const [systemVersion, setSystemVersion] = useState('')
   const [nodeVersion, setNodeVersion] = useState('')
@@ -77,6 +78,7 @@ export function SettingsDialog({ open, onOpenChange }: SettingsDialogProps) {
     setRpmOpus(config.credentialRpmOpus == null ? '' : String(config.credentialRpmOpus))
     setRpmSonnet(config.credentialRpmSonnet == null ? '' : String(config.credentialRpmSonnet))
     setRpmHaiku(config.credentialRpmHaiku == null ? '' : String(config.credentialRpmHaiku))
+    setRpmMaxWaitMs(String(config.credentialRpmMaxWaitMs ?? 0))
     setKiroVersion(config.kiroVersion)
     setSystemVersion(config.systemVersion)
     setNodeVersion(config.nodeVersion)
@@ -180,6 +182,7 @@ export function SettingsDialog({ open, onOpenChange }: SettingsDialogProps) {
         credentialRpmOpus: parseOptionalRpm(rpmOpus),
         credentialRpmSonnet: parseOptionalRpm(rpmSonnet),
         credentialRpmHaiku: parseOptionalRpm(rpmHaiku),
+        credentialRpmMaxWaitMs: Math.max(0, parseInt(rpmMaxWaitMs, 10) || 0),
         kiroVersion: kiroVersion.trim(),
         systemVersion: systemVersion.trim(),
         nodeVersion: nodeVersion.trim(),
@@ -289,8 +292,21 @@ export function SettingsDialog({ open, onOpenChange }: SettingsDialogProps) {
                     />
                   </div>
                 </div>
+                <div className="space-y-1 max-w-xs">
+                  <label className="text-xs text-muted-foreground">
+                    RPM 打满等待 (credentialRpmMaxWaitMs, ms)
+                  </label>
+                  <Input
+                    type="number"
+                    min="0"
+                    value={rpmMaxWaitMs}
+                    onChange={(e) => setRpmMaxWaitMs(e.target.value)}
+                    disabled={isPending}
+                  />
+                </div>
                 <p className="text-xs text-muted-foreground">
-                  每个凭据每分钟请求数上限。0 或留空表示不单独限制（专用项留空回退到兜底值）
+                  每个凭据每分钟请求数上限。0 或留空表示不单独限制（专用项留空回退到兜底值）。
+                  「RPM 打满等待」：全部凭据达上限时，发出请求前最多等待的毫秒数；0 表示不等待、立即向客户端返回 429
                 </p>
               </section>
 

@@ -12,7 +12,7 @@ use crate::kiro::provider::KiroProvider;
 use crate::openai::{chat_completions, create_response};
 
 use super::{
-    handlers::{count_tokens, get_models, post_messages, post_messages_cc},
+    handlers::{count_tokens, get_models, healthz, metrics, post_messages, post_messages_cc, readyz},
     middleware::{AppState, SharedApiKey, auth_middleware, cors_layer},
 };
 
@@ -59,7 +59,7 @@ pub fn create_router_with_provider(
         ));
 
     // 需要认证的 /cc/v1 路由（Claude Code 兼容端点）
-    // 与 /v1 的区别：流式响应会等待 contextUsageEvent 后再发送 message_start
+    // 与 /v1 的区别：流式响应等待 contextUsageEvent 后再发送 message_start（准确 input_tokens）
     let cc_v1_routes = Router::new()
         .route("/models", get(get_models))
         .route("/messages", post(post_messages_cc))
@@ -70,6 +70,9 @@ pub fn create_router_with_provider(
         ));
 
     Router::new()
+        .route("/healthz", get(healthz))
+        .route("/readyz", get(readyz))
+        .route("/metrics", get(metrics))
         .nest("/v1", v1_routes)
         .nest("/cc/v1", cc_v1_routes)
         .layer(cors_layer())

@@ -5,6 +5,7 @@ use std::convert::Infallible;
 use crate::kiro::model::events::Event;
 use crate::kiro::model::requests::kiro::KiroRequest;
 use crate::kiro::parser::decoder::EventStreamDecoder;
+use crate::kiro::parser::error::ParseError;
 use crate::token;
 use anyhow::Error;
 use axum::{
@@ -65,15 +66,22 @@ fn map_provider_error(err: Error) -> Response {
     if let Some(api_err) = err.downcast_ref::<crate::kiro::provider::UpstreamApiError>() {
         match api_err.status {
             429 => {
-                tracing::warn!(error = %err, "上游限流，透传 429 给客户端");
-                return (
+                tracing::warn!(error = %err, "限流，透传 429 给客户端");
+                let mut resp = (
                     StatusCode::TOO_MANY_REQUESTS,
                     Json(ErrorResponse::new(
                         "rate_limit_error",
-                        "Upstream rate limit reached. Please retry after a short delay.",
+                        "Rate limit reached. Please retry after the indicated delay.",
                     )),
                 )
                     .into_response();
+                if let Some(ra) = api_err.retry_after {
+                    if let Ok(value) = header::HeaderValue::from_str(&ra.as_secs().max(1).to_string())
+                    {
+                        resp.headers_mut().insert(header::RETRY_AFTER, value);
+                    }
+                }
+                return resp;
             }
             402 => {
                 tracing::warn!(error = %err, "上游额度耗尽，透传 402 给客户端");
@@ -99,6 +107,63 @@ fn map_provider_error(err: Error) -> Response {
         )),
     )
         .into_response()
+}
+
+/// GET /metrics — Prometheus 文本格式指标（无需认证）
+pub async fn metrics(State(state): State<AppState>) -> impl IntoResponse {
+    let (available, total) = match &state.kiro_provider {
+        Some(p) => (p.available_credentials(), p.total_credentials()),
+        None => (0, 0),
+    };
+    (
+        [(header::CONTENT_TYPE, "text/plain; version=0.0.4; charset=utf-8")],
+        crate::metrics::METRICS.render_prometheus(available, total),
+    )
+}
+
+/// GET /healthz — 进程存活探针（无需认证）
+pub async fn healthz() -> impl IntoResponse {
+    Json(json!({ "status": "ok" }))
+}
+
+/// GET /readyz — 就绪探针：至少有一个未禁用的凭据（无需认证）
+pub async fn readyz(State(state): State<AppState>) -> impl IntoResponse {
+    match &state.kiro_provider {
+        None => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({
+                "status": "not_ready",
+                "reason": "kiro_provider_not_configured"
+            })),
+        )
+            .into_response(),
+        Some(provider) => {
+            let available = provider.available_credentials();
+            let total = provider.total_credentials();
+            if available == 0 {
+                (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    Json(json!({
+                        "status": "not_ready",
+                        "reason": "no_available_credentials",
+                        "total": total,
+                        "available": available
+                    })),
+                )
+                    .into_response()
+            } else {
+                (
+                    StatusCode::OK,
+                    Json(json!({
+                        "status": "ready",
+                        "total": total,
+                        "available": available
+                    })),
+                )
+                    .into_response()
+            }
+        }
+    }
 }
 
 /// GET /v1/models
@@ -147,16 +212,37 @@ pub async fn get_models() -> impl IntoResponse {
 /// 创建消息（对话）
 pub async fn post_messages(
     State(state): State<AppState>,
-    JsonExtractor(mut payload): JsonExtractor<MessagesRequest>,
+    JsonExtractor(payload): JsonExtractor<MessagesRequest>,
+) -> Response {
+    handle_messages(state, payload, false, "/v1/messages").await
+}
+
+/// POST /cc/v1/messages
+///
+/// Claude Code 兼容端点：等待 contextUsageEvent 后再发送 message_start。
+pub async fn post_messages_cc(
+    State(state): State<AppState>,
+    JsonExtractor(payload): JsonExtractor<MessagesRequest>,
+) -> Response {
+    handle_messages(state, payload, true, "/cc/v1/messages").await
+}
+
+/// /v1 与 /cc/v1 共享的消息处理逻辑
+async fn handle_messages(
+    state: AppState,
+    mut payload: MessagesRequest,
+    delay_message_start: bool,
+    log_path: &str,
 ) -> Response {
     tracing::info!(
+        path = log_path,
         model = %payload.model,
         max_tokens = %payload.max_tokens,
         stream = %payload.stream,
         message_count = %payload.messages.len(),
-        "Received POST /v1/messages request"
+        "Received messages request"
     );
-    // 检查 KiroProvider 是否可用
+
     let provider = match &state.kiro_provider {
         Some(p) => p.clone(),
         None => {
@@ -172,14 +258,11 @@ pub async fn post_messages(
         }
     };
 
-    // 检测模型名是否包含 "thinking" 后缀，若包含则覆写 thinking 配置
     override_thinking_from_model_name(&mut payload);
 
-    // 检查是否为 WebSearch 请求
     if websearch::has_web_search_tool(&payload) {
         tracing::info!("检测到 WebSearch 工具，路由到 WebSearch 处理");
 
-        // 估算输入 tokens
         let input_tokens = token::count_all_tokens(
             payload.model.clone(),
             payload.system.clone(),
@@ -190,7 +273,6 @@ pub async fn post_messages(
         return websearch::handle_websearch_request(provider, &payload, input_tokens).await;
     }
 
-    // 转换请求
     let conversion_result = match convert_request(&payload) {
         Ok(result) => result,
         Err(e) => {
@@ -204,7 +286,6 @@ pub async fn post_messages(
         }
     };
 
-    // 构建 Kiro 请求（profile_arn 由 provider 层根据实际凭据注入）
     let kiro_request = KiroRequest {
         conversation_state: conversion_result.conversation_state,
         profile_arn: None,
@@ -227,7 +308,6 @@ pub async fn post_messages(
 
     tracing::debug!("Kiro request body: {}", request_body);
 
-    // 估算输入 tokens
     let input_tokens = token::count_all_tokens(
         payload.model.clone(),
         payload.system,
@@ -235,7 +315,6 @@ pub async fn post_messages(
         payload.tools,
     ) as i32;
 
-    // 检查是否启用了thinking
     let thinking_enabled = payload
         .thinking
         .as_ref()
@@ -243,24 +322,24 @@ pub async fn post_messages(
         .unwrap_or(false);
 
     let tool_name_map = conversion_result.tool_name_map;
+    let model = payload.model;
 
     if payload.stream {
-        // 流式响应
         handle_stream_request(
             provider,
             &request_body,
-            &payload.model,
+            &model,
             input_tokens,
             thinking_enabled,
             tool_name_map,
-            true,
+            delay_message_start,
         )
         .await
     } else {
         handle_non_stream_request(
             provider,
             &request_body,
-            &payload.model,
+            &model,
             input_tokens,
             thinking_enabled,
             tool_name_map,
@@ -279,7 +358,7 @@ async fn handle_stream_request(
     tool_name_map: std::collections::HashMap<String, String>,
     delay_message_start: bool,
 ) -> Response {
-    let response = match provider.call_api_stream(request_body).await {
+    let response = match provider.call_api_stream(request_body, Some(model)).await {
         Ok(resp) => resp,
         Err(e) => return map_provider_error(e),
     };
@@ -309,6 +388,24 @@ const PING_INTERVAL_SECS: u64 = 25;
 /// 创建 ping 事件的 SSE 字符串
 fn create_ping_sse() -> Bytes {
     Bytes::from("event: ping\ndata: {\"type\": \"ping\"}\n\n")
+}
+
+/// 流式解码错误处理：连续失败时标记流失败并向前端发送 error 事件
+fn handle_stream_decode_error(
+    events: &mut Vec<SseEvent>,
+    ctx: &mut StreamContext,
+    e: &ParseError,
+) {
+    if matches!(e, ParseError::TooManyErrors { .. }) {
+        tracing::error!("解码器停止: {}", e);
+        ctx.stream_failed = true;
+        crate::metrics::inc_stream_decode_failure();
+        events.push(StreamContext::create_error_event(&format!(
+            "Stream decode failed: {e}"
+        )));
+    } else {
+        tracing::warn!("解码事件失败: {}", e);
+    }
 }
 
 /// 创建 SSE 事件流
@@ -348,7 +445,7 @@ fn create_sse_stream(
                                         }
                                     }
                                     Err(e) => {
-                                        tracing::warn!("解码事件失败: {}", e);
+                                        handle_stream_decode_error(&mut events, &mut ctx, &e);
                                     }
                                 }
                             }
@@ -409,7 +506,7 @@ async fn handle_non_stream_request(
     tool_name_map: std::collections::HashMap<String, String>,
 ) -> Response {
     // 调用 Kiro API（支持多凭据故障转移）
-    let response = match provider.call_api(request_body).await {
+    let response = match provider.call_api(request_body, Some(model)).await {
         Ok(resp) => resp,
         Err(e) => return map_provider_error(e),
     };
@@ -544,6 +641,17 @@ async fn handle_non_stream_request(
                 }
             }
             Err(e) => {
+                if matches!(e, ParseError::TooManyErrors { .. }) {
+                    tracing::error!("非流式解码器停止: {}", e);
+                    return (
+                        StatusCode::BAD_GATEWAY,
+                        Json(ErrorResponse::new(
+                            "api_error",
+                            format!("Upstream stream decode failed: {e}"),
+                        )),
+                    )
+                        .into_response();
+                }
                 tracing::warn!("解码事件失败: {}", e);
             }
         }
@@ -667,134 +775,6 @@ pub async fn count_tokens(
     })
 }
 
-/// POST /cc/v1/messages
-///
-/// Claude Code 兼容端点，与 /v1/messages 流式行为相同：
-/// 等待 contextUsageEvent 后发送带准确 input_tokens 的 message_start，之后实时转发内容。
-pub async fn post_messages_cc(
-    State(state): State<AppState>,
-    JsonExtractor(mut payload): JsonExtractor<MessagesRequest>,
-) -> Response {
-    tracing::info!(
-        model = %payload.model,
-        max_tokens = %payload.max_tokens,
-        stream = %payload.stream,
-        message_count = %payload.messages.len(),
-        "Received POST /cc/v1/messages request"
-    );
-
-    // 检查 KiroProvider 是否可用
-    let provider = match &state.kiro_provider {
-        Some(p) => p.clone(),
-        None => {
-            tracing::error!("KiroProvider 未配置");
-            return (
-                StatusCode::SERVICE_UNAVAILABLE,
-                Json(ErrorResponse::new(
-                    "service_unavailable",
-                    "Kiro API provider not configured",
-                )),
-            )
-                .into_response();
-        }
-    };
-
-    // 检测模型名是否包含 "thinking" 后缀，若包含则覆写 thinking 配置
-    override_thinking_from_model_name(&mut payload);
-
-    // 检查是否为 WebSearch 请求
-    if websearch::has_web_search_tool(&payload) {
-        tracing::info!("检测到 WebSearch 工具，路由到 WebSearch 处理");
-
-        // 估算输入 tokens
-        let input_tokens = token::count_all_tokens(
-            payload.model.clone(),
-            payload.system.clone(),
-            payload.messages.clone(),
-            payload.tools.clone(),
-        ) as i32;
-
-        return websearch::handle_websearch_request(provider, &payload, input_tokens).await;
-    }
-
-    // 转换请求
-    let conversion_result = match convert_request(&payload) {
-        Ok(result) => result,
-        Err(e) => {
-            let (error_type, message) = conversion_error_parts(&e);
-            tracing::warn!("请求转换失败: {}", e);
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(ErrorResponse::new(error_type, message)),
-            )
-                .into_response();
-        }
-    };
-
-    // 构建 Kiro 请求（profile_arn 由 provider 层根据实际凭据注入）
-    let kiro_request = KiroRequest {
-        conversation_state: conversion_result.conversation_state,
-        profile_arn: None,
-    };
-
-    let request_body = match serde_json::to_string(&kiro_request) {
-        Ok(body) => body,
-        Err(e) => {
-            tracing::error!("序列化请求失败: {}", e);
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ErrorResponse::new(
-                    "internal_error",
-                    format!("序列化请求失败: {}", e),
-                )),
-            )
-                .into_response();
-        }
-    };
-
-    tracing::debug!("Kiro request body: {}", request_body);
-
-    // 估算输入 tokens
-    let input_tokens = token::count_all_tokens(
-        payload.model.clone(),
-        payload.system,
-        payload.messages,
-        payload.tools,
-    ) as i32;
-
-    // 检查是否启用了thinking
-    let thinking_enabled = payload
-        .thinking
-        .as_ref()
-        .map(|t| t.is_enabled())
-        .unwrap_or(false);
-
-    let tool_name_map = conversion_result.tool_name_map;
-
-    if payload.stream {
-        handle_stream_request(
-            provider,
-            &request_body,
-            &payload.model,
-            input_tokens,
-            thinking_enabled,
-            tool_name_map,
-            true,
-        )
-        .await
-    } else {
-        handle_non_stream_request(
-            provider,
-            &request_body,
-            &payload.model,
-            input_tokens,
-            thinking_enabled,
-            tool_name_map,
-        )
-        .await
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -805,9 +785,29 @@ mod tests {
         let err = anyhow::Error::new(UpstreamApiError {
             status: 429,
             message: "流式 API 请求失败: 429 Too Many Requests".to_string(),
+            retry_after: Some(Duration::from_secs(30)),
         });
         let resp = map_provider_error(err);
         assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(
+            resp.headers().get(header::RETRY_AFTER).and_then(|v| v.to_str().ok()),
+            Some("30")
+        );
+    }
+
+    #[test]
+    fn test_map_provider_error_local_rpm_429_includes_retry_after() {
+        let err = anyhow::Error::new(UpstreamApiError {
+            status: 429,
+            message: "local credential RPM limit exceeded (8/min)".to_string(),
+            retry_after: Some(Duration::from_secs(12)),
+        });
+        let resp = map_provider_error(err);
+        assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(
+            resp.headers().get(header::RETRY_AFTER).and_then(|v| v.to_str().ok()),
+            Some("12")
+        );
     }
 
     #[test]
@@ -815,6 +815,7 @@ mod tests {
         let err = anyhow::Error::new(UpstreamApiError {
             status: 402,
             message: "流式 API 请求失败（所有凭据已用尽）: 402".to_string(),
+            retry_after: None,
         });
         let resp = map_provider_error(err);
         assert_eq!(resp.status(), StatusCode::PAYMENT_REQUIRED);
@@ -826,6 +827,7 @@ mod tests {
         let err = anyhow::Error::new(UpstreamApiError {
             status: 403,
             message: "流式 API 请求失败: 403 Forbidden".to_string(),
+            retry_after: None,
         });
         let resp = map_provider_error(err);
         assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);

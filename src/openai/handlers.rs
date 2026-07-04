@@ -20,6 +20,7 @@ use crate::anthropic::{AppState, convert_request, conversion_error_parts, get_co
 use crate::kiro::model::events::Event;
 use crate::kiro::model::requests::kiro::KiroRequest;
 use crate::kiro::parser::decoder::EventStreamDecoder;
+use crate::kiro::parser::error::ParseError;
 use crate::token;
 
 use super::converter::to_anthropic_request;
@@ -180,7 +181,7 @@ async fn handle_stream_request(
     tool_name_map: std::collections::HashMap<String, String>,
     include_usage: bool,
 ) -> Response {
-    let response = match provider.call_api_stream(request_body).await {
+    let response = match provider.call_api_stream(request_body, Some(model)).await {
         Ok(r) => r,
         Err(e) => return map_provider_error(e),
     };
@@ -228,14 +229,30 @@ fn create_openai_sse_stream(
 
                             let mut sse_parts = Vec::new();
                             for result in decoder.decode_iter() {
-                                if let Ok(frame) = result {
-                                    if let Ok(event) = Event::from_frame(frame) {
-                                        for openai_chunk in ctx.process_kiro_event(&event) {
-                                            if openai_chunk.data == serde_json::Value::String("[DONE]".to_string()) {
-                                                sse_parts.push(done_sse());
-                                            } else {
-                                                sse_parts.push(openai_chunk.to_sse_string());
+                                match result {
+                                    Ok(frame) => {
+                                        if let Ok(event) = Event::from_frame(frame) {
+                                            for openai_chunk in ctx.process_kiro_event(&event) {
+                                                if openai_chunk.data == serde_json::Value::String("[DONE]".to_string()) {
+                                                    sse_parts.push(done_sse());
+                                                } else {
+                                                    sse_parts.push(openai_chunk.to_sse_string());
+                                                }
                                             }
+                                        }
+                                    }
+                                    Err(e) => {
+                                        if matches!(e, ParseError::TooManyErrors { .. }) {
+                                            tracing::error!("解码器停止: {}", e);
+                                            ctx.stream_failed = true;
+                                            crate::metrics::inc_stream_decode_failure();
+                                            let err = OpenAiStreamContext::create_error_chunk(
+                                                &format!("Stream decode failed: {e}"),
+                                            );
+                                            sse_parts.push(err.to_sse_string());
+                                            sse_parts.push(done_sse());
+                                        } else {
+                                            tracing::warn!("解码事件失败: {}", e);
                                         }
                                     }
                                 }
@@ -300,7 +317,7 @@ async fn handle_non_stream_request(
     thinking_enabled: bool,
     tool_name_map: std::collections::HashMap<String, String>,
 ) -> Response {
-    let response = match provider.call_api(request_body).await {
+    let response = match provider.call_api(request_body, Some(model)).await {
         Ok(r) => r,
         Err(e) => return map_provider_error(e),
     };
@@ -488,14 +505,21 @@ pub(crate) fn map_provider_error(err: Error) -> Response {
     if let Some(api_err) = err.downcast_ref::<crate::kiro::provider::UpstreamApiError>() {
         match api_err.status {
             429 => {
-                return (
+                let mut resp = (
                     StatusCode::TOO_MANY_REQUESTS,
                     Json(ErrorResponse::new(
                         "rate_limit_error",
-                        "Upstream rate limit reached. Please retry after a short delay.",
+                        "Rate limit reached. Please retry after the indicated delay.",
                     )),
                 )
                     .into_response();
+                if let Some(ra) = api_err.retry_after {
+                    if let Ok(value) = header::HeaderValue::from_str(&ra.as_secs().max(1).to_string())
+                    {
+                        resp.headers_mut().insert(header::RETRY_AFTER, value);
+                    }
+                }
+                return resp;
             }
             402 => {
                 return (

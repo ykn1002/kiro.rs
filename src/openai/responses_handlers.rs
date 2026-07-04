@@ -18,6 +18,7 @@ use crate::anthropic::{AppState, conversion_error_parts, get_context_window_size
 use crate::kiro::model::events::Event;
 use crate::kiro::model::requests::kiro::KiroRequest;
 use crate::kiro::parser::decoder::EventStreamDecoder;
+use crate::kiro::parser::error::ParseError;
 use crate::token;
 
 use super::handlers::{map_provider_error, override_thinking_from_model_name};
@@ -144,7 +145,7 @@ async fn handle_responses_stream(
     thinking_enabled: bool,
     tool_name_map: std::collections::HashMap<String, String>,
 ) -> Response {
-    let response = match provider.call_api_stream(request_body).await {
+    let response = match provider.call_api_stream(request_body, Some(model)).await {
         Ok(r) => r,
         Err(e) => return map_provider_error(e),
     };
@@ -190,10 +191,26 @@ fn create_responses_sse_stream(
 
                     let mut sse_parts = Vec::new();
                     for result in decoder.decode_iter() {
-                        if let Ok(frame) = result {
-                            if let Ok(event) = Event::from_frame(frame) {
-                                for ev in ctx.process_kiro_event(&event) {
-                                    sse_parts.push(ev.to_sse_string());
+                        match result {
+                            Ok(frame) => {
+                                if let Ok(event) = Event::from_frame(frame) {
+                                    for ev in ctx.process_kiro_event(&event) {
+                                        sse_parts.push(ev.to_sse_string());
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                if matches!(e, ParseError::TooManyErrors { .. }) {
+                                    tracing::error!("解码器停止: {}", e);
+                                    ctx.stream_failed = true;
+                                    crate::metrics::inc_stream_decode_failure();
+                                    let err =
+                                        super::responses_stream::ResponsesStreamContext::create_error_event(
+                                            &format!("Stream decode failed: {e}"),
+                                        );
+                                    sse_parts.push(err.to_sse_string());
+                                } else {
+                                    tracing::warn!("解码事件失败: {}", e);
                                 }
                             }
                         }
@@ -243,7 +260,7 @@ async fn handle_responses_non_stream(
     thinking_enabled: bool,
     tool_name_map: std::collections::HashMap<String, String>,
 ) -> Response {
-    let response = match provider.call_api(request_body).await {
+    let response = match provider.call_api(request_body, Some(model)).await {
         Ok(r) => r,
         Err(e) => return map_provider_error(e),
     };
