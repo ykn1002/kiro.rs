@@ -461,18 +461,18 @@ fn create_sse_stream(
                         Some(Err(e)) => {
                             tracing::error!("读取响应流失败: {:?}", e);
                             ctx.stream_failed = true;
-                            let err = StreamContext::create_error_event(&format!(
+                            let mut events = vec![StreamContext::create_error_event(&format!(
                                 "Upstream stream error: {e}"
-                            ));
-                            let bytes = vec![Ok(Bytes::from(err.to_sse_string()))];
+                            ))];
+                            events.extend(ctx.finalize_stream_on_failure());
+                            let bytes: Vec<Result<Bytes, Infallible>> = events
+                                .into_iter()
+                                .map(|ev| Ok(Bytes::from(ev.to_sse_string())))
+                                .collect();
                             Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval)))
                         }
                         None => {
-                            let final_events = if ctx.stream_failed {
-                                Vec::new()
-                            } else {
-                                ctx.finalize_stream()
-                            };
+                            let final_events = ctx.finalize_stream();
                             let bytes: Vec<Result<Bytes, Infallible>> = final_events
                                 .into_iter()
                                 .map(|e| Ok(Bytes::from(e.to_sse_string())))

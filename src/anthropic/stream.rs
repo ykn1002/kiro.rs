@@ -361,6 +361,11 @@ impl SseStateManager {
         }
     }
 
+    /// message_start 是否已发送
+    pub fn message_started(&self) -> bool {
+        self.message_started
+    }
+
     /// 处理 message_start 事件
     pub fn handle_message_start(&mut self, event: serde_json::Value) -> Option<SseEvent> {
         if self.message_started {
@@ -669,10 +674,10 @@ impl StreamContext {
         out
     }
 
-    /// 流正常结束时生成剩余事件
+    /// 流结束时生成剩余事件（含失败路径）
     pub fn finalize_stream(&mut self) -> Vec<SseEvent> {
         if self.stream_failed {
-            return Vec::new();
+            return self.finalize_stream_on_failure();
         }
         let mut out = Vec::new();
         if self.delay_message_start && !self.message_start_released {
@@ -684,6 +689,30 @@ impl StreamContext {
             self.message_start_released = true;
         }
         out.extend(self.generate_final_events());
+        out
+    }
+
+    /// 流异常结束时补全 SSE 序列（关闭块 + message_delta + message_stop）
+    pub fn finalize_stream_on_failure(&mut self) -> Vec<SseEvent> {
+        let mut out = Vec::new();
+
+        if self.delay_message_start && !self.message_start_released {
+            if !self.stream_initialized {
+                out.extend(self.generate_initial_events());
+                self.stream_initialized = true;
+            }
+            out.extend(self.release_pending_events());
+            self.message_start_released = true;
+        } else if !self.state_manager.message_started() {
+            out.extend(self.generate_initial_events());
+            self.stream_initialized = true;
+        }
+
+        let final_input_tokens = self.context_input_tokens.unwrap_or(self.input_tokens);
+        out.extend(
+            self.state_manager
+                .generate_final_events(final_input_tokens, self.output_tokens.max(1)),
+        );
         out
     }
 
@@ -1980,6 +2009,26 @@ mod tests {
         assert_eq!(
             message_delta.data["delta"]["stop_reason"], "tool_use",
             "stop_reason should be tool_use when tool_use is present"
+        );
+    }
+
+    #[test]
+    fn test_finalize_stream_on_failure_emits_message_stop() {
+        let mut ctx =
+            StreamContext::new_with_thinking("claude-sonnet-4-6", 100, false, HashMap::new(), false);
+        ctx.stream_failed = true;
+        let events = ctx.finalize_stream_on_failure();
+        assert!(
+            events.iter().any(|e| e.event == "message_start"),
+            "failure finalize should emit message_start when stream never started"
+        );
+        assert!(
+            events.iter().any(|e| e.event == "message_stop"),
+            "failure finalize should emit message_stop"
+        );
+        assert!(
+            events.iter().any(|e| e.event == "message_delta"),
+            "failure finalize should emit message_delta"
         );
     }
 }
