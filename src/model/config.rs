@@ -97,6 +97,16 @@ pub struct Config {
     #[serde(default = "default_streaming_sdk_version")]
     pub streaming_sdk_version: String,
 
+    /// `@aws-sdk/client-sso-oidc` 版本，用于 IdC Token 刷新 User-Agent；未配置时默认 `3.980.0`
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sso_oidc_sdk_version: Option<String>,
+
+    /// `@amzn/codewhisperer-runtime` 版本，用于额度查询等 runtime API User-Agent；未配置时默认 `1.0.0`
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub runtime_sdk_version: Option<String>,
+
     #[serde(default = "default_tls_backend")]
     pub tls_backend: TlsBackend,
 
@@ -351,6 +361,8 @@ impl Default for Config {
             system_version: default_system_version(),
             node_version: default_node_version(),
             streaming_sdk_version: default_streaming_sdk_version(),
+            sso_oidc_sdk_version: None,
+            runtime_sdk_version: None,
             tls_backend: default_tls_backend(),
             count_tokens_api_url: None,
             count_tokens_api_key: None,
@@ -392,6 +404,22 @@ impl Config {
     /// 优先使用 api_region，未配置时回退到 region
     pub fn effective_api_region(&self) -> &str {
         self.api_region.as_deref().unwrap_or(&self.region)
+    }
+
+    /// IdC Token 刷新用的 `@aws-sdk/client-sso-oidc` 版本
+    pub fn effective_sso_oidc_sdk_version(&self) -> &str {
+        self.sso_oidc_sdk_version
+            .as_deref()
+            .filter(|s| !s.is_empty())
+            .unwrap_or("3.980.0")
+    }
+
+    /// 额度查询等 runtime API 用的 `@amzn/codewhisperer-runtime` 版本
+    pub fn effective_runtime_sdk_version(&self) -> &str {
+        self.runtime_sdk_version
+            .as_deref()
+            .filter(|s| !s.is_empty())
+            .unwrap_or("1.0.0")
     }
 
     /// 获取有效的模型表

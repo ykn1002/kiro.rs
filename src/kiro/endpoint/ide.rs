@@ -86,7 +86,7 @@ impl KiroEndpoint for IdeEndpoint {
             .header("Authorization", format!("Bearer {}", ctx.token));
 
         if ctx.credentials.is_api_key_credential() {
-            req = req.header("tokentype", "API_KEY");
+            req = req.header("TokenType", "API_KEY");
         }
         req
     }
@@ -104,7 +104,7 @@ impl KiroEndpoint for IdeEndpoint {
             req = req.header("x-amzn-kiro-profile-arn", arn);
         }
         if ctx.credentials.is_api_key_credential() {
-            req = req.header("tokentype", "API_KEY");
+            req = req.header("TokenType", "API_KEY");
         }
         req
     }

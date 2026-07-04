@@ -181,7 +181,9 @@ docker-compose up
 | `machineId` | string | - | 全局设备 ID（64 位 hex 或 UUID）。未配置时按凭据 refreshToken 派生。从本机 Kiro IDE 读取：macOS `~/Library/Application Support/Kiro/machineid`；Windows `%APPDATA%\Kiro\machineId`；Linux `~/.config/Kiro/machineid` |
 | `systemVersion` | string | 随机 | 系统版本标识 |
 | `nodeVersion` | string | `22.21.1` | Node.js 版本标识 |
-| `streamingSdkVersion` | string | `1.0.39` | `@aws/codewhisperer-streaming-client` 版本，用于主 API / MCP 的 aws-sdk-js User-Agent。获取方式见下方 [上游指纹获取](#上游指纹获取) |
+| `streamingSdkVersion` | string | `1.0.39` | `@aws/codewhisperer-streaming-client` 版本，用于主 API / MCP 的 aws-sdk-js User-Agent。获取方式见 [上游指纹获取](#上游指纹获取) |
+| `ssoOidcSdkVersion` | string? | `3.980.0` | `@aws-sdk/client-sso-oidc` 版本，用于 IdC Token 刷新 User-Agent；省略时使用默认值。获取方式见 [上游指纹获取](#上游指纹获取) |
+| `runtimeSdkVersion` | string? | `1.0.0` | `@amzn/codewhisperer-runtime` 版本，用于额度查询 / Profile 列表等 auxiliary API User-Agent；省略时使用默认值。获取方式见 [上游指纹获取](#上游指纹获取) |
 | `tlsBackend` | string | `rustls` | TLS 后端：`rustls` 或 `native-tls` |
 | `countTokensApiUrl` | string | - | 外部 count_tokens API 地址 |
 | `countTokensApiKey` | string | - | 外部 count_tokens API 密钥 |
@@ -219,9 +221,7 @@ docker-compose up
 
 以下字段用于对齐 Kiro IDE 发往 AWS 的请求指纹，建议从**已安装 Kiro IDE 的本机**读取，并在 Kiro 升级后重新核对。
 
-**`streamingSdkVersion`**（`@aws/codewhisperer-streaming-client`）
-
-Kiro 将该 SDK 版本打进扩展 bundle，路径因平台而异（`extension.js` 位于 Kiro 安装目录下）：
+Kiro 将各 SDK 版本打进扩展 bundle，路径因平台而异（`extension.js` 位于 Kiro 安装目录下）：
 
 | 平台 | `extension.js` 路径 |
 | --- | --- |
@@ -229,7 +229,9 @@ Kiro 将该 SDK 版本打进扩展 bundle，路径因平台而异（`extension.j
 | Windows | `%LOCALAPPDATA%\Programs\Kiro\resources\app\extensions\kiro.kiro-agent\dist\extension.js`（例：`C:\Users\你\AppData\Local\Programs\Kiro\...`） |
 | Linux | `/usr/share/kiro/resources/app/extensions/kiro.kiro-agent/dist/extension.js` 或 `~/.local/share/Kiro/resources/app/extensions/kiro.kiro-agent/dist/extension.js`（视安装方式而定） |
 
-命令行提取版本（将 `$EXT` 换成上表实际路径）：
+下文命令均将 `$EXT` 替换为上表实际路径。
+
+**`streamingSdkVersion`**（`@aws/codewhisperer-streaming-client`，主 API / MCP）
 
 ```bash
 # macOS / Linux
@@ -241,9 +243,35 @@ grep -A6 'codewhisperer-streaming-client/package.json' "$EXT" | grep 'version:'
 Select-String -Path "$env:LOCALAPPDATA\Programs\Kiro\resources\app\extensions\kiro.kiro-agent\dist\extension.js" -Pattern 'codewhisperer-streaming-client/package.json' -Context 0,6 | Select-String 'version:'
 ```
 
-输出中的 `version: "1.0.39"` 即为 `streamingSdkVersion` 应填写的值（引号内 semver）。
+输出中的 `version: "1.0.39"` 即为应填写的 semver。抓包备选：Kiro IDE 发对话时，从 `User-Agent` 读取 `api/codewhispererstreaming#1.0.39` 的 `#` 后缀。
 
-若无法访问安装目录，可在 Kiro IDE 里发一条对话后抓包，从请求头 `User-Agent` 中读取 `api/codewhispererstreaming#1.0.39` 的 `#` 后缀。
+**`ssoOidcSdkVersion`**（`@aws-sdk/client-sso-oidc`，IdC Token 刷新）
+
+```bash
+# macOS / Linux
+grep -A6 'client-sso-oidc/package.json' "$EXT" | grep 'version:'
+```
+
+```powershell
+# Windows PowerShell
+Select-String -Path "$env:LOCALAPPDATA\Programs\Kiro\resources\app\extensions\kiro.kiro-agent\dist\extension.js" -Pattern 'client-sso-oidc/package.json' -Context 0,6 | Select-String 'version:'
+```
+
+输出中的 `version: "3.980.0"` 即为应填写的 semver。抓包备选：IdC 凭据 Token 过期触发刷新时，请求发往 `oidc.{region}.amazonaws.com/token`，从 `User-Agent` 读取 `api/sso-oidc#3.980.0` 的 `#` 后缀。
+
+**`runtimeSdkVersion`**（`@amzn/codewhisperer-runtime`，额度查询 / Profile 列表）
+
+```bash
+# macOS / Linux
+grep -A6 'codewhisperer-runtime/package.json' "$EXT" | grep 'version:'
+```
+
+```powershell
+# Windows PowerShell
+Select-String -Path "$env:LOCALAPPDATA\Programs\Kiro\resources\app\extensions\kiro.kiro-agent\dist\extension.js" -Pattern 'codewhisperer-runtime/package.json' -Context 0,6 | Select-String 'version:'
+```
+
+输出中的 `version: "1.0.0"` 即为应填写的 semver。抓包备选：在 Admin 界面查看凭据余额，或 Kiro IDE 打开用量面板时，从 `getUsageLimits` 请求的 `User-Agent` 读取 `api/codewhispererruntime#1.0.0` 的 `#` 后缀。
 
 **其他指纹字段（简要）**
 
@@ -269,6 +297,8 @@ Select-String -Path "$env:LOCALAPPDATA\Programs\Kiro\resources\app\extensions\ki
    "systemVersion": "darwin#24.6.0",
    "nodeVersion": "22.21.1",
    "streamingSdkVersion": "1.0.39",
+   "ssoOidcSdkVersion": "3.980.0",
+   "runtimeSdkVersion": "1.0.0",
    "authRegion": "us-east-1",
    "apiRegion": "us-east-1",
    "countTokensApiUrl": "https://api.example.com/v1/messages/count_tokens",

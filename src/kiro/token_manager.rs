@@ -275,10 +275,11 @@ async fn refresh_idc_token(
     let os_name = &config.system_version;
     let node_version = &config.node_version;
 
-    let x_amz_user_agent = "aws-sdk-js/3.980.0 KiroIDE";
+    let x_amz_user_agent = format!("aws-sdk-js/{} KiroIDE", config.effective_sso_oidc_sdk_version());
+    let sso_oidc_ver = config.effective_sso_oidc_sdk_version();
     let user_agent = format!(
-        "aws-sdk-js/3.980.0 ua/2.1 os/{} lang/js md/nodejs#{} api/sso-oidc#3.980.0 m/E KiroIDE",
-        os_name, node_version
+        "aws-sdk-js/{} ua/2.1 os/{} lang/js md/nodejs#{} api/sso-oidc#{} m/E KiroIDE",
+        sso_oidc_ver, os_name, node_version, sso_oidc_ver
     );
 
     let client = build_client(proxy, 60, config.tls_backend)?;
@@ -378,13 +379,14 @@ pub(crate) async fn get_usage_limits(
     }
 
     // 构建 User-Agent headers
+    let runtime_ver = config.effective_runtime_sdk_version();
     let user_agent = format!(
-        "aws-sdk-js/1.0.0 ua/2.1 os/{} lang/js md/nodejs#{} api/codewhispererruntime#1.0.0 m/N,E KiroIDE-{}-{}",
-        os_name, node_version, kiro_version, machine_id
+        "aws-sdk-js/{} ua/2.1 os/{} lang/js md/nodejs#{} api/codewhispererruntime#{} m/N,E KiroIDE-{}-{}",
+        runtime_ver, os_name, node_version, runtime_ver, kiro_version, machine_id
     );
     let amz_user_agent = format!(
-        "aws-sdk-js/1.0.0 KiroIDE-{}-{}",
-        kiro_version, machine_id
+        "aws-sdk-js/{} KiroIDE-{}-{}",
+        runtime_ver, kiro_version, machine_id
     );
 
     let client = build_client(proxy, 60, config.tls_backend)?;
@@ -400,7 +402,7 @@ pub(crate) async fn get_usage_limits(
         .header("Connection", "close");
 
     if credentials.is_api_key_credential() {
-        request = request.header("tokentype", "API_KEY");
+        request = request.header("TokenType", "API_KEY");
     }
 
     let response = request.send().await?;
@@ -497,11 +499,15 @@ async fn list_available_profile_in_region(
 
     let url = format!("https://{}/", host);
 
+    let runtime_ver = config.effective_runtime_sdk_version();
     let user_agent = format!(
-        "aws-sdk-js/1.0.0 ua/2.1 os/{} lang/js md/nodejs#{} api/codewhisperer#1.0.0 m/N,E KiroIDE-{}-{}",
-        os_name, node_version, kiro_version, machine_id
+        "aws-sdk-js/{} ua/2.1 os/{} lang/js md/nodejs#{} api/codewhisperer#{} m/N,E KiroIDE-{}-{}",
+        runtime_ver, os_name, node_version, runtime_ver, kiro_version, machine_id
     );
-    let amz_user_agent = format!("aws-sdk-js/1.0.0 KiroIDE-{}-{}", kiro_version, machine_id);
+    let amz_user_agent = format!(
+        "aws-sdk-js/{} KiroIDE-{}-{}",
+        runtime_ver, kiro_version, machine_id
+    );
 
     let client = build_client(proxy, 60, config.tls_backend)?;
 
@@ -523,7 +529,7 @@ async fn list_available_profile_in_region(
         .body(r#"{"maxResults":10}"#);
 
     if credentials.is_api_key_credential() {
-        request = request.header("tokentype", "API_KEY");
+        request = request.header("TokenType", "API_KEY");
     }
 
     let response = request.send().await?;
