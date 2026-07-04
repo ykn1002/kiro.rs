@@ -12,3 +12,9 @@ services:
     volumes:
       - ./config/:/app/config/
     restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://127.0.0.1:8990/healthz"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
