@@ -446,7 +446,9 @@ impl AdminService {
         new_config.credential_rpm_opus = req.credential_rpm_opus;
         new_config.credential_rpm_sonnet = req.credential_rpm_sonnet;
         new_config.credential_rpm_haiku = req.credential_rpm_haiku;
-        new_config.credential_rpm_max_wait_ms = req.credential_rpm_max_wait_ms;
+        if let Some(max_wait_ms) = req.credential_rpm_max_wait_ms {
+            new_config.credential_rpm_max_wait_ms = max_wait_ms;
+        }
         new_config.kiro_version = req.kiro_version.trim().to_string();
         new_config.system_version = req.system_version.trim().to_string();
         new_config.node_version = req.node_version.trim().to_string();

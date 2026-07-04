@@ -253,9 +253,8 @@ pub struct UpdateAppConfigRequest {
     /// Haiku 专用 RPM
     #[serde(default)]
     pub credential_rpm_haiku: Option<u32>,
-    /// RPM 打满时最多等待毫秒数（0 = 立即 429）
-    #[serde(default)]
-    pub credential_rpm_max_wait_ms: u64,
+    /// RPM 打满时最多等待毫秒数（0 = 立即 429）；缺省时不更新（兼容旧 Admin UI）
+    pub credential_rpm_max_wait_ms: Option<u64>,
     /// Kiro 客户端版本（不能为空）
     pub kiro_version: String,
     /// 系统版本指纹（不能为空）
