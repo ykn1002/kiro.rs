@@ -35,10 +35,28 @@ pub struct KiroRequest {
     /// Profile ARN（可选）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub profile_arn: Option<String>,
+    /// 与 HTTP 头 `x-amzn-kiro-agent-mode` 一致
+    #[serde(default = "default_agent_mode")]
+    pub agent_mode: String,
+}
+
+fn default_agent_mode() -> String {
+    "vibe".to_string()
+}
+
+impl KiroRequest {
+    /// 由转换后的 `ConversationState` 构建上游请求（`profileArn` 由 endpoint 注入）
+    pub fn from_conversation_state(conversation_state: ConversationState) -> Self {
+        Self {
+            conversation_state,
+            profile_arn: None,
+            agent_mode: default_agent_mode(),
+        }
+    }
 }
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::{ConversationState, KiroRequest};
     #[test]
     fn test_kiro_request_deserialize() {
         let json = r#"{
@@ -64,5 +82,12 @@ mod tests {
                 .content,
             "Test message"
         );
+    }
+
+    #[test]
+    fn test_kiro_request_serializes_agent_mode() {
+        let request = KiroRequest::from_conversation_state(ConversationState::new("conv-1"));
+        let json = serde_json::to_string(&request).unwrap();
+        assert!(json.contains("\"agentMode\":\"vibe\""));
     }
 }

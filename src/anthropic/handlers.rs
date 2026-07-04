@@ -286,10 +286,7 @@ async fn handle_messages(
         }
     };
 
-    let kiro_request = KiroRequest {
-        conversation_state: conversion_result.conversation_state,
-        profile_arn: None,
-    };
+    let kiro_request = KiroRequest::from_conversation_state(conversion_result.conversation_state);
 
     let request_body = match serde_json::to_string(&kiro_request) {
         Ok(body) => body,

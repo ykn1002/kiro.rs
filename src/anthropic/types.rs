@@ -107,10 +107,13 @@ fn default_effort() -> String {
 }
 
 /// Claude Code 请求中的 metadata
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Default)]
 pub struct Metadata {
     /// 用户 ID，格式如: user_xxx_account__session_0b4445e1-f5be-49e1-87ce-62bbc28ad705
     pub user_id: Option<String>,
+    /// 代理延续 ID（若客户端显式提供）
+    #[serde(default)]
+    pub continuation_id: Option<String>,
 }
 
 /// Messages 请求体

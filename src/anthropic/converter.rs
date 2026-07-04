@@ -391,6 +391,39 @@ fn is_valid_uuid(s: &str) -> bool {
     s.len() == 36 && s.chars().filter(|c| *c == '-').count() == 4
 }
 
+/// 从 metadata 提取 agentContinuationId（无则返回 None，不伪造 UUID）
+pub(crate) fn extract_continuation_id(metadata: &super::types::Metadata) -> Option<String> {
+    if let Some(ref cid) = metadata.continuation_id {
+        let trimmed = cid.trim();
+        if !trimmed.is_empty() {
+            return Some(trimmed.to_string());
+        }
+    }
+
+    if let Some(ref user_id) = metadata.user_id {
+        if let Ok(json) = serde_json::from_str::<serde_json::Value>(user_id) {
+            if let Some(cid) = json.get("continuation_id").and_then(|v| v.as_str()) {
+                let trimmed = cid.trim();
+                if !trimmed.is_empty() {
+                    return Some(trimmed.to_string());
+                }
+            }
+        }
+
+        if let Some(pos) = user_id.find("continuation_") {
+            let part = &user_id[pos + 13..];
+            if part.len() >= 36 {
+                let uuid_str = &part[..36];
+                if is_valid_uuid(uuid_str) {
+                    return Some(uuid_str.to_string());
+                }
+            }
+        }
+    }
+
+    None
+}
+
 /// 从 OpenAI/Codex 请求的额外字段构建 metadata（用于会话 continuity）
 pub(crate) fn metadata_from_openai_extra(
     extra: &HashMap<String, serde_json::Value>,
@@ -398,15 +431,25 @@ pub(crate) fn metadata_from_openai_extra(
     use super::types::Metadata;
 
     if let Some(meta_val) = extra.get("metadata") {
-        if let Some(uid) = meta_val.get("user_id").and_then(|v| v.as_str()) {
+        let user_id = meta_val
+            .get("user_id")
+            .and_then(|v| v.as_str())
+            .map(String::from);
+        let continuation_id = meta_val
+            .get("continuation_id")
+            .and_then(|v| v.as_str())
+            .map(String::from);
+        if user_id.is_some() || continuation_id.is_some() {
             return Some(Metadata {
-                user_id: Some(uid.to_string()),
+                user_id,
+                continuation_id,
             });
         }
         if let Some(sid) = meta_val.get("session_id").and_then(|v| v.as_str()) {
             if is_valid_uuid(sid) {
                 return Some(Metadata {
                     user_id: Some(format!("user_codex_account__session_{sid}")),
+                    ..Default::default()
                 });
             }
         }
@@ -416,6 +459,7 @@ pub(crate) fn metadata_from_openai_extra(
         if !user.is_empty() {
             return Some(Metadata {
                 user_id: Some(user.to_string()),
+                ..Default::default()
             });
         }
     }
@@ -424,6 +468,7 @@ pub(crate) fn metadata_from_openai_extra(
         if is_valid_uuid(sid) {
             return Some(Metadata {
                 user_id: Some(format!("user_codex_account__session_{sid}")),
+                ..Default::default()
             });
         }
     }
@@ -436,6 +481,7 @@ pub(crate) fn metadata_from_openai_extra(
         if is_valid_uuid(raw) {
             return Some(Metadata {
                 user_id: Some(format!("user_codex_account__session_{raw}")),
+                ..Default::default()
             });
         }
     }
@@ -538,7 +584,10 @@ fn convert_request_inner(
         .and_then(|m| m.user_id.as_ref())
         .and_then(|user_id| extract_session_id(user_id))
         .unwrap_or_else(|| Uuid::new_v4().to_string());
-    let agent_continuation_id = Uuid::new_v4().to_string();
+    let agent_continuation_id = req
+        .metadata
+        .as_ref()
+        .and_then(extract_continuation_id);
 
     // 4. 确定触发类型
     let chat_trigger_type = determine_chat_trigger_type(req);
@@ -611,12 +660,14 @@ fn convert_request_inner(
     let current_message = CurrentMessage::new(user_input);
 
     // 13. 构建 ConversationState
-    let conversation_state = ConversationState::new(conversation_id)
-        .with_agent_continuation_id(agent_continuation_id)
+    let mut conversation_state = ConversationState::new(conversation_id)
         .with_agent_task_type("vibe")
         .with_chat_trigger_type(chat_trigger_type)
         .with_current_message(current_message)
         .with_history(history);
+    if let Some(id) = agent_continuation_id {
+        conversation_state = conversation_state.with_agent_continuation_id(id);
+    }
 
     if !tool_name_map.is_empty() {
         tracing::info!("工具名称映射: {} 个超长名称已缩短", tool_name_map.len());
@@ -1732,6 +1783,7 @@ mod tests {
                 user_id: Some(
                     "user_0dede55c6dcc4a11a30bbb5e7f22e6fdf86cdeba3820019cc27612af4e1243cd_account__session_a0662283-7fd3-4399-a7eb-52b9a717ae88".to_string(),
                 ),
+                ..Default::default()
             }),
         };
 
@@ -1774,6 +1826,70 @@ mod tests {
                 .filter(|c| *c == '-')
                 .count(),
             4
+        );
+        assert!(
+            result.conversation_state.agent_continuation_id.is_none(),
+            "无 continuation metadata 时不应伪造 agentContinuationId"
+        );
+    }
+
+    #[test]
+    fn test_extract_continuation_id_from_metadata_field() {
+        use super::super::types::Metadata;
+
+        let meta = Metadata {
+            continuation_id: Some("cont-abc".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(
+            extract_continuation_id(&meta),
+            Some("cont-abc".to_string())
+        );
+    }
+
+    #[test]
+    fn test_extract_continuation_id_from_user_id_suffix() {
+        use super::super::types::Metadata;
+
+        let meta = Metadata {
+            user_id: Some(
+                "user_x_account__continuation_0b4445e1-f5be-49e1-87ce-62bbc28ad705".to_string(),
+            ),
+            ..Default::default()
+        };
+        assert_eq!(
+            extract_continuation_id(&meta),
+            Some("0b4445e1-f5be-49e1-87ce-62bbc28ad705".to_string())
+        );
+    }
+
+    #[test]
+    fn test_convert_request_with_continuation_metadata() {
+        use super::super::types::{Message as AnthropicMessage, Metadata};
+
+        let req = MessagesRequest {
+            model: "claude-sonnet-4-6".to_string(),
+            max_tokens: 1024,
+            messages: vec![AnthropicMessage {
+                role: "user".to_string(),
+                content: serde_json::json!("Hello"),
+            }],
+            stream: false,
+            system: None,
+            tools: None,
+            tool_choice: None,
+            thinking: None,
+            output_config: None,
+            metadata: Some(Metadata {
+                continuation_id: Some("0b4445e1-f5be-49e1-87ce-62bbc28ad705".to_string()),
+                ..Default::default()
+            }),
+        };
+
+        let result = convert_request(&req).unwrap();
+        assert_eq!(
+            result.conversation_state.agent_continuation_id,
+            Some("0b4445e1-f5be-49e1-87ce-62bbc28ad705".to_string())
         );
     }
 
