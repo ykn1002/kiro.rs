@@ -178,7 +178,7 @@ docker-compose up
 | `authRegion` | string | - | Auth Region（用于 Token 刷新），未配置时回退到 region |
 | `apiRegion` | string | - | API Region（用于 API 请求），未配置时回退到 region |
 | `kiroVersion` | string | `0.9.2` | Kiro 版本号 |
-| `machineId` | string | - | 自定义机器码（64位十六进制），不定义则自动生成 |
+| `machineId` | string | - | 全局设备 ID（64 位 hex 或 UUID）。未配置时按凭据 refreshToken 派生。从本机 Kiro IDE 读取：macOS `~/Library/Application Support/Kiro/machineid`；Windows `%APPDATA%\Kiro\machineId`；Linux `~/.config/Kiro/machineid` |
 | `systemVersion` | string | 随机 | 系统版本标识 |
 | `nodeVersion` | string | `22.21.1` | Node.js 版本标识 |
 | `tlsBackend` | string | `rustls` | TLS 后端：`rustls` 或 `native-tls` |
@@ -301,7 +301,7 @@ docker-compose up
 | `region`       | string | 凭据级 Auth Region, 兼容字段                       |
 | `authRegion`   | string | 凭据级 Auth Region，用于 Token 刷新, 未配置时回退到 region |
 | `apiRegion`    | string | 凭据级 API Region，用于 API 请求                    |
-| `machineId`    | string | 凭据级机器码（64位十六进制）                             |
+| `machineId`    | string | 凭据级设备 ID（可选；优先于 config 全局值）。来源路径同 config.machineId |
 | `email`        | string | 用户邮箱（可选，从 API 获取）                           |
 | `proxyUrl`     | string | 凭据级代理 URL（可选，特殊值 `direct` 表示不使用代理）       |
 | `proxyUsername`| string | 凭据级代理用户名（可选）                                |

@@ -12,6 +12,7 @@ import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { useAppConfig, useUpdateAppConfig } from '@/hooks/use-credentials'
 import { extractErrorMessage } from '@/lib/utils'
+import { MachineIdHint } from '@/components/machine-id-hint'
 import type { ModelDef } from '@/types/api'
 
 interface SettingsDialogProps {
@@ -351,10 +352,7 @@ export function SettingsDialog({ open, onOpenChange }: SettingsDialogProps) {
                     />
                   </div>
                 </div>
-                <p className="text-xs text-muted-foreground">
-                  对齐本机 Kiro：macOS 可读 ~/Library/Application Support/Kiro/machineid。
-                  凭据级 machineId 优先于全局。仅影响后续新发起的上游请求与 Token 刷新
-                </p>
+                <MachineIdHint scope="global" />
               </section>
 
               {/* OpenAI/Codex 模型映射 */}

@@ -11,6 +11,7 @@ import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { useAddCredential } from '@/hooks/use-credentials'
 import { extractErrorMessage } from '@/lib/utils'
+import { MachineIdHint } from '@/components/machine-id-hint'
 
 interface AddCredentialDialogProps {
   open: boolean
@@ -256,8 +257,9 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
                 disabled={isPending}
               />
               <p className="text-xs text-muted-foreground">
-                可选，64 位十六进制字符串，留空使用配置中字段, 否则由刷新Token自动派生
+                可选；64 位十六进制或 UUID
               </p>
+              <MachineIdHint scope="credential" />
             </div>
 
             {/* 端点 */}
