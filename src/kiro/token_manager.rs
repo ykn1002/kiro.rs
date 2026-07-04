@@ -297,7 +297,7 @@ async fn refresh_idc_token(
         .header("user-agent", &user_agent)
         .header("host", format!("oidc.{}.amazonaws.com", region))
         .header("amz-sdk-invocation-id", uuid::Uuid::new_v4().to_string())
-        .header("amz-sdk-request", "attempt=1; max=4")
+        .header("amz-sdk-request", "attempt=1; max=3")
         .header("Connection", "close")
         .json(&body)
         .send()

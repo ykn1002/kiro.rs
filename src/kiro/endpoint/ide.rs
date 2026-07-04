@@ -93,6 +93,8 @@ impl KiroEndpoint for IdeEndpoint {
 
     fn decorate_mcp(&self, req: RequestBuilder, ctx: &RequestContext<'_>) -> RequestBuilder {
         let mut req = req
+            .header("x-amzn-codewhisperer-optout", "true")
+            .header("x-amzn-kiro-agent-mode", "vibe")
             .header("x-amz-user-agent", self.x_amz_user_agent(ctx))
             .header("user-agent", self.user_agent(ctx))
             .header("host", self.host(ctx))
