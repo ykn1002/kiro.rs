@@ -12,7 +12,6 @@ import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { useAppConfig, useUpdateAppConfig } from '@/hooks/use-credentials'
 import { extractErrorMessage } from '@/lib/utils'
-import { MachineIdHint } from '@/components/machine-id-hint'
 import type { ModelDef } from '@/types/api'
 
 interface SettingsDialogProps {
@@ -365,14 +364,10 @@ export function SettingsDialog({ open, onOpenChange }: SettingsDialogProps) {
                       value={machineId}
                       onChange={(e) => setMachineId(e.target.value)}
                       disabled={isPending}
-                      placeholder="64 位 hex 或 UUID；留空则清除，新增凭据时回退到 refreshToken 派生"
+                      placeholder="64 位 hex 或 UUID"
                     />
                   </div>
                 </div>
-                <p className="text-xs text-muted-foreground">
-                  streamingSdkVersion 对应 Kiro IDE 内置 <code className="text-foreground/80">@aws/codewhisperer-streaming-client</code> 版本，用于主 API / MCP 的 aws-sdk-js User-Agent。
-                </p>
-                <MachineIdHint scope="global" />
               </section>
 
               {/* OpenAI/Codex 模型映射 */}
