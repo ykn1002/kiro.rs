@@ -32,15 +32,22 @@ pub struct AppState {
     pub kiro_provider: Option<Arc<KiroProvider>>,
     /// 是否开启非流式响应的 thinking 块提取
     pub extract_thinking: bool,
+    /// 是否在 429 响应中向客户端透传 `Retry-After`
+    pub passthrough_retry_after: bool,
 }
 
 impl AppState {
     /// 创建新的应用状态
-    pub fn new(api_key: SharedApiKey, extract_thinking: bool) -> Self {
+    pub fn new(
+        api_key: SharedApiKey,
+        extract_thinking: bool,
+        passthrough_retry_after: bool,
+    ) -> Self {
         Self {
             api_key,
             kiro_provider: None,
             extract_thinking,
+            passthrough_retry_after,
         }
     }
 

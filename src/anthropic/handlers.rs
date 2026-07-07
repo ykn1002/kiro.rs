@@ -32,7 +32,7 @@ use super::types::{
 use super::websearch;
 
 /// 将 KiroProvider 错误映射为 HTTP 响应
-fn map_provider_error(err: Error) -> Response {
+fn map_provider_error(err: Error, passthrough_retry_after: bool) -> Response {
     let err_str = err.to_string();
 
     // 上下文窗口满了（对话历史累积超出模型上下文窗口限制）
@@ -75,12 +75,11 @@ fn map_provider_error(err: Error) -> Response {
                     )),
                 )
                     .into_response();
-                if let Some(ra) = api_err.retry_after {
-                    if let Ok(value) = header::HeaderValue::from_str(&ra.as_secs().max(1).to_string())
-                    {
-                        resp.headers_mut().insert(header::RETRY_AFTER, value);
-                    }
-                }
+                crate::common::provider_error::insert_retry_after_header(
+                    &mut resp,
+                    api_err.retry_after,
+                    passthrough_retry_after,
+                );
                 return resp;
             }
             402 => {
@@ -330,6 +329,7 @@ async fn handle_messages(
             thinking_enabled,
             tool_name_map,
             delay_message_start,
+            state.passthrough_retry_after,
         )
         .await
     } else {
@@ -340,6 +340,7 @@ async fn handle_messages(
             input_tokens,
             thinking_enabled,
             tool_name_map,
+            state.passthrough_retry_after,
         )
         .await
     }
@@ -354,10 +355,11 @@ async fn handle_stream_request(
     thinking_enabled: bool,
     tool_name_map: std::collections::HashMap<String, String>,
     delay_message_start: bool,
+    passthrough_retry_after: bool,
 ) -> Response {
     let response = match provider.call_api_stream(request_body, Some(model)).await {
         Ok(resp) => resp,
-        Err(e) => return map_provider_error(e),
+        Err(e) => return map_provider_error(e, passthrough_retry_after),
     };
 
     let ctx = StreamContext::new_with_thinking(
@@ -504,11 +506,12 @@ async fn handle_non_stream_request(
     input_tokens: i32,
     thinking_enabled: bool,
     tool_name_map: std::collections::HashMap<String, String>,
+    passthrough_retry_after: bool,
 ) -> Response {
     // 调用 Kiro API（支持多凭据故障转移）
     let response = match provider.call_api(request_body, Some(model)).await {
         Ok(resp) => resp,
-        Err(e) => return map_provider_error(e),
+        Err(e) => return map_provider_error(e, passthrough_retry_after),
     };
 
     // 读取响应体
@@ -787,12 +790,24 @@ mod tests {
             message: "流式 API 请求失败: 429 Too Many Requests".to_string(),
             retry_after: Some(Duration::from_secs(30)),
         });
-        let resp = map_provider_error(err);
+        let resp = map_provider_error(err, true);
         assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
         assert_eq!(
             resp.headers().get(header::RETRY_AFTER).and_then(|v| v.to_str().ok()),
             Some("30")
         );
+    }
+
+    #[test]
+    fn test_map_provider_error_429_omits_retry_after_when_disabled() {
+        let err = anyhow::Error::new(UpstreamApiError {
+            status: 429,
+            message: "流式 API 请求失败: 429 Too Many Requests".to_string(),
+            retry_after: Some(Duration::from_secs(30)),
+        });
+        let resp = map_provider_error(err, false);
+        assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert!(resp.headers().get(header::RETRY_AFTER).is_none());
     }
 
     #[test]
@@ -802,7 +817,7 @@ mod tests {
             message: "local credential RPM limit exceeded (8/min)".to_string(),
             retry_after: Some(Duration::from_secs(12)),
         });
-        let resp = map_provider_error(err);
+        let resp = map_provider_error(err, true);
         assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
         assert_eq!(
             resp.headers().get(header::RETRY_AFTER).and_then(|v| v.to_str().ok()),
@@ -817,7 +832,7 @@ mod tests {
             message: "流式 API 请求失败（所有凭据已用尽）: 402".to_string(),
             retry_after: None,
         });
-        let resp = map_provider_error(err);
+        let resp = map_provider_error(err, true);
         assert_eq!(resp.status(), StatusCode::PAYMENT_REQUIRED);
     }
 
@@ -829,21 +844,21 @@ mod tests {
             message: "流式 API 请求失败: 403 Forbidden".to_string(),
             retry_after: None,
         });
-        let resp = map_provider_error(err);
+        let resp = map_provider_error(err, true);
         assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
     }
 
     #[test]
     fn test_map_provider_error_plain_error_is_502() {
         let err = anyhow::anyhow!("网络发送失败");
-        let resp = map_provider_error(err);
+        let resp = map_provider_error(err, true);
         assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
     }
 
     #[test]
     fn test_map_provider_error_context_full_is_400() {
         let err = anyhow::anyhow!("xxx CONTENT_LENGTH_EXCEEDS_THRESHOLD yyy");
-        let resp = map_provider_error(err);
+        let resp = map_provider_error(err, true);
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
     }
 }

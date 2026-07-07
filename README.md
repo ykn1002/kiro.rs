@@ -198,6 +198,7 @@ docker-compose up
 | `credentialRpmSonnet` | number | - | 单凭据 Sonnet 模型专用 RPM，未配置时回退到 `credentialRpm` |
 | `credentialRpmHaiku` | number | - | 单凭据 Haiku 模型专用 RPM，未配置时回退到 `credentialRpm` |
 | `credentialRpmMaxWaitMs` | number | `0` | 当所有可用凭据都达到 RPM 上限时，请求发出前最多等待的毫秒数（平滑突发）。`0` 表示不等待，立即向客户端返回 **429**。大于 0 时先等待至多该时长，仍无空位再返回 429。等待不消耗上游重试次数 |
+| `passthroughRetryAfter` | boolean | `false` | 向客户端透传 429 时是否附带 `Retry-After` 响应头（上游或本地 RPM 计算的等待秒数）。默认关闭，避免部分客户端按大值长时间退避 |
 | `extractThinking` | boolean | `true` | 非流式响应的 thinking 块提取。启用后 `<thinking>` 标签会被解析为独立的 `thinking` 内容块 |
 | `defaultEndpoint` | string | `ide` | 默认 Kiro 端点。凭据未显式指定 `endpoint` 时使用。当前支持：`ide` |
 | `models` | array | 内置默认表 | 模型列表（驱动 `/v1/models` 展示、模型名映射、上下文窗口判断）。未配置时使用内置默认表，**完全向后兼容**；一旦提供则整张表以配置为准。每项字段见下方说明 |

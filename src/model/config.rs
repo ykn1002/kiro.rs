@@ -174,6 +174,12 @@ pub struct Config {
     #[serde(default)]
     pub credential_rpm_max_wait_ms: u64,
 
+    /// 是否在向客户端透传 429 时附带 `Retry-After` 响应头（默认 false）
+    ///
+    /// 开启后会把上游或本地 RPM 计算的等待秒数写入响应头；部分客户端会据此长时间退避。
+    #[serde(default)]
+    pub passthrough_retry_after: bool,
+
     /// 是否开启非流式响应的 thinking 块提取（默认 true）
     ///
     /// 启用后，非流式响应中的 `<thinking>...</thinking>` 标签会被解析为
@@ -377,6 +383,7 @@ impl Default for Config {
             credential_rpm_sonnet: None,
             credential_rpm_haiku: None,
             credential_rpm_max_wait_ms: 0,
+            passthrough_retry_after: false,
             extract_thinking: default_extract_thinking(),
             default_endpoint: default_endpoint(),
             endpoints: HashMap::new(),

@@ -131,6 +131,7 @@ pub async fn chat_completions(
             thinking_enabled,
             tool_name_map,
             include_usage,
+            state.passthrough_retry_after,
         )
         .await
     } else {
@@ -141,6 +142,7 @@ pub async fn chat_completions(
             input_tokens,
             thinking_enabled,
             tool_name_map,
+            state.passthrough_retry_after,
         )
         .await
     }
@@ -223,10 +225,11 @@ async fn handle_stream_request(
     thinking_enabled: bool,
     tool_name_map: std::collections::HashMap<String, String>,
     include_usage: bool,
+    passthrough_retry_after: bool,
 ) -> Response {
     let response = match provider.call_api_stream(request_body, Some(model)).await {
         Ok(r) => r,
-        Err(e) => return map_provider_error(e),
+        Err(e) => return map_provider_error(e, passthrough_retry_after),
     };
 
     let ctx = OpenAiStreamContext::new(model, input_tokens, thinking_enabled, tool_name_map);
@@ -347,10 +350,11 @@ async fn handle_non_stream_request(
     input_tokens: i32,
     thinking_enabled: bool,
     tool_name_map: std::collections::HashMap<String, String>,
+    passthrough_retry_after: bool,
 ) -> Response {
     let response = match provider.call_api(request_body, Some(model)).await {
         Ok(r) => r,
-        Err(e) => return map_provider_error(e),
+        Err(e) => return map_provider_error(e, passthrough_retry_after),
     };
 
     let body_bytes = match response.bytes().await {
@@ -508,7 +512,7 @@ async fn handle_non_stream_request(
     (StatusCode::OK, Json(resp)).into_response()
 }
 
-pub(crate) fn map_provider_error(err: Error) -> Response {
+pub(crate) fn map_provider_error(err: Error, passthrough_retry_after: bool) -> Response {
     let err_str = err.to_string();
 
     if err_str.contains("CONTENT_LENGTH_EXCEEDS_THRESHOLD") {
@@ -544,12 +548,11 @@ pub(crate) fn map_provider_error(err: Error) -> Response {
                     )),
                 )
                     .into_response();
-                if let Some(ra) = api_err.retry_after {
-                    if let Ok(value) = header::HeaderValue::from_str(&ra.as_secs().max(1).to_string())
-                    {
-                        resp.headers_mut().insert(header::RETRY_AFTER, value);
-                    }
-                }
+                crate::common::provider_error::insert_retry_after_header(
+                    &mut resp,
+                    api_err.retry_after,
+                    passthrough_retry_after,
+                );
                 return resp;
             }
             402 => {

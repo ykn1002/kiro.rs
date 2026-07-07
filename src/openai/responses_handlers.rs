@@ -148,6 +148,7 @@ pub async fn create_response(
             input_tokens,
             thinking_enabled,
             tool_name_map,
+            state.passthrough_retry_after,
         )
         .await
     } else {
@@ -158,6 +159,7 @@ pub async fn create_response(
             input_tokens,
             thinking_enabled,
             tool_name_map,
+            state.passthrough_retry_after,
         )
         .await
     }
@@ -170,10 +172,11 @@ async fn handle_responses_stream(
     input_tokens: i32,
     thinking_enabled: bool,
     tool_name_map: std::collections::HashMap<String, String>,
+    passthrough_retry_after: bool,
 ) -> Response {
     let response = match provider.call_api_stream(request_body, Some(model)).await {
         Ok(r) => r,
-        Err(e) => return map_provider_error(e),
+        Err(e) => return map_provider_error(e, passthrough_retry_after),
     };
 
     let mut ctx = ResponsesStreamContext::new(model, input_tokens, thinking_enabled, tool_name_map);
@@ -278,10 +281,11 @@ async fn handle_responses_non_stream(
     input_tokens: i32,
     thinking_enabled: bool,
     tool_name_map: std::collections::HashMap<String, String>,
+    passthrough_retry_after: bool,
 ) -> Response {
     let response = match provider.call_api(request_body, Some(model)).await {
         Ok(r) => r,
-        Err(e) => return map_provider_error(e),
+        Err(e) => return map_provider_error(e, passthrough_retry_after),
     };
 
     let body_bytes = match response.bytes().await {
