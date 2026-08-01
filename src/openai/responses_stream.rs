@@ -3,7 +3,7 @@
 use std::collections::HashMap;
 
 use chrono::Utc;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use uuid::Uuid;
 
 use crate::anthropic::get_context_window_size;
@@ -230,8 +230,7 @@ impl ResponsesStreamContext {
             Event::ToolUse(tool_use) => self.process_tool_use(tool_use),
             Event::ContextUsage(cu) => {
                 let window = get_context_window_size(&self.model);
-                self.input_tokens =
-                    (cu.context_usage_percentage * (window as f64) / 100.0) as i32;
+                self.input_tokens = (cu.context_usage_percentage * (window as f64) / 100.0) as i32;
                 if cu.context_usage_percentage >= 100.0 {
                     self.status = "incomplete".to_string();
                 }
@@ -694,11 +693,7 @@ mod tests {
         let mut ctx = ResponsesStreamContext::new("claude-sonnet-4-6", 10, false, HashMap::new());
         ctx.stream_failed = true;
         let events = ctx.finalize_stream_on_failure();
-        assert!(
-            events
-                .iter()
-                .any(|e| e.event_type == "response.completed")
-        );
+        assert!(events.iter().any(|e| e.event_type == "response.completed"));
         let completed = events
             .iter()
             .find(|e| e.event_type == "response.completed")
@@ -711,10 +706,6 @@ mod tests {
         let mut ctx = ResponsesStreamContext::new("claude-sonnet-4-6", 10, false, HashMap::new());
         ctx.stream_failed = true;
         let events = ctx.generate_final_events();
-        assert!(
-            events
-                .iter()
-                .any(|e| e.event_type == "response.completed")
-        );
+        assert!(events.iter().any(|e| e.event_type == "response.completed"));
     }
 }

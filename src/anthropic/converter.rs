@@ -17,7 +17,7 @@ use crate::kiro::model::requests::conversation::{
 use crate::kiro::model::requests::tool::{
     InputSchema, Tool, ToolResult, ToolSpecification, ToolUseEntry,
 };
-use crate::model::config::{ModelDef, default_models};
+use crate::model::config::{ChunkedWritePolicy, ModelDef, default_models};
 
 use super::types::{ContentBlock, MessagesRequest};
 
@@ -197,10 +197,7 @@ fn append_output_constraints(content: &str, max_tokens: i32) -> String {
 }
 
 /// 根据 Anthropic tool_choice 过滤工具列表
-fn apply_tool_choice(
-    tool_choice: &Option<serde_json::Value>,
-    tools: Vec<Tool>,
-) -> Vec<Tool> {
+fn apply_tool_choice(tool_choice: &Option<serde_json::Value>, tools: Vec<Tool>) -> Vec<Tool> {
     let choice_type = tool_choice
         .as_ref()
         .and_then(|v| v.get("type"))
@@ -289,11 +286,33 @@ fn normalize_json_schema(schema: serde_json::Value) -> serde_json::Value {
     serde_json::Value::Object(obj)
 }
 
-/// 追加到 Write 工具 description 末尾的内容
-const WRITE_TOOL_DESCRIPTION_SUFFIX: &str = "- IMPORTANT: If the content to write exceeds 150 lines, you MUST only write the first 50 lines using this tool, then use `Edit` tool to append the remaining content in chunks of no more than 50 lines each. If needed, leave a unique placeholder to help append content. Do NOT attempt to write all content at once.";
+/// 生成追加到 Write 工具 description 末尾的内容
+///
+/// 措辞对齐 Kiro IDE 官方 `fs_write` 的 description：
+/// 「If the content is larger than {WRITE_LIMIT}, use create with part of the
+/// content and then use `fs_append` to add more content.」
+/// 这里把 `fs_append` 替换为 Claude Code 侧实际可用的 `Edit`。
+fn write_tool_description_suffix(trigger_lines: u32, chunk_lines: u32) -> String {
+    format!(
+        "- IMPORTANT: If the content is larger than {trigger_lines} lines, write only part of \
+         the content with this tool, then use `Edit` to append the remaining content in chunks of \
+         {chunk_lines} lines or fewer. If needed, leave a unique placeholder to help append \
+         content. Do NOT attempt to write all content at once."
+    )
+}
 
-/// 追加到 Edit 工具 description 末尾的内容
-const EDIT_TOOL_DESCRIPTION_SUFFIX: &str = "- IMPORTANT: If the `new_string` content exceeds 50 lines, you MUST split it into multiple Edit calls, each replacing no more than 50 lines at a time. If used to append content, leave a unique placeholder to help append content. On the final chunk, do NOT include the placeholder.";
+/// 生成追加到 Edit 工具 description 末尾的内容
+///
+/// 措辞对齐 Kiro IDE 官方截断错误消息中的指令：
+/// 「For edits, use multiple str_replace calls instead of one large edit.」
+fn edit_tool_description_suffix(chunk_lines: u32) -> String {
+    format!(
+        "- IMPORTANT: Limit each edit to {chunk_lines} lines or fewer. If the `new_string` \
+         content is larger, use multiple Edit calls instead of one large edit. If used to append \
+         content, leave a unique placeholder to help append content. On the final chunk, do NOT \
+         include the placeholder."
+    )
+}
 
 /// 追加到系统提示词的分块写入策略
 const SYSTEM_CHUNKED_POLICY: &str = "\
@@ -301,6 +320,38 @@ When the Write or Edit tool has content size limits, always comply silently. \
 Never suggest bypassing these limits via alternative tools. \
 Never ask the user whether to switch approaches. \
 Complete all chunked operations without commentary.";
+
+/// 分块写入策略，由 `main.rs` 启动时及 Admin API 热更新时通过
+/// [`set_chunked_write_policy`] 注入。
+///
+/// 默认关闭：不改写 Write/Edit 工具描述，也不向系统提示词追加分块策略。
+/// 与 [`MODEL_REGISTRY`] 同样采用「全局状态注入」的模式，避免为此在
+/// `convert_request` 及其全部调用方上增加参数。
+static CHUNKED_WRITE_POLICY: RwLock<Option<ChunkedWritePolicy>> = RwLock::new(None);
+
+/// 设置分块写入策略（由配置 `chunkedWritePolicy` 驱动）。
+pub fn set_chunked_write_policy(policy: ChunkedWritePolicy) {
+    *CHUNKED_WRITE_POLICY.write() = Some(policy);
+}
+
+/// 读取生效的分块写入策略；未注入或未启用时返回 `None`。
+fn active_chunked_write_policy() -> Option<ChunkedWritePolicy> {
+    CHUNKED_WRITE_POLICY.read().clone().filter(|p| p.enabled)
+}
+
+/// 读取生效的**每块**行数上限；策略未启用时回退到默认值（与 Kiro 官方一致的 50）。
+///
+/// 供 `/cc` 的截断纠正文本使用——即便未启用注入，截断发生时给出的建议行数也应
+/// 有意义。注意这里必须取 `chunk_lines` 而非 `trigger_lines`：纠正指令的语义是
+/// 「接下来每次写不超过 N 行」，取阈值会让模型按可能被截断的量继续分块。
+pub(super) fn active_chunk_lines() -> u32 {
+    CHUNKED_WRITE_POLICY
+        .read()
+        .as_ref()
+        .filter(|p| p.enabled)
+        .map(|p| p.chunk_lines)
+        .unwrap_or_else(|| ChunkedWritePolicy::default().chunk_lines)
+}
 
 /// 模型映射：将 Anthropic 模型名映射到 Kiro 模型 ID
 ///
@@ -473,10 +524,7 @@ pub(crate) fn metadata_from_openai_extra(
         }
     }
 
-    if let Some(prev) = extra
-        .get("previous_response_id")
-        .and_then(|v| v.as_str())
-    {
+    if let Some(prev) = extra.get("previous_response_id").and_then(|v| v.as_str()) {
         let raw = prev.strip_prefix("resp_").unwrap_or(prev);
         if is_valid_uuid(raw) {
             return Some(Metadata {
@@ -584,10 +632,7 @@ fn convert_request_inner(
         .and_then(|m| m.user_id.as_ref())
         .and_then(|user_id| extract_session_id(user_id))
         .unwrap_or_else(|| Uuid::new_v4().to_string());
-    let agent_continuation_id = req
-        .metadata
-        .as_ref()
-        .and_then(extract_continuation_id);
+    let agent_continuation_id = req.metadata.as_ref().and_then(extract_continuation_id);
 
     // 4. 确定触发类型
     let chat_trigger_type = determine_chat_trigger_type(req);
@@ -993,20 +1038,27 @@ fn convert_tools(
         return Vec::new();
     };
 
+    let chunked_policy = active_chunked_write_policy();
+
     tools
         .iter()
         .map(|t| {
             let mut description = t.description.clone();
 
-            // 对 Write/Edit 工具追加自定义描述后缀
-            let suffix = match t.name.as_str() {
-                "Write" => WRITE_TOOL_DESCRIPTION_SUFFIX,
-                "Edit" => EDIT_TOOL_DESCRIPTION_SUFFIX,
-                _ => "",
-            };
-            if !suffix.is_empty() {
-                description.push('\n');
-                description.push_str(suffix);
+            // 对 Write/Edit 工具追加自定义描述后缀（仅在分块写入策略启用时）
+            if let Some(ref policy) = chunked_policy {
+                let suffix = match t.name.as_str() {
+                    "Write" => Some(write_tool_description_suffix(
+                        policy.trigger_lines,
+                        policy.chunk_lines,
+                    )),
+                    "Edit" => Some(edit_tool_description_suffix(policy.chunk_lines)),
+                    _ => None,
+                };
+                if let Some(suffix) = suffix {
+                    description.push('\n');
+                    description.push_str(&suffix);
+                }
             }
 
             // 限制描述长度为 10000 字符（安全截断 UTF-8，单次遍历）
@@ -1082,8 +1134,12 @@ fn build_history(
             .join("\n");
 
         if !system_content.is_empty() {
-            // 追加分块写入策略与输出 token 上限到系统消息
-            let mut system_content = format!("{}\n{}", system_content, SYSTEM_CHUNKED_POLICY);
+            // 追加分块写入策略（仅在启用时）与输出 token 上限到系统消息
+            let mut system_content = if active_chunked_write_policy().is_some() {
+                format!("{}\n{}", system_content, SYSTEM_CHUNKED_POLICY)
+            } else {
+                system_content
+            };
             system_content = append_output_constraints(&system_content, req.max_tokens);
 
             // 注入thinking标签到系统消息最前面（如果需要且不存在）
@@ -1319,6 +1375,112 @@ mod tests {
 
     /// 全局模型注册表测试互斥锁（避免并行测试互相覆盖）
     static REGISTRY_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    /// 分块写入策略开关测试互斥锁（该开关为全局状态，测试需串行）
+    static CHUNKED_POLICY_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    /// 构造一个包含 Write/Edit 工具的请求，用于分块策略开关测试
+    fn chunked_policy_test_request() -> MessagesRequest {
+        let tool = |name: &str| super::super::types::Tool {
+            tool_type: None,
+            name: name.to_string(),
+            description: format!("{name} a file"),
+            input_schema: HashMap::new(),
+            max_uses: None,
+        };
+        MessagesRequest {
+            model: "claude-sonnet-4-6".to_string(),
+            messages: vec![super::super::types::Message {
+                role: "user".to_string(),
+                content: serde_json::json!("hello"),
+            }],
+            max_tokens: 1024,
+            stream: false,
+            system: Some(vec![super::super::types::SystemMessage {
+                text: "You are a helpful assistant.".to_string(),
+                cache_control: None,
+            }]),
+            tools: Some(vec![tool("Write"), tool("Edit")]),
+            tool_choice: None,
+            thinking: None,
+            output_config: None,
+            metadata: None,
+        }
+    }
+
+    #[test]
+    fn test_chunked_write_policy_disabled_by_default() {
+        let _guard = CHUNKED_POLICY_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        set_chunked_write_policy(ChunkedWritePolicy::default());
+
+        let req = chunked_policy_test_request();
+        let mut tool_name_map = HashMap::new();
+        let tools = convert_tools(&req.tools, &mut tool_name_map);
+
+        // 工具描述不应被追加分块约束
+        for t in &tools {
+            assert!(
+                !t.tool_specification.description.contains("IMPORTANT"),
+                "关闭时不应注入分块约束: {}",
+                t.tool_specification.description
+            );
+        }
+
+        // 系统提示词不应被追加分块策略
+        let result = convert_request(&req).unwrap();
+        let body = serde_json::to_string(&result.conversation_state).unwrap();
+        assert!(!body.contains("comply silently"));
+    }
+
+    #[test]
+    fn test_chunked_write_policy_enabled_uses_configured_limit() {
+        let _guard = CHUNKED_POLICY_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        set_chunked_write_policy(ChunkedWritePolicy {
+            enabled: true,
+            trigger_lines: 300,
+            chunk_lines: 120,
+        });
+
+        let req = chunked_policy_test_request();
+        let mut tool_name_map = HashMap::new();
+        let tools = convert_tools(&req.tools, &mut tool_name_map);
+
+        // Write 描述：阈值用 trigger_lines，块大小用 chunk_lines
+        let write = &tools
+            .iter()
+            .find(|t| t.tool_specification.name == "Write")
+            .unwrap()
+            .tool_specification
+            .description;
+        assert!(write.contains("larger than 300 lines"), "实际: {write}");
+        assert!(write.contains("chunks of 120 lines"), "实际: {write}");
+        assert!(!write.contains("50 lines"), "不应残留默认值: {write}");
+
+        // Edit 描述只受块大小约束，不应出现阈值
+        let edit = &tools
+            .iter()
+            .find(|t| t.tool_specification.name == "Edit")
+            .unwrap()
+            .tool_specification
+            .description;
+        assert!(edit.contains("120 lines or fewer"), "实际: {edit}");
+        assert!(edit.contains("multiple Edit calls"), "实际: {edit}");
+        assert!(!edit.contains("300"), "Edit 不应带触发阈值: {edit}");
+
+        // /cc 截断纠正必须取块大小，取阈值会让模型按可能被截断的量继续分块
+        assert_eq!(active_chunk_lines(), 120);
+
+        let result = convert_request(&req).unwrap();
+        let body = serde_json::to_string(&result.conversation_state).unwrap();
+        assert!(body.contains("comply silently"));
+
+        // 恢复默认，避免影响其他测试
+        set_chunked_write_policy(ChunkedWritePolicy::default());
+    }
 
     #[test]
     fn test_map_model_sonnet() {
@@ -1841,10 +2003,7 @@ mod tests {
             continuation_id: Some("cont-abc".to_string()),
             ..Default::default()
         };
-        assert_eq!(
-            extract_continuation_id(&meta),
-            Some("cont-abc".to_string())
-        );
+        assert_eq!(extract_continuation_id(&meta), Some("cont-abc".to_string()));
     }
 
     #[test]
@@ -2099,13 +2258,15 @@ mod tests {
                 .content,
             " "
         );
-        assert!(result
-            .conversation_state
-            .current_message
-            .user_input_message
-            .user_input_message_context
-            .tool_results
-            .is_empty());
+        assert!(
+            result
+                .conversation_state
+                .current_message
+                .user_input_message
+                .user_input_message_context
+                .tool_results
+                .is_empty()
+        );
     }
 
     #[test]

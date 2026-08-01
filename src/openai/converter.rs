@@ -2,24 +2,24 @@
 
 use std::collections::HashMap;
 
-use crate::anthropic::{ConversionError, map_model, metadata_from_openai_extra};
 use crate::anthropic::types::{Message, MessagesRequest, SystemMessage, Thinking, Tool};
+use crate::anthropic::{ConversionError, map_model, metadata_from_openai_extra};
 
 use super::types::ChatCompletionRequest;
 
 /// 将 OpenAI Chat Completions 请求转换为 Anthropic MessagesRequest
-pub fn to_anthropic_request(req: &ChatCompletionRequest) -> Result<MessagesRequest, ConversionError> {
+pub fn to_anthropic_request(
+    req: &ChatCompletionRequest,
+) -> Result<MessagesRequest, ConversionError> {
     if req.messages.is_empty() {
         return Err(ConversionError::EmptyMessages);
     }
 
     // 校验模型
-    let _ = map_model(&req.model).ok_or_else(|| ConversionError::UnsupportedModel(req.model.clone()))?;
+    let _ = map_model(&req.model)
+        .ok_or_else(|| ConversionError::UnsupportedModel(req.model.clone()))?;
 
-    let max_tokens = req
-        .max_completion_tokens
-        .or(req.max_tokens)
-        .unwrap_or(8192);
+    let max_tokens = req.max_completion_tokens.or(req.max_tokens).unwrap_or(8192);
 
     let (system, messages) = convert_messages(&req.messages)?;
 
@@ -297,7 +297,10 @@ fn convert_tool_choice(tool_choice: &Option<serde_json::Value>) -> Option<serde_
 
 fn infer_thinking_config(
     req: &ChatCompletionRequest,
-) -> (Option<Thinking>, Option<crate::anthropic::types::OutputConfig>) {
+) -> (
+    Option<Thinking>,
+    Option<crate::anthropic::types::OutputConfig>,
+) {
     let model_lower = req.model.to_lowercase();
     let has_thinking_suffix = model_lower.contains("thinking");
     let has_reasoning_effort = req
@@ -431,7 +434,10 @@ mod tests {
         };
 
         let anthropic = to_anthropic_request(&req).unwrap();
-        assert_eq!(anthropic.system.as_ref().unwrap()[0].text, "You are helpful");
+        assert_eq!(
+            anthropic.system.as_ref().unwrap()[0].text,
+            "You are helpful"
+        );
         assert_eq!(anthropic.max_tokens, 2048);
         assert_eq!(anthropic.messages.len(), 3);
     }

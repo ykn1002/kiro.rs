@@ -27,10 +27,7 @@ use super::responses_stream::ResponsesStreamContext;
 use super::responses_types::ResponsesRequest;
 use super::types::ErrorResponse;
 
-fn append_responses_failure_tail(
-    ctx: &mut ResponsesStreamContext,
-    sse_parts: &mut Vec<String>,
-) {
+fn append_responses_failure_tail(ctx: &mut ResponsesStreamContext, sse_parts: &mut Vec<String>) {
     for ev in ctx.finalize_stream_on_failure() {
         sse_parts.push(ev.to_sse_string());
     }
@@ -234,13 +231,14 @@ fn create_responses_sse_stream(
                         }
                     }
 
-                    let bytes: Vec<Result<Bytes, Infallible>> = sse_parts
-                        .into_iter()
-                        .map(|s| Ok(Bytes::from(s)))
-                        .collect();
+                    let bytes: Vec<Result<Bytes, Infallible>> =
+                        sse_parts.into_iter().map(|s| Ok(Bytes::from(s))).collect();
 
                     let stream_failed = ctx.stream_failed;
-                    Some((stream::iter(bytes), (body_stream, ctx, decoder, stream_failed)))
+                    Some((
+                        stream::iter(bytes),
+                        (body_stream, ctx, decoder, stream_failed),
+                    ))
                 }
                 Some(Err(e)) => {
                     tracing::error!("读取响应流失败: {:?}", e);
@@ -252,10 +250,8 @@ fn create_responses_sse_stream(
                         .to_sse_string(),
                     ];
                     append_responses_failure_tail(&mut ctx, &mut sse_parts);
-                    let bytes: Vec<Result<Bytes, Infallible>> = sse_parts
-                        .into_iter()
-                        .map(|s| Ok(Bytes::from(s)))
-                        .collect();
+                    let bytes: Vec<Result<Bytes, Infallible>> =
+                        sse_parts.into_iter().map(|s| Ok(Bytes::from(s))).collect();
                     Some((stream::iter(bytes), (body_stream, ctx, decoder, true)))
                 }
                 None => {
@@ -394,8 +390,7 @@ async fn handle_responses_non_stream(
         reasoning_text = reasoning;
         content_text = remaining;
     } else if content_text.contains("<thinking>") {
-        let (_, remaining) =
-            crate::anthropic::extract_thinking_from_complete_text(&text_content);
+        let (_, remaining) = crate::anthropic::extract_thinking_from_complete_text(&text_content);
         content_text = remaining;
     }
 

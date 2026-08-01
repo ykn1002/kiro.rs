@@ -12,7 +12,9 @@ use crate::kiro::provider::KiroProvider;
 use crate::openai::{chat_completions, create_response};
 
 use super::{
-    handlers::{count_tokens, get_models, healthz, metrics, post_messages, post_messages_cc, readyz},
+    handlers::{
+        count_tokens, get_models, healthz, metrics, post_messages, post_messages_cc, readyz,
+    },
     middleware::{AppState, SharedApiKey, auth_middleware, cors_layer},
 };
 

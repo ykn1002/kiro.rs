@@ -2,8 +2,8 @@
 
 use std::collections::HashMap;
 
-use crate::anthropic::{ConversionError, map_model, metadata_from_openai_extra};
 use crate::anthropic::types::{Message, MessagesRequest, SystemMessage, Thinking, Tool};
+use crate::anthropic::{ConversionError, map_model, metadata_from_openai_extra};
 
 use super::responses_types::ResponsesRequest;
 
@@ -15,7 +15,8 @@ pub fn responses_to_anthropic(req: &ResponsesRequest) -> Result<MessagesRequest,
         return Err(ConversionError::EmptyMessages);
     }
 
-    let _ = map_model(&req.model).ok_or_else(|| ConversionError::UnsupportedModel(req.model.clone()))?;
+    let _ = map_model(&req.model)
+        .ok_or_else(|| ConversionError::UnsupportedModel(req.model.clone()))?;
 
     let max_tokens = req.max_output_tokens.unwrap_or(8192);
 
@@ -147,7 +148,9 @@ fn parse_role_message(role: &str, item: &serde_json::Value) -> ParsedInputItem {
 }
 
 fn normalize_messages(messages: &mut Vec<Message>) {
-    while messages.last().is_some_and(|m| m.role == "user" && message_content_is_empty(&m.content))
+    while messages
+        .last()
+        .is_some_and(|m| m.role == "user" && message_content_is_empty(&m.content))
     {
         messages.pop();
     }
@@ -197,8 +200,7 @@ fn message_content_is_empty(content: &serde_json::Value) -> bool {
 }
 
 fn part_text_is_empty(part: &serde_json::Value) -> bool {
-    response_content_part_to_text(part)
-        .is_none_or(|t| t.trim().is_empty())
+    response_content_part_to_text(part).is_none_or(|t| t.trim().is_empty())
 }
 
 fn is_compaction_item(item: &serde_json::Value) -> bool {
@@ -230,10 +232,9 @@ fn apply_compaction(input: &[serde_json::Value]) -> Vec<serde_json::Value> {
 fn response_content_part_to_text(part: &serde_json::Value) -> Option<String> {
     match part {
         serde_json::Value::String(text) => Some(text.clone()),
-        serde_json::Value::Object(map) => map
-            .get("text")
-            .and_then(|v| v.as_str())
-            .map(str::to_string),
+        serde_json::Value::Object(map) => {
+            map.get("text").and_then(|v| v.as_str()).map(str::to_string)
+        }
         _ => None,
     }
 }
@@ -250,11 +251,7 @@ fn extract_response_content_text(content: Option<&serde_json::Value>) -> Option<
         serde_json::Value::Object(_) => response_content_part_to_text(content).unwrap_or_default(),
         _ => return None,
     };
-    if text.is_empty() {
-        None
-    } else {
-        Some(text)
-    }
+    if text.is_empty() { None } else { Some(text) }
 }
 
 fn convert_response_content(content: Option<&serde_json::Value>) -> serde_json::Value {
@@ -265,7 +262,8 @@ fn convert_response_content(content: Option<&serde_json::Value>) -> serde_json::
     match content {
         serde_json::Value::String(s) => serde_json::Value::String(s.clone()),
         serde_json::Value::Object(part) => {
-            if let Some(text) = response_content_part_to_text(&serde_json::Value::Object(part.clone()))
+            if let Some(text) =
+                response_content_part_to_text(&serde_json::Value::Object(part.clone()))
             {
                 if !text.is_empty() {
                     return serde_json::Value::String(text);
@@ -290,13 +288,11 @@ fn convert_response_content_array(parts: &[serde_json::Value]) -> serde_json::Va
         }
         match typ {
             "input_image" => {
-                let url = part
-                    .get("image_url")
-                    .and_then(|v| {
-                        v.as_str()
-                            .map(str::to_string)
-                            .or_else(|| v.get("url").and_then(|u| u.as_str()).map(str::to_string))
-                    });
+                let url = part.get("image_url").and_then(|v| {
+                    v.as_str()
+                        .map(str::to_string)
+                        .or_else(|| v.get("url").and_then(|u| u.as_str()).map(str::to_string))
+                });
                 if let Some(url) = url {
                     if let Some((media_type, data)) = parse_data_url(&url) {
                         blocks.push(serde_json::json!({
@@ -453,7 +449,10 @@ fn extract_local_shell_tool(item: &serde_json::Value) -> (String, serde_json::Va
 
     let input = match action.get("type").and_then(|v| v.as_str()) {
         Some("exec") => {
-            let command = action.get("command").map(format_shell_command).unwrap_or_default();
+            let command = action
+                .get("command")
+                .map(format_shell_command)
+                .unwrap_or_default();
             let mut obj = serde_json::Map::new();
             obj.insert("command".to_string(), serde_json::Value::String(command));
             if let Some(timeout) = action.get("timeout_ms") {
@@ -487,7 +486,10 @@ fn convert_function_output_item(item: &serde_json::Value) -> Message {
         .and_then(|v| v.as_str())
         .unwrap_or("unknown")
         .to_string();
-    let output = item.get("output").map(extract_output_value).unwrap_or_default();
+    let output = item
+        .get("output")
+        .map(extract_output_value)
+        .unwrap_or_default();
 
     Message {
         role: "user".to_string(),
@@ -549,10 +551,7 @@ fn coalesce_consecutive_messages(messages: &mut Vec<Message>) {
     *messages = merged;
 }
 
-fn merge_message_content(
-    left: &serde_json::Value,
-    right: &serde_json::Value,
-) -> serde_json::Value {
+fn merge_message_content(left: &serde_json::Value, right: &serde_json::Value) -> serde_json::Value {
     use serde_json::json;
     match (left, right) {
         (serde_json::Value::String(a), serde_json::Value::String(b)) => {
@@ -614,7 +613,10 @@ fn convert_response_tools(tools: &Option<Vec<serde_json::Value>>) -> Option<Vec<
     let mut result = Vec::new();
 
     for tool in tools {
-        let typ = tool.get("type").and_then(|v| v.as_str()).unwrap_or("function");
+        let typ = tool
+            .get("type")
+            .and_then(|v| v.as_str())
+            .unwrap_or("function");
         match typ {
             "function" => {
                 let name = tool
@@ -673,10 +675,7 @@ fn convert_response_tools(tools: &Option<Vec<serde_json::Value>>) -> Option<Vec<
                             serde_json::Value::String("object".to_string()),
                         ),
                         ("properties".to_string(), serde_json::json!({})),
-                        (
-                            "required".to_string(),
-                            serde_json::Value::Array(Vec::new()),
-                        ),
+                        ("required".to_string(), serde_json::Value::Array(Vec::new())),
                     ]),
                     max_uses: None,
                 });
@@ -692,7 +691,9 @@ fn convert_response_tools(tools: &Option<Vec<serde_json::Value>>) -> Option<Vec<
     }
 }
 
-fn convert_response_tool_choice(tool_choice: &Option<serde_json::Value>) -> Option<serde_json::Value> {
+fn convert_response_tool_choice(
+    tool_choice: &Option<serde_json::Value>,
+) -> Option<serde_json::Value> {
     let Some(choice) = tool_choice else {
         return None;
     };
@@ -709,7 +710,10 @@ fn convert_response_tool_choice(tool_choice: &Option<serde_json::Value>) -> Opti
 
 fn infer_thinking_from_responses(
     req: &ResponsesRequest,
-) -> (Option<Thinking>, Option<crate::anthropic::types::OutputConfig>) {
+) -> (
+    Option<Thinking>,
+    Option<crate::anthropic::types::OutputConfig>,
+) {
     let model_lower = req.model.to_lowercase();
     let has_thinking_suffix = model_lower.contains("thinking");
 
@@ -819,10 +823,7 @@ mod tests {
         };
         let anthropic = responses_to_anthropic(&req).unwrap();
         assert_eq!(anthropic.messages.len(), 1);
-        assert_eq!(
-            anthropic.messages[0].content.as_str().unwrap(),
-            "你是谁"
-        );
+        assert_eq!(anthropic.messages[0].content.as_str().unwrap(), "你是谁");
     }
 
     #[test]
@@ -877,10 +878,7 @@ mod tests {
         };
         let anthropic = responses_to_anthropic(&req).unwrap();
         assert_eq!(anthropic.messages.len(), 1);
-        assert_eq!(
-            anthropic.messages[0].content.as_str().unwrap(),
-            "真实问题"
-        );
+        assert_eq!(anthropic.messages[0].content.as_str().unwrap(), "真实问题");
     }
 
     #[test]
@@ -1000,9 +998,11 @@ mod tests {
             .iter()
             .find(|m| {
                 m.role == "user"
-                    && m.content
-                        .as_array()
-                        .is_some_and(|arr| arr.iter().any(|b| b.get("type") == Some(&serde_json::Value::String("tool_result".into()))))
+                    && m.content.as_array().is_some_and(|arr| {
+                        arr.iter().any(|b| {
+                            b.get("type") == Some(&serde_json::Value::String("tool_result".into()))
+                        })
+                    })
             })
             .expect("应存在含 tool_result 的 user 消息");
         let merged = tool_user.content.as_array().unwrap();
@@ -1060,10 +1060,12 @@ mod tests {
             .expect("assistant tool_use");
         let tool_use = tool_msg.content.as_array().unwrap()[0].clone();
         assert_eq!(tool_use["name"], "shell");
-        assert!(tool_use["input"]["command"]
-            .as_str()
-            .unwrap()
-            .contains("wttr.in"));
+        assert!(
+            tool_use["input"]["command"]
+                .as_str()
+                .unwrap()
+                .contains("wttr.in")
+        );
     }
 
     #[test]

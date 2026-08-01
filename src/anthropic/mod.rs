@@ -33,8 +33,13 @@ pub mod types;
 pub(crate) use stream::{compute_thinking_signature, extract_thinking_from_complete_text};
 mod websearch;
 
-pub use converter::{init_model_mapping, init_model_registry, set_model_registry};
-pub(crate) use converter::{ConversionError, convert_request, convert_responses_request, conversion_error_parts, get_context_window_size, map_model, metadata_from_openai_extra, normalize_tool_schema};
-pub use middleware::SharedApiKey;
+pub(crate) use converter::{
+    ConversionError, conversion_error_parts, convert_request, convert_responses_request,
+    get_context_window_size, map_model, metadata_from_openai_extra, normalize_tool_schema,
+};
+pub use converter::{
+    init_model_mapping, init_model_registry, set_chunked_write_policy, set_model_registry,
+};
 pub(crate) use middleware::AppState;
+pub use middleware::SharedApiKey;
 pub use router::create_router_with_provider;

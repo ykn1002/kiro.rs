@@ -100,7 +100,11 @@ impl OpenAiStreamContext {
         })
     }
 
-    fn make_choice_chunk(&self, delta: serde_json::Value, finish_reason: Option<&str>) -> OpenAiChunk {
+    fn make_choice_chunk(
+        &self,
+        delta: serde_json::Value,
+        finish_reason: Option<&str>,
+    ) -> OpenAiChunk {
         OpenAiChunk {
             data: {
                 let mut chunk = self.base_chunk();
@@ -280,12 +284,7 @@ impl OpenAiStreamContext {
 
         let (index, id, name, is_new) = {
             if let Some(state) = self.tool_calls.get(&tool_use.tool_use_id) {
-                (
-                    state.index,
-                    state.id.clone(),
-                    state.name.clone(),
-                    false,
-                )
+                (state.index, state.id.clone(), state.name.clone(), false)
             } else {
                 let index = self.next_tool_index;
                 self.next_tool_index += 1;
@@ -363,18 +362,15 @@ impl OpenAiStreamContext {
                     if !self.sent_role {
                         chunks.push(self.initial_chunk());
                     }
-                    chunks.push(
-                        self.make_choice_chunk(json!({"reasoning_content": thinking}), None),
-                    );
+                    chunks
+                        .push(self.make_choice_chunk(json!({"reasoning_content": thinking}), None));
                 }
             } else if !self.text_buffer.trim().is_empty() {
                 let rest = self.text_buffer.trim().to_string();
                 if !self.sent_role {
                     chunks.push(self.initial_chunk());
                 }
-                chunks.push(
-                    self.make_choice_chunk(json!({"content": rest}), None),
-                );
+                chunks.push(self.make_choice_chunk(json!({"content": rest}), None));
             }
             self.text_buffer.clear();
         }

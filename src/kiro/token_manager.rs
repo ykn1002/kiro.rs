@@ -13,8 +13,8 @@ use tokio::sync::Mutex as TokioMutex;
 use std::collections::HashMap;
 use std::fmt;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration as StdDuration, Instant};
 
 use crate::http_client::{ProxyConfig, build_client};
@@ -275,7 +275,10 @@ async fn refresh_idc_token(
     let os_name = &config.system_version;
     let node_version = &config.node_version;
 
-    let x_amz_user_agent = format!("aws-sdk-js/{} KiroIDE", config.effective_sso_oidc_sdk_version());
+    let x_amz_user_agent = format!(
+        "aws-sdk-js/{} KiroIDE",
+        config.effective_sso_oidc_sdk_version()
+    );
     let sso_oidc_ver = config.effective_sso_oidc_sdk_version();
     let user_agent = format!(
         "aws-sdk-js/{} ua/2.1 os/{} lang/js md/nodejs#{} api/sso-oidc#{} m/E KiroIDE",
@@ -462,7 +465,11 @@ pub(crate) async fn list_available_profile(
         match list_available_profile_in_region(credentials, config, token, proxy, region).await {
             Ok(Some(arn)) => {
                 // 从 ARN 解析区域：arn:aws:codewhisperer:<region>:<acct>:profile/<id>
-                let arn_region = arn.split(':').nth(3).filter(|s| !s.is_empty()).map(String::from);
+                let arn_region = arn
+                    .split(':')
+                    .nth(3)
+                    .filter(|s| !s.is_empty())
+                    .map(String::from);
                 return Ok(Some((arn, arn_region)));
             }
             Ok(None) => {
@@ -607,9 +614,7 @@ impl ModelClass {
             ModelClass::Sonnet => config
                 .credential_rpm_sonnet
                 .unwrap_or(config.credential_rpm),
-            ModelClass::Haiku => config
-                .credential_rpm_haiku
-                .unwrap_or(config.credential_rpm),
+            ModelClass::Haiku => config.credential_rpm_haiku.unwrap_or(config.credential_rpm),
             ModelClass::Other => config.credential_rpm,
         }
     }
@@ -1110,9 +1115,7 @@ impl MultiTokenManager {
         self.entries
             .lock()
             .iter()
-            .filter(|e| {
-                !e.disabled && !(is_opus && !e.credentials.supports_opus())
-            })
+            .filter(|e| !e.disabled && !(is_opus && !e.credentials.supports_opus()))
             .count()
     }
 
@@ -1158,11 +1161,7 @@ impl MultiTokenManager {
             }
         }
 
-        if any_available {
-            min_wait
-        } else {
-            None
-        }
+        if any_available { min_wait } else { None }
     }
 
     /// Reuse 模式下优先选中已占位凭据（即使 RPM 窗口已满，不再重复计数）
@@ -1355,14 +1354,13 @@ impl MultiTokenManager {
                 }
                 Err(e) => {
                     // refreshToken 永久失效 → 立即禁用，不累计重试
-                    let has_available =
-                        if e.downcast_ref::<RefreshTokenInvalidError>().is_some() {
-                            tracing::warn!("凭据 #{} refreshToken 永久失效: {}", id, e);
-                            self.report_refresh_token_invalid(id)
-                        } else {
-                            tracing::warn!("凭据 #{} Token 刷新失败: {}", id, e);
-                            self.report_refresh_failure(id)
-                        };
+                    let has_available = if e.downcast_ref::<RefreshTokenInvalidError>().is_some() {
+                        tracing::warn!("凭据 #{} refreshToken 永久失效: {}", id, e);
+                        self.report_refresh_token_invalid(id)
+                    } else {
+                        tracing::warn!("凭据 #{} Token 刷新失败: {}", id, e);
+                        self.report_refresh_failure(id)
+                    };
                     attempt_count += 1;
                     if !has_available {
                         anyhow::bail!("所有凭据均已禁用（0/{}）", total);
@@ -1996,7 +1994,8 @@ impl MultiTokenManager {
                         Some("api_key".to_string())
                     } else {
                         e.credentials.auth_method.as_deref().map(|m| {
-                            if m.eq_ignore_ascii_case("builder-id") || m.eq_ignore_ascii_case("iam") {
+                            if m.eq_ignore_ascii_case("builder-id") || m.eq_ignore_ascii_case("iam")
+                            {
                                 "idc".to_string()
                             } else {
                                 m.to_string()
@@ -2030,14 +2029,17 @@ impl MultiTokenManager {
                     has_proxy: e.credentials.proxy_url.is_some(),
                     proxy_url: e.credentials.proxy_url.clone(),
                     refresh_failure_count: e.refresh_failure_count,
-                    disabled_reason: e.disabled_reason.map(|r| match r {
-                        DisabledReason::Manual => "Manual",
-                        DisabledReason::TooManyFailures => "TooManyFailures",
-                        DisabledReason::TooManyRefreshFailures => "TooManyRefreshFailures",
-                        DisabledReason::QuotaExceeded => "QuotaExceeded",
-                        DisabledReason::InvalidRefreshToken => "InvalidRefreshToken",
-                        DisabledReason::InvalidConfig => "InvalidConfig",
-                    }.to_string()),
+                    disabled_reason: e.disabled_reason.map(|r| {
+                        match r {
+                            DisabledReason::Manual => "Manual",
+                            DisabledReason::TooManyFailures => "TooManyFailures",
+                            DisabledReason::TooManyRefreshFailures => "TooManyRefreshFailures",
+                            DisabledReason::QuotaExceeded => "QuotaExceeded",
+                            DisabledReason::InvalidRefreshToken => "InvalidRefreshToken",
+                            DisabledReason::InvalidConfig => "InvalidConfig",
+                        }
+                        .to_string()
+                    }),
                     endpoint: e.credentials.endpoint.clone(),
                     rpm,
                 }
@@ -2104,10 +2106,7 @@ impl MultiTokenManager {
                 .find(|e| e.id == id)
                 .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?;
             if entry.disabled_reason == Some(DisabledReason::InvalidConfig) {
-                anyhow::bail!(
-                    "凭据 #{} 因配置无效被禁用，请修正配置后重启服务",
-                    id
-                );
+                anyhow::bail!("凭据 #{} 因配置无效被禁用，请修正配置后重启服务", id);
             }
             entry.failure_count = 0;
             entry.refresh_failure_count = 0;
@@ -2160,7 +2159,7 @@ impl MultiTokenManager {
 
             if needs_refresh {
                 let refresh_lock = self.refresh_lock_for(id);
-            let _guard = refresh_lock.lock().await;
+                let _guard = refresh_lock.lock().await;
                 let current_creds = {
                     let entries = self.entries.lock();
                     entries
@@ -2210,7 +2209,13 @@ impl MultiTokenManager {
         };
 
         let effective_proxy = credentials.effective_proxy(self.proxy.as_ref());
-        let usage_limits = get_usage_limits(&credentials, &self.config(), &token, effective_proxy.as_ref()).await?;
+        let usage_limits = get_usage_limits(
+            &credentials,
+            &self.config(),
+            &token,
+            effective_proxy.as_ref(),
+        )
+        .await?;
 
         // 更新订阅等级到凭据（仅在发生变化时持久化）
         if let Some(subscription_title) = usage_limits.subscription_title() {
@@ -2219,8 +2224,7 @@ impl MultiTokenManager {
                 if let Some(entry) = entries.iter_mut().find(|e| e.id == id) {
                     let old_title = entry.credentials.subscription_title.clone();
                     if old_title.as_deref() != Some(subscription_title) {
-                        entry.credentials.subscription_title =
-                            Some(subscription_title.to_string());
+                        entry.credentials.subscription_title = Some(subscription_title.to_string());
                         tracing::info!(
                             "凭据 #{} 订阅等级已更新: {:?} -> {}",
                             id,
@@ -2707,11 +2711,13 @@ mod tests {
 
         let result = manager.add_credential(duplicate).await;
         assert!(result.is_err());
-        assert!(result
-            .err()
-            .unwrap()
-            .to_string()
-            .contains("kiroApiKey 重复"));
+        assert!(
+            result
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("kiroApiKey 重复")
+        );
     }
 
     #[tokio::test]
@@ -2725,11 +2731,13 @@ mod tests {
 
         let result = manager.add_credential(cred).await;
         assert!(result.is_err());
-        assert!(result
-            .err()
-            .unwrap()
-            .to_string()
-            .contains("kiroApiKey 为空"));
+        assert!(
+            result
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("kiroApiKey 为空")
+        );
     }
 
     #[tokio::test]
@@ -2743,11 +2751,13 @@ mod tests {
 
         let result = manager.add_credential(cred).await;
         assert!(result.is_err());
-        assert!(result
-            .err()
-            .unwrap()
-            .to_string()
-            .contains("缺少 kiroApiKey"));
+        assert!(
+            result
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("缺少 kiroApiKey")
+        );
     }
 
     #[tokio::test]
@@ -2808,7 +2818,11 @@ mod tests {
             .map(|_| manager.select_next_credential(None).unwrap().0)
             .collect();
 
-        assert_eq!(picks, vec![2, 3, 1, 2, 3, 1], "轮询应按 (priority, id) 顺序循环");
+        assert_eq!(
+            picks,
+            vec![2, 3, 1, 2, 3, 1],
+            "轮询应按 (priority, id) 顺序循环"
+        );
     }
 
     #[test]
@@ -2871,13 +2885,26 @@ mod tests {
 
     #[test]
     fn test_set_load_balancing_mode_accepts_round_robin() {
-        let manager =
-            MultiTokenManager::new(Config::default(), vec![KiroCredentials::default()], None, None, false)
-                .unwrap();
-        assert!(manager.set_load_balancing_mode("round-robin".to_string()).is_ok());
+        let manager = MultiTokenManager::new(
+            Config::default(),
+            vec![KiroCredentials::default()],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+        assert!(
+            manager
+                .set_load_balancing_mode("round-robin".to_string())
+                .is_ok()
+        );
         assert_eq!(manager.get_load_balancing_mode(), "round-robin");
         // 非法模式仍应被拒绝
-        assert!(manager.set_load_balancing_mode("nonsense".to_string()).is_err());
+        assert!(
+            manager
+                .set_load_balancing_mode("nonsense".to_string())
+                .is_err()
+        );
     }
 
     #[test]
@@ -3007,21 +3034,14 @@ mod tests {
 
     #[test]
     fn test_set_load_balancing_mode_persists_to_config_file() {
-        let config_path = std::env::temp_dir().join(format!(
-            "kiro-load-balancing-{}.json",
-            uuid::Uuid::new_v4()
-        ));
+        let config_path =
+            std::env::temp_dir().join(format!("kiro-load-balancing-{}.json", uuid::Uuid::new_v4()));
         std::fs::write(&config_path, r#"{"loadBalancingMode":"priority"}"#).unwrap();
 
         let config = Config::load(&config_path).unwrap();
-        let manager = MultiTokenManager::new(
-            config,
-            vec![KiroCredentials::default()],
-            None,
-            None,
-            false,
-        )
-        .unwrap();
+        let manager =
+            MultiTokenManager::new(config, vec![KiroCredentials::default()], None, None, false)
+                .unwrap();
 
         manager
             .set_load_balancing_mode("balanced".to_string())
@@ -3058,13 +3078,17 @@ mod tests {
         assert_eq!(manager.available_count(), 0);
 
         // 应触发自愈：重置失败计数并重新启用，避免必须重启进程
-        let ctx = manager.acquire_context(None, RpmChargeMode::Charge).await.unwrap();
+        let ctx = manager
+            .acquire_context(None, RpmChargeMode::Charge)
+            .await
+            .unwrap();
         assert!(ctx.token == "t1" || ctx.token == "t2");
         assert_eq!(manager.available_count(), 2);
     }
 
     #[tokio::test]
-    async fn test_multi_token_manager_acquire_context_balanced_retries_until_bad_credential_disabled() {
+    async fn test_multi_token_manager_acquire_context_balanced_retries_until_bad_credential_disabled()
+     {
         let mut config = Config::default();
         config.load_balancing_mode = "balanced".to_string();
 
@@ -3080,7 +3104,10 @@ mod tests {
         let manager =
             MultiTokenManager::new(config, vec![bad_cred, good_cred], None, None, false).unwrap();
 
-        let ctx = manager.acquire_context(None, RpmChargeMode::Charge).await.unwrap();
+        let ctx = manager
+            .acquire_context(None, RpmChargeMode::Charge)
+            .await
+            .unwrap();
         assert_eq!(ctx.id, 2);
         assert_eq!(ctx.token, "good-token");
     }
@@ -3125,7 +3152,12 @@ mod tests {
         }
         assert_eq!(manager.available_count(), 0);
 
-        let err = manager.acquire_context(None, RpmChargeMode::Charge).await.err().unwrap().to_string();
+        let err = manager
+            .acquire_context(None, RpmChargeMode::Charge)
+            .await
+            .err()
+            .unwrap()
+            .to_string();
         assert!(
             err.contains("所有凭据均已禁用"),
             "错误应提示所有凭据禁用，实际: {}",
@@ -3165,7 +3197,12 @@ mod tests {
         manager.report_quota_exhausted(2);
         assert_eq!(manager.available_count(), 0);
 
-        let err = manager.acquire_context(None, RpmChargeMode::Charge).await.err().unwrap().to_string();
+        let err = manager
+            .acquire_context(None, RpmChargeMode::Charge)
+            .await
+            .err()
+            .unwrap()
+            .to_string();
         assert!(
             err.contains("所有凭据均已禁用"),
             "错误应提示所有凭据禁用，实际: {}",
@@ -3376,7 +3413,10 @@ mod tests {
     #[tokio::test]
     async fn test_acquire_context_allows_request_under_rpm_limit() {
         let manager = make_manager_with_rpm(1, 2, 0);
-        manager.acquire_context(None, RpmChargeMode::Charge).await.unwrap();
+        manager
+            .acquire_context(None, RpmChargeMode::Charge)
+            .await
+            .unwrap();
     }
 
     #[tokio::test]
@@ -3521,7 +3561,11 @@ mod tests {
             }
         }
         // Sonnet 打满 → 需要等待
-        assert!(manager.rpm_wait_for_slot(Some("claude-sonnet-4"), now).is_some());
+        assert!(
+            manager
+                .rpm_wait_for_slot(Some("claude-sonnet-4"), now)
+                .is_some()
+        );
         // Opus 窗口为空 → 无需等待
         assert_eq!(manager.rpm_wait_for_slot(Some("claude-opus-4"), now), None);
     }

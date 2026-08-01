@@ -1,12 +1,12 @@
-mod metrics;
 mod admin;
 mod admin_ui;
 mod anthropic;
 mod common;
-mod openai;
 mod http_client;
 mod kiro;
+mod metrics;
 mod model;
+mod openai;
 pub mod token;
 
 use std::collections::HashMap;
@@ -52,6 +52,16 @@ async fn main() {
         config.effective_model_aliases(),
         config.default_model.clone(),
     );
+
+    // 分块写入策略（默认关闭，开启后会增加工具往返次数即配额消耗）
+    anthropic::set_chunked_write_policy(config.chunked_write_policy.clone());
+    if config.chunked_write_policy.enabled {
+        tracing::info!(
+            trigger_lines = config.chunked_write_policy.trigger_lines,
+            chunk_lines = config.chunked_write_policy.chunk_lines,
+            "已启用 Write/Edit 分块写入策略注入（会增加请求次数与配额消耗）"
+        );
+    }
 
     if config.default_model.is_some() || !config.model_aliases.is_empty() {
         tracing::info!(

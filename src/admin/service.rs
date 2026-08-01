@@ -352,6 +352,7 @@ impl AdminService {
             models: config.effective_models(),
             default_model: config.default_model.clone(),
             model_aliases: config.model_aliases.clone(),
+            chunked_write_policy: config.chunked_write_policy.clone(),
         }
     }
 
@@ -412,10 +413,29 @@ impl AdminService {
                 ));
             }
         }
-        if req.default_model.as_ref().is_some_and(|s| s.trim().is_empty()) {
+        if req
+            .default_model
+            .as_ref()
+            .is_some_and(|s| s.trim().is_empty())
+        {
             return Err(AdminServiceError::InvalidCredential(
                 "defaultModel 不能为空字符串".to_string(),
             ));
+        }
+        // 分块写入策略：仅在启用时校验行数（关闭时数值无意义，允许任意残留值）
+        if let Some(ref p) = req.chunked_write_policy
+            && p.enabled
+        {
+            if p.chunk_lines == 0 {
+                return Err(AdminServiceError::InvalidCredential(
+                    "chunkedWritePolicy 的 chunkLines 必须为正数".to_string(),
+                ));
+            }
+            if p.trigger_lines < p.chunk_lines {
+                return Err(AdminServiceError::InvalidCredential(
+                    "chunkedWritePolicy 的 triggerLines 不能小于 chunkLines".to_string(),
+                ));
+            }
         }
 
         let normalized_aliases: std::collections::HashMap<String, String> = req
@@ -459,12 +479,13 @@ impl AdminService {
                 None
             } else {
                 Some(
-                    crate::kiro::machine_id::parse_configured_machine_id(trimmed)
-                        .ok_or_else(|| {
+                    crate::kiro::machine_id::parse_configured_machine_id(trimmed).ok_or_else(
+                        || {
                             AdminServiceError::InvalidCredential(
                                 "machineId 格式无效（需 64 位十六进制或 UUID）".to_string(),
                             )
-                        })?,
+                        },
+                    )?,
                 )
             };
         }
@@ -475,6 +496,9 @@ impl AdminService {
         new_config.models = Some(req.models.clone());
         new_config.model_aliases = normalized_aliases.clone();
         new_config.default_model = default_model.clone();
+        if let Some(ref policy) = req.chunked_write_policy {
+            new_config.chunked_write_policy = policy.clone();
+        }
 
         if config_path.is_some() {
             new_config.save().map_err(|e| {
@@ -486,11 +510,8 @@ impl AdminService {
 
         // ---- 热应用 ----
         *self.shared_api_key.write() = api_key.to_string();
-        crate::anthropic::init_model_mapping(
-            req.models,
-            normalized_aliases,
-            default_model,
-        );
+        crate::anthropic::init_model_mapping(req.models, normalized_aliases, default_model);
+        crate::anthropic::set_chunked_write_policy(new_config.chunked_write_policy.clone());
         self.token_manager.replace_config(new_config);
 
         tracing::info!("应用配置已更新并热生效");

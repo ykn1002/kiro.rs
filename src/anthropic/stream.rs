@@ -196,27 +196,21 @@ pub(crate) fn extract_thinking_from_complete_text(text: &str) -> (Option<String>
     let after_open = &text[start_pos + "<thinking>".len()..];
 
     // 查找结束标签：优先匹配带 \n\n 后缀的，退而使用末尾匹配
-    let (thinking_raw, text_after) =
-        if let Some(end_pos) = find_real_thinking_end_tag(after_open) {
-            (
-                &after_open[..end_pos],
-                &after_open[end_pos + "</thinking>\n\n".len()..],
-            )
-        } else if let Some(end_pos) = find_real_thinking_end_tag_at_buffer_end(after_open) {
-            let after_tag = end_pos + "</thinking>".len();
-            (
-                &after_open[..end_pos],
-                after_open[after_tag..].trim_start(),
-            )
-        } else {
-            // 找不到有效的结束标签，不做提取
-            return (None, text.to_string());
-        };
+    let (thinking_raw, text_after) = if let Some(end_pos) = find_real_thinking_end_tag(after_open) {
+        (
+            &after_open[..end_pos],
+            &after_open[end_pos + "</thinking>\n\n".len()..],
+        )
+    } else if let Some(end_pos) = find_real_thinking_end_tag_at_buffer_end(after_open) {
+        let after_tag = end_pos + "</thinking>".len();
+        (&after_open[..end_pos], after_open[after_tag..].trim_start())
+    } else {
+        // 找不到有效的结束标签，不做提取
+        return (None, text.to_string());
+    };
 
     // 剥离开头的换行符（与流式处理一致：模型输出 <thinking>\n）
-    let thinking_content = thinking_raw
-        .strip_prefix('\n')
-        .unwrap_or(thinking_raw);
+    let thinking_content = thinking_raw.strip_prefix('\n').unwrap_or(thinking_raw);
 
     // 组装剩余文本：跳过纯空白的 before 部分
     let mut remaining = String::new();
@@ -446,6 +440,16 @@ impl SseStateManager {
         Some(SseEvent::new("content_block_delta", data))
     }
 
+    /// 注销一个块，使其不再出现在最终的收尾事件中
+    ///
+    /// 用于缓冲模式下丢弃「参数未写完就被截断」的 tool_use：这些块的
+    /// `content_block_start` 从未发给客户端，若仍留在 `active_blocks` 里，
+    /// [`Self::generate_final_events`] 会为其补发一个孤立的 `content_block_stop`，
+    /// 客户端会因索引不存在而报错。
+    pub fn discard_block(&mut self, index: i32) {
+        self.active_blocks.remove(&index);
+    }
+
     /// 处理 content_block_stop 事件
     pub fn handle_content_block_stop(&mut self, index: i32) -> Option<SseEvent> {
         if let Some(block) = self.active_blocks.get_mut(&index) {
@@ -519,7 +523,30 @@ impl SseStateManager {
     }
 }
 
-use super::converter::get_context_window_size;
+use super::converter::{active_chunk_lines, get_context_window_size};
+
+/// 提取 SSE 事件顶层的 `index` 字段（content_block_* 事件都带）
+///
+/// 用于缓冲模式下区分「属于 tool_use 块的事件」与「关闭前置 text 块的事件」。
+fn event_block_index(e: &SseEvent) -> Option<i32> {
+    e.data.get("index").and_then(|v| v.as_i64()).map(|v| v as i32)
+}
+
+/// tool_use 被截断时回灌给模型的纠正文本
+///
+/// 逐字取自 Kiro IDE 本体 `OutputTruncatedError` 的消息（`extension.js` 中
+/// `errors-BBdZwTgx.js` 的 `m17` 类），仅把 `fs_write` / `fs_append` /
+/// `str_replace` 替换为 Claude Code 侧实际可用的 `Write` / `Edit`。
+/// `{limit}` 由生效的 `chunkedWritePolicy.writeLimitLines` 代入（默认 50，
+/// 与官方 `WRITE_LIMIT` 一致）。
+fn truncated_tool_correction(chunk_lines: u32) -> String {
+    format!(
+        "The model output was truncated before this tool call was complete. The tool was NOT \
+         executed. When writing files, limit each Write call to {chunk_lines} lines or \
+         fewer, then use Edit to add remaining content in chunks of {chunk_lines} lines or \
+         fewer. For edits, use multiple Edit calls instead of one large edit."
+    )
+}
 
 /// 流处理上下文
 pub struct StreamContext {
@@ -533,6 +560,8 @@ pub struct StreamContext {
     pub input_tokens: i32,
     /// 从 contextUsageEvent 计算的实际输入 tokens
     pub context_input_tokens: Option<i32>,
+    /// 来自 metadataEvent 的精确 token 用量（优先于上面两个估算值）
+    pub token_usage: Option<crate::kiro::model::events::TokenUsage>,
     /// 输出 tokens 累计
     pub output_tokens: i32,
     /// 工具块索引映射 (tool_id -> block_index)
@@ -564,6 +593,23 @@ pub struct StreamContext {
     stream_initialized: bool,
     /// 上游流是否已失败（不再发送正常结束事件）
     pub stream_failed: bool,
+    /// 各 tool_use 已累积的输入字节数（tool_id -> 字节数）
+    ///
+    /// 仅用于 `ContentLengthExceededException` 的诊断日志：上游截断时需要知道
+    /// 截断发生在哪个工具、已写出多少字节，以便定位真实长度上限。
+    tool_input_bytes: HashMap<String, usize>,
+    /// 尚未收到 `stop: true` 的 tool_use 的 SSE 事件（按到达顺序）
+    ///
+    /// 仅在缓冲模式（`delay_message_start`，即 `/cc` 路径）下使用：tool_use 的
+    /// 事件先在此暂存，直到该工具的 `stop: true` 到达才整体放行。若流结束时仍
+    /// 有残留，说明模型输出在参数 JSON 写完前被截断，这些事件会被**丢弃**并改为
+    /// 发送一段纠正文本（见 [`Self::take_truncated_tool_correction`]）。
+    ///
+    /// 对齐 Kiro IDE 本体：它用「已开启工具调用 + 参数已开始 + 未收到 stop」
+    /// 判定截断，并让工具**完全不执行**，再把纠正指令作为工具结果回灌给模型。
+    buffered_tool_events: Vec<(String, SseEvent)>,
+    /// 已收到 `stop: true` 的 tool_use id 集合（缓冲模式下用于判定是否完整）
+    completed_tool_ids: std::collections::HashSet<String>,
 }
 
 impl StreamContext {
@@ -581,6 +627,7 @@ impl StreamContext {
             message_id: format!("msg_{}", Uuid::new_v4().to_string().replace('-', "")),
             input_tokens,
             context_input_tokens: None,
+            token_usage: None,
             output_tokens: 0,
             tool_block_indices: HashMap::new(),
             tool_name_map,
@@ -596,6 +643,9 @@ impl StreamContext {
             message_start_released: false,
             stream_initialized: false,
             stream_failed: false,
+            tool_input_bytes: HashMap::new(),
+            buffered_tool_events: Vec::new(),
+            completed_tool_ids: std::collections::HashSet::new(),
         }
     }
 
@@ -614,7 +664,20 @@ impl StreamContext {
     }
 
     fn effective_input_tokens(&self) -> i32 {
-        self.context_input_tokens.unwrap_or(self.input_tokens)
+        // 优先级：metadataEvent 的精确值 > contextUsageEvent 反推值 > 本地估算
+        self.token_usage
+            .as_ref()
+            .and_then(|u| u.anthropic_input_tokens())
+            .or(self.context_input_tokens)
+            .unwrap_or(self.input_tokens)
+    }
+
+    /// 最终上报的输出 tokens：优先用 metadataEvent 精确值，否则用累计估算
+    fn effective_output_tokens(&self) -> i32 {
+        self.token_usage
+            .as_ref()
+            .and_then(|u| u.anthropic_output_tokens())
+            .unwrap_or(self.output_tokens)
     }
 
     fn patch_message_start_tokens(events: &mut [SseEvent], input_tokens: i32) {
@@ -688,6 +751,7 @@ impl StreamContext {
             out.extend(self.release_pending_events());
             self.message_start_released = true;
         }
+        out.extend(self.take_truncated_tool_correction());
         out.extend(self.generate_final_events());
         out
     }
@@ -708,10 +772,14 @@ impl StreamContext {
             self.stream_initialized = true;
         }
 
-        let final_input_tokens = self.context_input_tokens.unwrap_or(self.input_tokens);
+        let final_input_tokens = self.effective_input_tokens();
+        let final_output_tokens = self.effective_output_tokens().max(1);
+        // 失败路径已向客户端发过 error 事件，无需再追加纠正文本；但残留的不完整
+        // tool_use 事件必须丢弃，避免半个参数 JSON 外泄。
+        self.buffered_tool_events.clear();
         out.extend(
             self.state_manager
-                .generate_final_events(final_input_tokens, self.output_tokens.max(1)),
+                .generate_final_events(final_input_tokens, final_output_tokens),
         );
         out
     }
@@ -783,9 +851,8 @@ impl StreamContext {
             Event::ContextUsage(context_usage) => {
                 // 从上下文使用百分比计算实际的 input_tokens
                 let window_size = get_context_window_size(&self.model);
-                let actual_input_tokens = (context_usage.context_usage_percentage
-                    * (window_size as f64)
-                    / 100.0) as i32;
+                let actual_input_tokens =
+                    (context_usage.context_usage_percentage * (window_size as f64) / 100.0) as i32;
                 self.context_input_tokens = Some(actual_input_tokens);
                 // 上下文使用量达到 100% 时，设置 stop_reason 为 model_context_window_exceeded
                 if context_usage.context_usage_percentage >= 100.0 {
@@ -798,6 +865,32 @@ impl StreamContext {
                     actual_input_tokens
                 );
                 Vec::new()
+            }
+            Event::Metadata(metadata) => {
+                if let Some(usage) = metadata.token_usage.as_ref().filter(|u| u.has_counts()) {
+                    tracing::debug!(
+                        uncached_input_tokens = ?usage.uncached_input_tokens,
+                        output_tokens = ?usage.output_tokens,
+                        total_tokens = ?usage.total_tokens,
+                        cache_read_input_tokens = ?usage.cache_read_input_tokens,
+                        cache_write_input_tokens = ?usage.cache_write_input_tokens,
+                        "收到 metadataEvent，使用上游精确 token 用量"
+                    );
+                    self.token_usage = Some(usage.clone());
+                }
+                Vec::new()
+            }
+            Event::InvalidState(invalid) => {
+                // 上游主动上报会话状态非法：视为流失败，向客户端发 error 事件
+                tracing::error!(
+                    reason = %invalid.reason,
+                    message = %invalid.message,
+                    "收到 invalidStateEvent，上游报告会话状态非法"
+                );
+                self.stream_failed = true;
+                vec![Self::create_error_event(&format!(
+                    "Upstream reported invalid state: {invalid}"
+                ))]
             }
             Event::Error {
                 error_code,
@@ -814,6 +907,24 @@ impl StreamContext {
                 message,
             } => {
                 if exception_type == "ContentLengthExceededException" {
+                    // 模型输出被截断：tool_use 参数 JSON 不完整，整次调用作废。
+                    // 记录截断位置便于对照 Kiro 官方 WRITE_LIMIT（50 行）——官方该值
+                    // 仅为提示词文本、不参与程序校验，故这里只观测不强制。
+                    let largest = self
+                        .tool_input_bytes
+                        .iter()
+                        .max_by_key(|(_, bytes)| **bytes)
+                        .map(|(id, &bytes)| (id.clone(), bytes));
+                    tracing::warn!(
+                        model = %self.model,
+                        output_tokens_est = self.output_tokens,
+                        tool_count = self.tool_input_bytes.len(),
+                        largest_tool_id = ?largest.as_ref().map(|(id, _)| id),
+                        largest_tool_input_bytes = ?largest.as_ref().map(|(_, b)| b),
+                        total_tool_input_bytes = self.tool_input_bytes.values().sum::<usize>(),
+                        upstream_message = %message,
+                        "上游内容长度超限，输出被截断（stop_reason=max_tokens）"
+                    );
                     self.state_manager.set_stop_reason("max_tokens");
                     return Vec::new();
                 }
@@ -1064,7 +1175,11 @@ impl StreamContext {
     }
 
     /// 关闭 thinking 块：signature_delta + content_block_stop
-    fn close_thinking_block(&mut self, thinking_index: i32, thinking_content: &str) -> Vec<SseEvent> {
+    fn close_thinking_block(
+        &mut self,
+        thinking_index: i32,
+        thinking_content: &str,
+    ) -> Vec<SseEvent> {
         let mut events = Vec::new();
         if !thinking_content.is_empty() {
             events.push(self.create_thinking_delta_event(thinking_index, thinking_content));
@@ -1161,6 +1276,10 @@ impl StreamContext {
         // 发送参数增量 (ToolUseEvent.input 是 String 类型)
         if !tool_use.input.is_empty() {
             self.output_tokens += (tool_use.input.len() as i32 + 3) / 4; // 估算 token
+            *self
+                .tool_input_bytes
+                .entry(tool_use.tool_use_id.clone())
+                .or_insert(0) += tool_use.input.len();
 
             if let Some(delta_event) = self.state_manager.handle_content_block_delta(
                 block_index,
@@ -1182,9 +1301,107 @@ impl StreamContext {
             if let Some(stop_event) = self.state_manager.handle_content_block_stop(block_index) {
                 events.push(stop_event);
             }
+            self.completed_tool_ids.insert(tool_use.tool_use_id.clone());
+        }
+
+        // 缓冲模式（/cc）：tool_use 事件先暂存，直到 stop 到达才整体放行。
+        // 目的是让「参数未写完就被截断」的 tool_use 不外泄给客户端——不完整的
+        // 参数 JSON 会让客户端解析失败或执行半个操作。
+        if self.buffers_tool_events() {
+            let tool_id = tool_use.tool_use_id.clone();
+            // events 里可能混有「开始 tool_use 时自动关闭前置 text 块」产生的
+            // content_block_stop（其 index != 本 tool_use 块）。这类事件属于**已放行**
+            // 的 text 块，必须立即放行——若跟着 tool_use 一起缓冲，截断时会随
+            // buffered_tool_events 被整体丢弃，导致 text 块 start 已发、stop 丢失的
+            // 孤立块，客户端据此报 "Invalid tool parameters"。
+            let mut passthrough = Vec::new();
+            for e in events {
+                if event_block_index(&e) == Some(block_index) {
+                    self.buffered_tool_events.push((tool_id.clone(), e));
+                } else {
+                    passthrough.push(e);
+                }
+            }
+            if tool_use.stop {
+                passthrough.extend(self.release_buffered_tool_events());
+            }
+            return passthrough;
         }
 
         events
+    }
+
+    /// 是否启用 tool_use 事件缓冲（仅 `/cc` 路径）
+    fn buffers_tool_events(&self) -> bool {
+        self.delay_message_start
+    }
+
+    /// 放行所有已完整（收到 stop）的 tool_use 事件
+    fn release_buffered_tool_events(&mut self) -> Vec<SseEvent> {
+        let completed = &self.completed_tool_ids;
+        let mut out = Vec::new();
+        self.buffered_tool_events.retain(|(id, event)| {
+            if completed.contains(id) {
+                out.push(event.clone());
+                false
+            } else {
+                true
+            }
+        });
+        out
+    }
+
+    /// 流结束时处理残留的不完整 tool_use：丢弃其事件，改发一段纠正文本
+    ///
+    /// 判定条件与 Kiro IDE 本体一致——已开启 tool_use、参数流已开始、但结束时
+    /// 未收到 `stop`，即模型输出被截断、参数 JSON 不完整。
+    ///
+    /// 官方的做法是让工具**完全不执行**，并把纠正指令作为 `role: "tool"` 的
+    /// `toolUseResponse` 回灌进自己的对话历史。作为代理我们不持有历史（历史在
+    /// 客户端），所以改为把那段指令作为**助手文本**发出：客户端看到模型「说」了
+    /// 这段话而非发起工具调用，模型下一轮即会改用分块写入。这同时避免了把不完整
+    /// 的参数 JSON 传给客户端。
+    fn take_truncated_tool_correction(&mut self) -> Vec<SseEvent> {
+        if self.buffered_tool_events.is_empty() {
+            return Vec::new();
+        }
+
+        // 收集被丢弃的工具，用于诊断日志与块注销
+        let mut dropped_ids: Vec<String> = self
+            .buffered_tool_events
+            .iter()
+            .map(|(id, _)| id.clone())
+            .collect();
+        dropped_ids.dedup();
+        let largest_bytes = dropped_ids
+            .iter()
+            .filter_map(|id| self.tool_input_bytes.get(id))
+            .max()
+            .copied();
+        tracing::warn!(
+            model = %self.model,
+            dropped_tool_ids = ?dropped_ids,
+            dropped_event_count = self.buffered_tool_events.len(),
+            largest_tool_input_bytes = ?largest_bytes,
+            chunk_lines = active_chunk_lines(),
+            "模型输出在 tool_use 参数写完前被截断，已丢弃不完整的工具调用并回灌分块指令"
+        );
+
+        self.buffered_tool_events.clear();
+
+        // 注销这些块，否则 generate_final_events 会为其补发孤立的
+        // content_block_stop（它们的 content_block_start 从未发出）。
+        for id in &dropped_ids {
+            if let Some(idx) = self.tool_block_indices.get(id) {
+                self.state_manager.discard_block(*idx);
+            }
+        }
+
+        let mut out = Vec::new();
+        let correction = truncated_tool_correction(active_chunk_lines());
+        out.extend(self.create_text_delta_events(&correction));
+        self.state_manager.set_stop_reason("max_tokens");
+        out
     }
 
     /// 生成最终事件序列
@@ -1236,13 +1453,14 @@ impl StreamContext {
             events.extend(self.create_text_delta_events(" "));
         }
 
-        // 使用从 contextUsageEvent 计算的 input_tokens，如果没有则使用估算值
-        let final_input_tokens = self.context_input_tokens.unwrap_or(self.input_tokens);
+        // token 用量优先级：metadataEvent 精确值 > contextUsageEvent 反推值 > 本地估算
+        let final_input_tokens = self.effective_input_tokens();
+        let final_output_tokens = self.effective_output_tokens();
 
         // 生成最终事件
         events.extend(
             self.state_manager
-                .generate_final_events(final_input_tokens, self.output_tokens),
+                .generate_final_events(final_input_tokens, final_output_tokens),
         );
         events
     }
@@ -1322,7 +1540,10 @@ mod tests {
         use crate::kiro::model::events::ToolUseEvent;
 
         let mut map = HashMap::new();
-        map.insert("short_abc12345".to_string(), "mcp__very_long_original_tool_name".to_string());
+        map.insert(
+            "short_abc12345".to_string(),
+            "mcp__very_long_original_tool_name".to_string(),
+        );
 
         let mut ctx = StreamContext::new_with_thinking("test-model", 1, false, map, false);
         let _ = ctx.generate_initial_events();
@@ -1338,17 +1559,339 @@ mod tests {
         let events = ctx.process_kiro_event(&tool_event);
 
         // content_block_start 中的 name 应该是原始长名称
-        let start_event = events.iter().find(|e| e.event == "content_block_start").unwrap();
+        let start_event = events
+            .iter()
+            .find(|e| e.event == "content_block_start")
+            .unwrap();
         assert_eq!(
-            start_event.data["content_block"]["name"],
-            "mcp__very_long_original_tool_name",
+            start_event.data["content_block"]["name"], "mcp__very_long_original_tool_name",
             "应还原为原始工具名称"
+        );
+    }
+
+    /// 走真实入口 take_events_for_kiro 的完整 /cc 序列：
+    /// text_delta → tool_use（分帧 + stop）→ contextUsage → finalize。
+    /// 校验最终 SSE 序列结构合法：message_start 唯一、块 start/stop 配对、
+    /// tool_use 的 partial_json 拼起来是合法 JSON。
+    #[test]
+    fn test_cc_full_sequence_via_real_entry_produces_valid_tool_json() {
+        use crate::kiro::model::events::{ContextUsageEvent, ToolUseEvent};
+
+        let mut ctx =
+            StreamContext::new_with_thinking("test-model", 1, false, HashMap::new(), true);
+
+        let mut all: Vec<SseEvent> = Vec::new();
+
+        // 1. 先来一段助手文本
+        all.extend(ctx.take_events_for_kiro(&Event::AssistantResponse(
+            serde_json::from_str(r#"{"content":"我来写文件"}"#).unwrap(),
+        )));
+
+        // 2. tool_use 参数分三帧到达，最后一帧 stop
+        all.extend(ctx.take_events_for_kiro(&Event::ToolUse(ToolUseEvent {
+            name: "Write".to_string(),
+            tool_use_id: "toolu_01".to_string(),
+            input: r#"{"file_path":"/a.rs","#.to_string(),
+            stop: false,
+        })));
+        all.extend(ctx.take_events_for_kiro(&Event::ToolUse(ToolUseEvent {
+            name: "Write".to_string(),
+            tool_use_id: "toolu_01".to_string(),
+            input: r#""content":"fn main"#.to_string(),
+            stop: false,
+        })));
+        all.extend(ctx.take_events_for_kiro(&Event::ToolUse(ToolUseEvent {
+            name: "Write".to_string(),
+            tool_use_id: "toolu_01".to_string(),
+            input: r#"() {}"}"#.to_string(),
+            stop: true,
+        })));
+
+        // 3. contextUsage 到达
+        all.extend(ctx.take_events_for_kiro(&Event::ContextUsage(ContextUsageEvent {
+            context_usage_percentage: 12.5,
+        })));
+
+        // 4. 收尾
+        all.extend(ctx.finalize_stream());
+
+        // message_start 必须恰好一次
+        let starts = all.iter().filter(|e| e.event == "message_start").count();
+        assert_eq!(starts, 1, "message_start 应恰好一次，实际 {starts}: {all:?}");
+
+        // 收集 tool_use 块的 partial_json，拼起来必须是合法 JSON
+        let tool_json: String = all
+            .iter()
+            .filter(|e| e.event == "content_block_delta")
+            .filter_map(|e| e.data["delta"]["partial_json"].as_str())
+            .collect();
+        assert!(
+            !tool_json.is_empty(),
+            "应有 tool_use 参数增量放行，实际序列: {all:?}"
+        );
+        let parsed: Result<serde_json::Value, _> = serde_json::from_str(&tool_json);
+        assert!(
+            parsed.is_ok(),
+            "tool_use 参数拼接后应是合法 JSON，实际 = {tool_json:?}，序列 = {all:?}"
+        );
+
+        // 块 start/stop 必须配对：每个 index 的 start 都要有对应 stop，反之亦然
+        let mut opened: std::collections::HashMap<i64, i64> = std::collections::HashMap::new();
+        for e in &all {
+            if e.event == "content_block_start" {
+                if let Some(idx) = e.data["index"].as_i64() {
+                    *opened.entry(idx).or_insert(0) += 1;
+                }
+            } else if e.event == "content_block_stop" {
+                if let Some(idx) = e.data["index"].as_i64() {
+                    *opened.entry(idx).or_insert(0) -= 1;
+                }
+            }
+        }
+        for (idx, bal) in &opened {
+            assert_eq!(
+                *bal, 0,
+                "块 {idx} 的 start/stop 不配对（差值 {bal}）: {all:?}"
+            );
+        }
+    }
+
+    /// 走真实入口的截断路径：tool_use 缓冲后从未收到 stop，流结束。
+    /// 校验发给客户端的纠正文本序列结构合法（有 message_start、text 块配对、
+    /// 没有孤立的 tool_use 块或半截 partial_json 外泄）。
+    #[test]
+    fn test_cc_truncated_via_real_entry_no_orphan_and_no_leak() {
+        use crate::kiro::model::events::ToolUseEvent;
+
+        let mut ctx =
+            StreamContext::new_with_thinking("test-model", 1, false, HashMap::new(), true);
+
+        let mut all: Vec<SseEvent> = Vec::new();
+
+        // tool_use 参数流开始但永远收不到 stop（模型输出被截断）
+        all.extend(ctx.take_events_for_kiro(&Event::ToolUse(ToolUseEvent {
+            name: "Write".to_string(),
+            tool_use_id: "toolu_01".to_string(),
+            input: r#"{"file_path":"/big.rs","content":"line1"#.to_string(),
+            stop: false,
+        })));
+        // 收尾
+        all.extend(ctx.finalize_stream());
+
+        // message_start 必须恰好一次
+        let starts = all.iter().filter(|e| e.event == "message_start").count();
+        assert_eq!(starts, 1, "message_start 应恰好一次，实际 {starts}: {all:?}");
+
+        // 不应外泄任何 partial_json（半截参数）
+        let leaked: Vec<&str> = all
+            .iter()
+            .filter(|e| e.event == "content_block_delta")
+            .filter_map(|e| e.data["delta"]["partial_json"].as_str())
+            .collect();
+        assert!(leaked.is_empty(), "不应外泄 tool_use 半截参数，实际: {leaked:?}");
+
+        // 应发出纠正文本
+        let text: String = all
+            .iter()
+            .filter(|e| e.event == "content_block_delta")
+            .filter_map(|e| e.data["delta"]["text"].as_str())
+            .collect();
+        assert!(text.contains("output was truncated"), "应有纠正文本: {all:?}");
+
+        // 块 start/stop 必须配对
+        let mut opened: std::collections::HashMap<i64, i64> = std::collections::HashMap::new();
+        for e in &all {
+            if e.event == "content_block_start" {
+                if let Some(idx) = e.data["index"].as_i64() {
+                    *opened.entry(idx).or_insert(0) += 1;
+                }
+            } else if e.event == "content_block_stop" {
+                if let Some(idx) = e.data["index"].as_i64() {
+                    *opened.entry(idx).or_insert(0) -= 1;
+                }
+            }
+        }
+        for (idx, bal) in &opened {
+            assert_eq!(*bal, 0, "块 {idx} 的 start/stop 不配对（差值 {bal}）: {all:?}");
+        }
+
+        // 纠正文本用的 text 块必须真的发过 content_block_start
+        let text_delta_indices: std::collections::HashSet<i64> = all
+            .iter()
+            .filter(|e| e.event == "content_block_delta"
+                && e.data["delta"]["type"] == "text_delta")
+            .filter_map(|e| e.data["index"].as_i64())
+            .collect();
+        let text_start_indices: std::collections::HashSet<i64> = all
+            .iter()
+            .filter(|e| e.event == "content_block_start"
+                && e.data["content_block"]["type"] == "text")
+            .filter_map(|e| e.data["index"].as_i64())
+            .collect();
+        for idx in &text_delta_indices {
+            assert!(
+                text_start_indices.contains(idx),
+                "text_delta 用的块 {idx} 从未发过 content_block_start（孤立 delta）: {all:?}"
+            );
+        }
+    }
+
+    /// 缓冲模式（/cc）下，完整的 tool_use（收到 stop）应正常放行
+    #[test]
+    fn test_cc_buffered_complete_tool_use_is_released() {
+        // delay_message_start = true 即 /cc 路径
+        let mut ctx =
+            StreamContext::new_with_thinking("test-model", 1, false, HashMap::new(), true);
+        let _ = ctx.generate_initial_events();
+
+        // 参数分两次到达，最后一次带 stop
+        let partial = ctx.process_tool_use(&crate::kiro::model::events::ToolUseEvent {
+            name: "Write".to_string(),
+            tool_use_id: "toolu_01".to_string(),
+            input: r#"{"path":"/a.rs","#.to_string(),
+            stop: false,
+        });
+        // 第一帧会关闭初始 text 块（index 0），该 content_block_stop 属于已放行的
+        // text 块，应立即放行；但不应放行任何 tool_use 块（index 1）的事件。
+        assert!(
+            partial
+                .iter()
+                .all(|e| e.event == "content_block_stop" && e.data["index"] == 0),
+            "stop 之前只应放行关闭前置 text 块的事件，实际: {partial:?}"
+        );
+        assert!(
+            !partial.iter().any(|e| e.event == "content_block_start"),
+            "tool_use 块的 start 不应在 stop 前放行，实际: {partial:?}"
+        );
+
+        let released = ctx.process_tool_use(&crate::kiro::model::events::ToolUseEvent {
+            name: "Write".to_string(),
+            tool_use_id: "toolu_01".to_string(),
+            input: r#""content":"x"}"#.to_string(),
+            stop: true,
+        });
+
+        // 完整的一组事件应在 stop 时整体放行
+        assert!(
+            released.iter().any(|e| e.event == "content_block_start"),
+            "应放行 content_block_start，实际: {released:?}"
+        );
+        assert!(
+            released.iter().any(|e| e.event == "content_block_stop"),
+            "应放行 content_block_stop，实际: {released:?}"
+        );
+        // 两段参数增量都应保留
+        let deltas: Vec<&str> = released
+            .iter()
+            .filter(|e| e.event == "content_block_delta")
+            .filter_map(|e| e.data["delta"]["partial_json"].as_str())
+            .collect();
+        assert_eq!(deltas.len(), 2, "两段参数增量都应放行，实际: {deltas:?}");
+
+        // 收尾不应再产生纠正文本
+        let final_events = ctx.finalize_stream();
+        let text: String = final_events
+            .iter()
+            .filter(|e| e.event == "content_block_delta")
+            .filter_map(|e| e.data["delta"]["text"].as_str())
+            .collect();
+        assert!(
+            !text.contains("truncated"),
+            "完整调用不应触发纠正文本，实际: {text}"
+        );
+    }
+
+    /// 缓冲模式下，未收到 stop 的 tool_use 应被丢弃并替换为纠正文本
+    #[test]
+    fn test_cc_buffered_truncated_tool_use_replaced_with_correction() {
+        let mut ctx =
+            StreamContext::new_with_thinking("test-model", 1, false, HashMap::new(), true);
+        let _ = ctx.generate_initial_events();
+
+        // 参数流开始但永远收不到 stop —— 即模型输出被截断
+        let buffered = ctx.process_tool_use(&crate::kiro::model::events::ToolUseEvent {
+            name: "Write".to_string(),
+            tool_use_id: "toolu_01".to_string(),
+            input: r#"{"path":"/big.rs","content":"line1\nline2"#.to_string(),
+            stop: false,
+        });
+        // 第一帧可能放行「关闭前置 text 块」的 content_block_stop（index 0），
+        // 但绝不能外泄 tool_use 块的任何事件（start / partial_json）。
+        assert!(
+            !buffered.iter().any(|e| e.event == "content_block_start"
+                || e.data["delta"]["partial_json"].is_string()),
+            "不完整的 tool_use 不应外泄 start 或参数增量，实际: {buffered:?}"
+        );
+
+        let final_events = ctx.finalize_stream();
+
+        // 不应出现任何 tool_use 块的事件
+        assert!(
+            !final_events.iter().any(|e| e.event == "content_block_start"
+                && e.data["content_block"]["type"] == "tool_use"),
+            "被截断的 tool_use 不应发给客户端，实际: {final_events:?}"
+        );
+        // 不应出现孤立的 content_block_stop（start 从未发出）
+        let stops = final_events
+            .iter()
+            .filter(|e| e.event == "content_block_stop")
+            .count();
+        let starts = final_events
+            .iter()
+            .filter(|e| e.event == "content_block_start")
+            .count();
+        assert!(
+            stops <= starts,
+            "content_block_stop 不应多于 start，start={starts} stop={stops}"
+        );
+
+        // 应改为发出纠正文本，且带上生效的行数
+        let text: String = final_events
+            .iter()
+            .filter(|e| e.event == "content_block_delta")
+            .filter_map(|e| e.data["delta"]["text"].as_str())
+            .collect();
+        assert!(
+            text.contains("output was truncated"),
+            "应发出截断纠正文本，实际: {text}"
+        );
+        assert!(
+            text.contains("The tool was NOT executed"),
+            "应说明工具未执行，实际: {text}"
+        );
+        assert!(text.contains("50 lines"), "应带上默认行数，实际: {text}");
+
+        // stop_reason 应为 max_tokens
+        let delta = final_events
+            .iter()
+            .find(|e| e.event == "message_delta")
+            .expect("应有 message_delta");
+        assert_eq!(delta.data["delta"]["stop_reason"], "max_tokens");
+    }
+
+    /// 非缓冲模式（/v1）不应缓冲 tool_use —— 保持实时转发
+    #[test]
+    fn test_v1_does_not_buffer_tool_use() {
+        let mut ctx =
+            StreamContext::new_with_thinking("test-model", 1, false, HashMap::new(), false);
+        let _ = ctx.generate_initial_events();
+
+        let events = ctx.process_tool_use(&crate::kiro::model::events::ToolUseEvent {
+            name: "Write".to_string(),
+            tool_use_id: "toolu_01".to_string(),
+            input: r#"{"path":"/a.rs""#.to_string(),
+            stop: false,
+        });
+        assert!(
+            events.iter().any(|e| e.event == "content_block_start"),
+            "/v1 应实时转发 tool_use，实际: {events:?}"
         );
     }
 
     #[test]
     fn test_text_delta_after_tool_use_restarts_text_block() {
-        let mut ctx = StreamContext::new_with_thinking("test-model", 1, false, HashMap::new(), false);
+        let mut ctx =
+            StreamContext::new_with_thinking("test-model", 1, false, HashMap::new(), false);
 
         let initial_events = ctx.generate_initial_events();
         assert!(
@@ -1409,7 +1952,8 @@ mod tests {
     fn test_tool_use_flushes_pending_thinking_buffer_text_before_tool_block() {
         // thinking 模式下，短文本可能被暂存在 thinking_buffer 以等待 `<thinking>` 的跨 chunk 匹配。
         // 当紧接着出现 tool_use 时，应先 flush 这段文本，再开始 tool_use block。
-        let mut ctx = StreamContext::new_with_thinking("test-model", 1, true, HashMap::new(), false);
+        let mut ctx =
+            StreamContext::new_with_thinking("test-model", 1, true, HashMap::new(), false);
         let _initial_events = ctx.generate_initial_events();
 
         // 两段短文本（各 2 个中文字符），总长度仍可能不足以满足 safe_len>0 的输出条件，
@@ -1616,7 +2160,8 @@ mod tests {
 
     #[test]
     fn test_tool_use_immediately_after_thinking_filters_end_tag_and_closes_thinking_block() {
-        let mut ctx = StreamContext::new_with_thinking("test-model", 1, true, HashMap::new(), false);
+        let mut ctx =
+            StreamContext::new_with_thinking("test-model", 1, true, HashMap::new(), false);
         let _initial_events = ctx.generate_initial_events();
 
         let mut all_events = Vec::new();
@@ -1668,7 +2213,8 @@ mod tests {
 
     #[test]
     fn test_final_flush_filters_standalone_thinking_end_tag() {
-        let mut ctx = StreamContext::new_with_thinking("test-model", 1, true, HashMap::new(), false);
+        let mut ctx =
+            StreamContext::new_with_thinking("test-model", 1, true, HashMap::new(), false);
         let _initial_events = ctx.generate_initial_events();
 
         let mut all_events = Vec::new();
@@ -1688,7 +2234,8 @@ mod tests {
     #[test]
     fn test_thinking_strips_leading_newline_same_chunk() {
         // <thinking>\n 在同一个 chunk 中，\n 应被剥离
-        let mut ctx = StreamContext::new_with_thinking("test-model", 1, true, HashMap::new(), false);
+        let mut ctx =
+            StreamContext::new_with_thinking("test-model", 1, true, HashMap::new(), false);
         let _initial_events = ctx.generate_initial_events();
 
         let events = ctx.process_assistant_response("<thinking>\nHello world");
@@ -1717,7 +2264,8 @@ mod tests {
     #[test]
     fn test_thinking_strips_leading_newline_cross_chunk() {
         // <thinking> 在第一个 chunk 末尾，\n 在第二个 chunk 开头
-        let mut ctx = StreamContext::new_with_thinking("test-model", 1, true, HashMap::new(), false);
+        let mut ctx =
+            StreamContext::new_with_thinking("test-model", 1, true, HashMap::new(), false);
         let _initial_events = ctx.generate_initial_events();
 
         let events1 = ctx.process_assistant_response("<thinking>");
@@ -1749,7 +2297,8 @@ mod tests {
     #[test]
     fn test_thinking_no_strip_when_no_leading_newline() {
         // <thinking> 后直接跟内容（无 \n），内容应完整保留
-        let mut ctx = StreamContext::new_with_thinking("test-model", 1, true, HashMap::new(), false);
+        let mut ctx =
+            StreamContext::new_with_thinking("test-model", 1, true, HashMap::new(), false);
         let _initial_events = ctx.generate_initial_events();
 
         let events = ctx.process_assistant_response("<thinking>abc</thinking>\n\ntext");
@@ -1763,7 +2312,12 @@ mod tests {
 
         let full_thinking: String = thinking_deltas
             .iter()
-            .filter(|e| !e.data["delta"]["thinking"].as_str().unwrap_or("").is_empty())
+            .filter(|e| {
+                !e.data["delta"]["thinking"]
+                    .as_str()
+                    .unwrap_or("")
+                    .is_empty()
+            })
             .map(|e| e.data["delta"]["thinking"].as_str().unwrap_or(""))
             .collect();
 
@@ -1773,17 +2327,15 @@ mod tests {
     #[test]
     fn test_text_after_thinking_strips_leading_newlines() {
         // `</thinking>\n\n` 后的文本不应以 \n\n 开头
-        let mut ctx = StreamContext::new_with_thinking("test-model", 1, true, HashMap::new(), false);
+        let mut ctx =
+            StreamContext::new_with_thinking("test-model", 1, true, HashMap::new(), false);
         let _initial_events = ctx.generate_initial_events();
 
-        let events =
-            ctx.process_assistant_response("<thinking>\nabc</thinking>\n\n你好");
+        let events = ctx.process_assistant_response("<thinking>\nabc</thinking>\n\n你好");
 
         let text_deltas: Vec<_> = events
             .iter()
-            .filter(|e| {
-                e.event == "content_block_delta" && e.data["delta"]["type"] == "text_delta"
-            })
+            .filter(|e| e.event == "content_block_delta" && e.data["delta"]["type"] == "text_delta")
             .collect();
 
         let full_text: String = text_deltas
@@ -1815,9 +2367,7 @@ mod tests {
     fn collect_text_content(events: &[SseEvent]) -> String {
         events
             .iter()
-            .filter(|e| {
-                e.event == "content_block_delta" && e.data["delta"]["type"] == "text_delta"
-            })
+            .filter(|e| e.event == "content_block_delta" && e.data["delta"]["type"] == "text_delta")
             .map(|e| e.data["delta"]["text"].as_str().unwrap_or(""))
             .collect()
     }
@@ -1826,7 +2376,8 @@ mod tests {
     fn test_end_tag_newlines_split_across_events() {
         // `</thinking>\n` 在 chunk 1，`\n` 在 chunk 2，`text` 在 chunk 3
         // 确保 `</thinking>` 不会被部分当作 thinking 内容发出
-        let mut ctx = StreamContext::new_with_thinking("test-model", 1, true, HashMap::new(), false);
+        let mut ctx =
+            StreamContext::new_with_thinking("test-model", 1, true, HashMap::new(), false);
         let _initial_events = ctx.generate_initial_events();
 
         let mut all = Vec::new();
@@ -1836,7 +2387,11 @@ mod tests {
         all.extend(ctx.generate_final_events());
 
         let thinking = collect_thinking_content(&all);
-        assert_eq!(thinking, "abc", "thinking should be 'abc', got: {:?}", thinking);
+        assert_eq!(
+            thinking, "abc",
+            "thinking should be 'abc', got: {:?}",
+            thinking
+        );
 
         let text = collect_text_content(&all);
         assert_eq!(text, "你好", "text should be '你好', got: {:?}", text);
@@ -1845,7 +2400,8 @@ mod tests {
     #[test]
     fn test_end_tag_alone_in_chunk_then_newlines_in_next() {
         // `</thinking>` 单独在一个 chunk，`\n\ntext` 在下一个 chunk
-        let mut ctx = StreamContext::new_with_thinking("test-model", 1, true, HashMap::new(), false);
+        let mut ctx =
+            StreamContext::new_with_thinking("test-model", 1, true, HashMap::new(), false);
         let _initial_events = ctx.generate_initial_events();
 
         let mut all = Vec::new();
@@ -1854,7 +2410,11 @@ mod tests {
         all.extend(ctx.generate_final_events());
 
         let thinking = collect_thinking_content(&all);
-        assert_eq!(thinking, "abc", "thinking should be 'abc', got: {:?}", thinking);
+        assert_eq!(
+            thinking, "abc",
+            "thinking should be 'abc', got: {:?}",
+            thinking
+        );
 
         let text = collect_text_content(&all);
         assert_eq!(text, "你好", "text should be '你好', got: {:?}", text);
@@ -1863,7 +2423,8 @@ mod tests {
     #[test]
     fn test_start_tag_newline_split_across_events() {
         // `\n\n` 在 chunk 1，`<thinking>` 在 chunk 2，`\n` 在 chunk 3
-        let mut ctx = StreamContext::new_with_thinking("test-model", 1, true, HashMap::new(), false);
+        let mut ctx =
+            StreamContext::new_with_thinking("test-model", 1, true, HashMap::new(), false);
         let _initial_events = ctx.generate_initial_events();
 
         let mut all = Vec::new();
@@ -1874,7 +2435,11 @@ mod tests {
         all.extend(ctx.generate_final_events());
 
         let thinking = collect_thinking_content(&all);
-        assert_eq!(thinking, "abc", "thinking should be 'abc', got: {:?}", thinking);
+        assert_eq!(
+            thinking, "abc",
+            "thinking should be 'abc', got: {:?}",
+            thinking
+        );
 
         let text = collect_text_content(&all);
         assert_eq!(text, "text", "text should be 'text', got: {:?}", text);
@@ -1883,7 +2448,8 @@ mod tests {
     #[test]
     fn test_full_flow_maximally_split() {
         // 极端拆分：每个关键边界都在不同 chunk
-        let mut ctx = StreamContext::new_with_thinking("test-model", 1, true, HashMap::new(), false);
+        let mut ctx =
+            StreamContext::new_with_thinking("test-model", 1, true, HashMap::new(), false);
         let _initial_events = ctx.generate_initial_events();
 
         let mut all = Vec::new();
@@ -1903,7 +2469,11 @@ mod tests {
         all.extend(ctx.generate_final_events());
 
         let thinking = collect_thinking_content(&all);
-        assert_eq!(thinking, "hello", "thinking should be 'hello', got: {:?}", thinking);
+        assert_eq!(
+            thinking, "hello",
+            "thinking should be 'hello', got: {:?}",
+            thinking
+        );
 
         let text = collect_text_content(&all);
         assert_eq!(text, "world", "text should be 'world', got: {:?}", text);
@@ -1912,7 +2482,8 @@ mod tests {
     #[test]
     fn test_thinking_only_sets_max_tokens_stop_reason() {
         // 整个流只有 thinking 块，没有 text 也没有 tool_use，stop_reason 应为 max_tokens
-        let mut ctx = StreamContext::new_with_thinking("test-model", 1, true, HashMap::new(), false);
+        let mut ctx =
+            StreamContext::new_with_thinking("test-model", 1, true, HashMap::new(), false);
         let _initial_events = ctx.generate_initial_events();
 
         let mut all_events = Vec::new();
@@ -1967,7 +2538,8 @@ mod tests {
     #[test]
     fn test_thinking_with_text_keeps_end_turn_stop_reason() {
         // thinking + text 的情况，stop_reason 应为 end_turn
-        let mut ctx = StreamContext::new_with_thinking("test-model", 1, true, HashMap::new(), false);
+        let mut ctx =
+            StreamContext::new_with_thinking("test-model", 1, true, HashMap::new(), false);
         let _initial_events = ctx.generate_initial_events();
 
         let mut all_events = Vec::new();
@@ -1988,17 +2560,20 @@ mod tests {
     #[test]
     fn test_thinking_with_tool_use_keeps_tool_use_stop_reason() {
         // thinking + tool_use 的情况，stop_reason 应为 tool_use
-        let mut ctx = StreamContext::new_with_thinking("test-model", 1, true, HashMap::new(), false);
+        let mut ctx =
+            StreamContext::new_with_thinking("test-model", 1, true, HashMap::new(), false);
         let _initial_events = ctx.generate_initial_events();
 
         let mut all_events = Vec::new();
         all_events.extend(ctx.process_assistant_response("<thinking>\nabc</thinking>"));
-        all_events.extend(ctx.process_tool_use(&crate::kiro::model::events::ToolUseEvent {
-            name: "test_tool".to_string(),
-            tool_use_id: "tool_1".to_string(),
-            input: "{}".to_string(),
-            stop: true,
-        }));
+        all_events.extend(
+            ctx.process_tool_use(&crate::kiro::model::events::ToolUseEvent {
+                name: "test_tool".to_string(),
+                tool_use_id: "tool_1".to_string(),
+                input: "{}".to_string(),
+                stop: true,
+            }),
+        );
         all_events.extend(ctx.generate_final_events());
 
         let message_delta = all_events
@@ -2014,8 +2589,13 @@ mod tests {
 
     #[test]
     fn test_finalize_stream_on_failure_emits_message_stop() {
-        let mut ctx =
-            StreamContext::new_with_thinking("claude-sonnet-4-6", 100, false, HashMap::new(), false);
+        let mut ctx = StreamContext::new_with_thinking(
+            "claude-sonnet-4-6",
+            100,
+            false,
+            HashMap::new(),
+            false,
+        );
         ctx.stream_failed = true;
         let events = ctx.finalize_stream_on_failure();
         assert!(
@@ -2029,6 +2609,112 @@ mod tests {
         assert!(
             events.iter().any(|e| e.event == "message_delta"),
             "failure finalize should emit message_delta"
+        );
+    }
+
+    /// 从 message_delta 里取出 usage
+    fn usage_from_delta(events: &[SseEvent]) -> serde_json::Value {
+        events
+            .iter()
+            .find(|e| e.event == "message_delta")
+            .expect("应有 message_delta")
+            .data["usage"]
+            .clone()
+    }
+
+    #[test]
+    fn test_metadata_event_overrides_estimated_tokens() {
+        use crate::kiro::model::events::MetadataEvent;
+
+        // 传入一个明显错误的估算值，验证被 metadataEvent 覆盖
+        let mut ctx =
+            StreamContext::new_with_thinking("test-model", 99999, false, HashMap::new(), false);
+        let _ = ctx.generate_initial_events();
+        let _ = ctx.process_kiro_event(&Event::AssistantResponse(
+            serde_json::from_str(r#"{"content":"hi"}"#).unwrap(),
+        ));
+
+        let metadata: MetadataEvent = serde_json::from_str(
+            r#"{"tokenUsage":{"uncachedInputTokens":123,"outputTokens":45,"totalTokens":168}}"#,
+        )
+        .unwrap();
+        let events = ctx.process_kiro_event(&Event::Metadata(metadata));
+        assert!(events.is_empty(), "metadataEvent 本身不产生 SSE 事件");
+
+        let usage = usage_from_delta(&ctx.finalize_stream());
+        assert_eq!(usage["input_tokens"], 123);
+        assert_eq!(usage["output_tokens"], 45);
+    }
+
+    #[test]
+    fn test_metadata_takes_priority_over_context_usage() {
+        use crate::kiro::model::events::{ContextUsageEvent, MetadataEvent};
+
+        let mut ctx =
+            StreamContext::new_with_thinking("test-model", 1, false, HashMap::new(), false);
+        let _ = ctx.generate_initial_events();
+
+        // contextUsageEvent 先到（反推值），metadataEvent 后到（精确值）
+        let _ = ctx.process_kiro_event(&Event::ContextUsage(ContextUsageEvent {
+            context_usage_percentage: 50.0,
+        }));
+        let reverse_derived = ctx.context_input_tokens.expect("应有反推值");
+
+        let metadata: MetadataEvent =
+            serde_json::from_str(r#"{"tokenUsage":{"uncachedInputTokens":777}}"#).unwrap();
+        let _ = ctx.process_kiro_event(&Event::Metadata(metadata));
+
+        let usage = usage_from_delta(&ctx.finalize_stream());
+        assert_eq!(usage["input_tokens"], 777, "精确值应优先于反推值");
+        assert_ne!(reverse_derived, 777, "测试前提：两者本应不同");
+    }
+
+    #[test]
+    fn test_context_usage_still_used_without_metadata() {
+        use crate::kiro::model::events::ContextUsageEvent;
+
+        // 没有 metadataEvent 时保持原有行为（回退到反推值）
+        let mut ctx =
+            StreamContext::new_with_thinking("test-model", 1, false, HashMap::new(), false);
+        let _ = ctx.generate_initial_events();
+        let _ = ctx.process_kiro_event(&Event::ContextUsage(ContextUsageEvent {
+            context_usage_percentage: 50.0,
+        }));
+        let expected = ctx.context_input_tokens.expect("应有反推值");
+
+        let usage = usage_from_delta(&ctx.finalize_stream());
+        assert_eq!(usage["input_tokens"], expected);
+    }
+
+    #[test]
+    fn test_invalid_state_event_emits_error_and_fails_stream() {
+        use crate::kiro::model::events::InvalidStateEvent;
+
+        let mut ctx =
+            StreamContext::new_with_thinking("test-model", 1, false, HashMap::new(), false);
+        let _ = ctx.generate_initial_events();
+
+        let events = ctx.process_kiro_event(&Event::InvalidState(InvalidStateEvent {
+            reason: "INVALID_TOOL_RESULT".to_string(),
+            message: "missing id".to_string(),
+        }));
+
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].event, "error");
+        let msg = events[0].data["error"]["message"]
+            .as_str()
+            .expect("error.message 应为字符串");
+        assert!(msg.contains("INVALID_TOOL_RESULT"), "实际: {msg}");
+        assert!(msg.contains("missing id"), "实际: {msg}");
+        assert!(ctx.stream_failed, "invalidStateEvent 应标记流失败");
+
+        // 标记失败后不再处理后续事件
+        assert!(
+            ctx.take_events_for_kiro(&Event::AssistantResponse(
+                serde_json::from_str(r#"{"content":"ignored"}"#).unwrap(),
+            ))
+            .is_empty(),
+            "流失败后应忽略后续事件"
         );
     }
 }

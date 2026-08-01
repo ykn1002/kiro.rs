@@ -10,6 +10,7 @@ import {
 } from '@/components/ui/dialog'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
+import { Switch } from '@/components/ui/switch'
 import { useAppConfig, useUpdateAppConfig } from '@/hooks/use-credentials'
 import { extractErrorMessage } from '@/lib/utils'
 import type { ModelDef } from '@/types/api'
@@ -70,6 +71,9 @@ export function SettingsDialog({ open, onOpenChange }: SettingsDialogProps) {
   const [defaultModel, setDefaultModel] = useState('')
   const [modelAliases, setModelAliases] = useState<ModelAliasRow[]>([])
   const [aliasesExpanded, setAliasesExpanded] = useState(true)
+  const [chunkedEnabled, setChunkedEnabled] = useState(false)
+  const [chunkedTriggerLines, setChunkedTriggerLines] = useState('150')
+  const [chunkedChunkLines, setChunkedChunkLines] = useState('50')
 
   // 打开对话框（或拉到数据）时用服务端值回填表单
   useEffect(() => {
@@ -89,6 +93,9 @@ export function SettingsDialog({ open, onOpenChange }: SettingsDialogProps) {
     setModels(config.models.map((m) => ({ ...m })))
     setDefaultModel(config.defaultModel ?? '')
     setModelAliases(aliasesToRows(config.modelAliases ?? {}))
+    setChunkedEnabled(config.chunkedWritePolicy?.enabled ?? false)
+    setChunkedTriggerLines(String(config.chunkedWritePolicy?.triggerLines ?? 150))
+    setChunkedChunkLines(String(config.chunkedWritePolicy?.chunkLines ?? 50))
   }, [open, config])
 
   const updateModel = (index: number, patch: Partial<ModelDef>) => {
@@ -173,6 +180,17 @@ export function SettingsDialog({ open, onOpenChange }: SettingsDialogProps) {
       }
     }
 
+    const triggerLines = parseInt(chunkedTriggerLines, 10) || 0
+    const chunkLines = parseInt(chunkedChunkLines, 10) || 0
+    if (chunkedEnabled && chunkLines <= 0) {
+      toast.error('分块写入的每块行数必须为正数')
+      return
+    }
+    if (chunkedEnabled && triggerLines < chunkLines) {
+      toast.error('分块写入的触发行数不能小于每块行数')
+      return
+    }
+
     const cleanedModels: ModelDef[] = models.map((m) => ({
       family: m.family.trim(),
       version: m.version?.trim() ? m.version.trim() : null,
@@ -200,6 +218,12 @@ export function SettingsDialog({ open, onOpenChange }: SettingsDialogProps) {
         models: cleanedModels,
         defaultModel: defaultModel.trim() || null,
         modelAliases: rowsToAliases(modelAliases),
+        chunkedWritePolicy: {
+          enabled: chunkedEnabled,
+          // 关闭时也提交当前值，便于下次开启时保留用户填写的数
+          triggerLines: triggerLines || 150,
+          chunkLines: chunkLines || 50,
+        },
       },
       {
         onSuccess: () => {
@@ -318,6 +342,55 @@ export function SettingsDialog({ open, onOpenChange }: SettingsDialogProps) {
                 <p className="text-xs text-muted-foreground">
                   每个凭据每分钟请求数上限。0 或留空表示不单独限制（专用项留空回退到兜底值）。
                   「RPM 打满等待」：全部凭据达上限时，发出请求前最多等待的毫秒数；0 表示不等待、立即向客户端返回 429
+                </p>
+              </section>
+
+              {/* 分块写入策略 */}
+              <section className="space-y-2">
+                <div className="flex items-center justify-between">
+                  <h3 className="text-sm font-semibold">Write/Edit 分块写入</h3>
+                  <Switch
+                    checked={chunkedEnabled}
+                    onCheckedChange={setChunkedEnabled}
+                    disabled={isPending}
+                  />
+                </div>
+                <div className="grid grid-cols-1 gap-3 md:grid-cols-2 max-w-md">
+                  <div className="space-y-1">
+                    <label className="text-xs text-muted-foreground">
+                      触发行数 (triggerLines)
+                    </label>
+                    <Input
+                      type="number"
+                      min="1"
+                      value={chunkedTriggerLines}
+                      onChange={(e) => setChunkedTriggerLines(e.target.value)}
+                      disabled={isPending || !chunkedEnabled}
+                    />
+                  </div>
+                  <div className="space-y-1">
+                    <label className="text-xs text-muted-foreground">
+                      每块行数 (chunkLines)
+                    </label>
+                    <Input
+                      type="number"
+                      min="1"
+                      value={chunkedChunkLines}
+                      onChange={(e) => setChunkedChunkLines(e.target.value)}
+                      disabled={isPending || !chunkedEnabled}
+                    />
+                  </div>
+                </div>
+                <p className="text-xs text-muted-foreground">
+                  向 Write/Edit 工具描述注入「超长内容分块写入」约束，规避模型输出被截断导致
+                  tool_use 参数不完整、整次调用作废。内容超过「触发行数」才分块，每块不超过
+                  「每块行数」（含 Write 首块与后续 Edit 追加）。默认 150 / 50——每块的 50
+                  取自 Kiro IDE 官方 WRITE_LIMIT 常量，触发阈值放宽到 150 让中小文件一次写完。
+                  截断发生时回灌给模型的纠正指令也使用「每块行数」。
+                  <span className="text-amber-600 dark:text-amber-500">
+                    {' '}
+                    注意：Kiro 按请求次数计费，分块会把一次写入拆成多次工具往返，显著增加配额消耗。
+                  </span>
                 </p>
               </section>
 

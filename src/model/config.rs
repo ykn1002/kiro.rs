@@ -17,6 +17,131 @@ impl Default for TlsBackend {
     }
 }
 
+/// Write/Edit 工具的分块写入策略
+///
+/// 启用后会向 `Write`/`Edit` 工具的 description 追加「超长内容必须分块写入」的
+/// 约束，并在系统提示词末尾追加「静默遵守分块限制」的策略说明。
+///
+/// 存在的原因是模型输出超长 tool_use 时会被截断，参数 JSON 不完整、整次调用作废
+/// （上游表现为 `ContentLengthExceededException`）。分块把一次写入拆成多次工具
+/// 往返以规避该上限。
+///
+/// # 与 Kiro IDE 官方实现对齐
+///
+/// 阈值单位与默认值取自 Kiro IDE 本体（`kiro.kiro-agent/dist/extension.js`）
+/// 导出的 `WRITE_LIMIT` 常量，其值为字符串 `"50 lines"`，用于三处：
+/// `fs_write` 的 description、输入超限错误、以及输出被截断后回灌给模型的重试
+/// 指令。官方用**行数**而非字节/字符，且该常量是纯提示词文本、不参与任何程序
+/// 校验——因此这里同样只做提示词注入，不在代理侧强制截断。
+///
+/// 官方以同一个值同时表示「触发阈值」与「每块上限」（内容超过 N 行就分块，
+/// 每块不超过 N 行）。这里拆成两个字段：`triggerLines` 控制多大才需要分块，
+/// `chunkLines` 控制每块多大。默认 150 / 50——即 150 行以内一次写完（省一次
+/// 请求），超过则按 50 行一块，与官方每块上限一致。
+///
+/// 代价：Kiro 按请求次数计费，分块会**增加**配额消耗，故默认关闭。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ChunkedWritePolicy {
+    /// 是否启用
+    pub enabled: bool,
+
+    /// 分块触发阈值：内容超过该行数才要求分块
+    ///
+    /// 不超过时允许一次写完，避免小文件被无谓拆成多次请求。默认 150。
+    /// 应 >= `chunk_lines`，否则等于每次都分块。
+    pub trigger_lines: u32,
+
+    /// 每块行数上限（含 Write 首块与后续 Edit 追加）
+    ///
+    /// 默认 50，与 Kiro 官方 `WRITE_LIMIT` 一致。截断纠正指令也用这个值。
+    pub chunk_lines: u32,
+}
+
+/// 旧配置的字节字段折算回行数的系数
+///
+/// 取自本仓库平均行长（约 34.6 字节/行）取整。仅用于兼容曾短暂存在的
+/// `triggerBytes` / `chunkBytes` 写法，折算后会打 warn 提示改用行数字段。
+const LEGACY_BYTES_PER_LINE: u32 = 35;
+
+impl Default for ChunkedWritePolicy {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            trigger_lines: default_trigger_lines(),
+            chunk_lines: default_chunk_lines(),
+        }
+    }
+}
+
+/// 反序列化接受以下写法（后两种为兼容历史配置）：
+/// 1. 推荐：`{"enabled": true, "triggerLines": 150, "chunkLines": 50}`
+/// 2. 单字段 `writeLimitLines`（曾与官方 `WRITE_LIMIT` 单值对齐）
+///    —— 同时作为阈值与块大小，等价于 `triggerLines == chunkLines`
+/// 3. 旧的字节字段：`{"enabled": true, "triggerBytes": 5250, "chunkBytes": 1750}`
+///    —— 按 [`LEGACY_BYTES_PER_LINE`] 折回行数并打 warn
+/// 4. 旧的裸布尔：`true` —— 启用并使用默认值
+impl<'de> Deserialize<'de> for ChunkedWritePolicy {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Obj {
+            #[serde(default)]
+            enabled: bool,
+            #[serde(default)]
+            trigger_lines: Option<u32>,
+            #[serde(default)]
+            chunk_lines: Option<u32>,
+            // 单值写法：同时作为阈值与块大小
+            #[serde(default)]
+            write_limit_lines: Option<u32>,
+            // 字节写法，仅在对应行数字段缺失时生效
+            #[serde(default)]
+            trigger_bytes: Option<u32>,
+            #[serde(default)]
+            chunk_bytes: Option<u32>,
+        }
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Raw {
+            Bool(bool),
+            Obj(Obj),
+        }
+        // 向上取整，避免小字节值折算成 0 行
+        let to_lines = |b: u32| b.div_ceil(LEGACY_BYTES_PER_LINE).max(1);
+        Ok(match Raw::deserialize(d)? {
+            Raw::Bool(enabled) => Self {
+                enabled,
+                ..Default::default()
+            },
+            Raw::Obj(o) => {
+                if o.trigger_bytes.is_some() || o.chunk_bytes.is_some() {
+                    tracing::warn!(
+                        "chunkedWritePolicy 的 triggerBytes / chunkBytes 已废弃，\
+                         请改用 triggerLines / chunkLines"
+                    );
+                }
+                let chunk_lines = o
+                    .chunk_lines
+                    .or(o.write_limit_lines)
+                    .or(o.chunk_bytes.map(to_lines))
+                    .unwrap_or_else(default_chunk_lines);
+                let trigger_lines = o
+                    .trigger_lines
+                    .or(o.write_limit_lines)
+                    .or(o.trigger_bytes.map(to_lines))
+                    .unwrap_or_else(default_trigger_lines);
+                Self {
+                    enabled: o.enabled,
+                    // 阈值小于块大小没有意义，抬到块大小
+                    trigger_lines: trigger_lines.max(chunk_lines),
+                    chunk_lines,
+                }
+            }
+        })
+    }
+}
+
 /// 模型定义
 ///
 /// 同时驱动三处逻辑：
@@ -187,6 +312,13 @@ pub struct Config {
     #[serde(default = "default_extract_thinking")]
     pub extract_thinking: bool,
 
+    /// Write/Edit 工具的分块写入策略（默认关闭）
+    ///
+    /// 见 [`ChunkedWritePolicy`]。为兼容旧配置，也接受裸布尔值
+    /// （`"chunkedWritePolicy": true` 等价于启用并使用默认行数）。
+    #[serde(default)]
+    pub chunked_write_policy: ChunkedWritePolicy,
+
     /// 默认端点名称（凭据未显式指定 endpoint 时使用，默认 "ide"）
     #[serde(default = "default_endpoint")]
     pub default_endpoint: String,
@@ -272,6 +404,22 @@ fn default_extract_thinking() -> bool {
 
 fn default_endpoint() -> String {
     crate::kiro::endpoint::ide::IDE_ENDPOINT_NAME.to_string()
+}
+
+/// 分块写入的默认行数上限
+///
+/// 取自 Kiro IDE 本体导出的 `WRITE_LIMIT` 常量（值为 `"50 lines"`）。
+fn default_chunk_lines() -> u32 {
+    50
+}
+
+/// 分块触发阈值默认值
+///
+/// 官方对 `fs_write` 用同一个 50 既作阈值又作块大小；这里放宽到 150，
+/// 让中小文件一次写完（按请求计费，少一次拆分就少一次扣费），只有确实
+/// 很大的内容才分块。
+fn default_trigger_lines() -> u32 {
+    150
 }
 
 /// 内置默认模型表
@@ -385,6 +533,7 @@ impl Default for Config {
             credential_rpm_max_wait_ms: 0,
             passthrough_retry_after: false,
             extract_thinking: default_extract_thinking(),
+            chunked_write_policy: ChunkedWritePolicy::default(),
             default_endpoint: default_endpoint(),
             endpoints: HashMap::new(),
             models: None,
@@ -482,6 +631,93 @@ impl Config {
 mod tests {
     use super::*;
 
+    /// chunkedWritePolicy 缺省时关闭，默认 150 触发 / 50 每块
+    #[test]
+    fn test_chunked_write_policy_default_disabled() {
+        let cfg = Config::default();
+        assert!(!cfg.chunked_write_policy.enabled);
+        assert_eq!(cfg.chunked_write_policy.trigger_lines, 150);
+        assert_eq!(cfg.chunked_write_policy.chunk_lines, 50);
+    }
+
+    /// 推荐写法应逐字段生效
+    #[test]
+    fn test_chunked_write_policy_object_form() {
+        let p: ChunkedWritePolicy =
+            serde_json::from_str(r#"{"enabled": true, "triggerLines": 300, "chunkLines": 120}"#)
+                .unwrap();
+        assert!(p.enabled);
+        assert_eq!(p.trigger_lines, 300);
+        assert_eq!(p.chunk_lines, 120);
+    }
+
+    /// 兼容旧配置的裸布尔写法：启用并回退默认值
+    #[test]
+    fn test_chunked_write_policy_bool_form_compat() {
+        let p: ChunkedWritePolicy = serde_json::from_str("true").unwrap();
+        assert!(p.enabled);
+        assert_eq!(p.trigger_lines, 150);
+        assert_eq!(p.chunk_lines, 50);
+
+        let p: ChunkedWritePolicy = serde_json::from_str("false").unwrap();
+        assert!(!p.enabled);
+    }
+
+    /// 兼容单值 writeLimitLines：同时作为阈值与块大小
+    #[test]
+    fn test_chunked_write_policy_single_value_compat() {
+        let p: ChunkedWritePolicy =
+            serde_json::from_str(r#"{"enabled": true, "writeLimitLines": 50}"#).unwrap();
+        assert_eq!(p.trigger_lines, 50);
+        assert_eq!(p.chunk_lines, 50);
+    }
+
+    /// 显式的双字段优先于单值写法
+    #[test]
+    fn test_explicit_fields_take_precedence_over_single_value() {
+        let p: ChunkedWritePolicy = serde_json::from_str(
+            r#"{"enabled": true, "writeLimitLines": 50,
+                 "triggerLines": 150, "chunkLines": 60}"#,
+        )
+        .unwrap();
+        assert_eq!(p.trigger_lines, 150);
+        assert_eq!(p.chunk_lines, 60);
+    }
+
+    /// 兼容旧的字节字段：按 35 字节/行折回行数
+    #[test]
+    fn test_chunked_write_policy_legacy_bytes_folded_to_lines() {
+        let p: ChunkedWritePolicy =
+            serde_json::from_str(r#"{"enabled": true, "triggerBytes": 5250, "chunkBytes": 1750}"#)
+                .unwrap();
+        assert_eq!(p.trigger_lines, 150);
+        assert_eq!(p.chunk_lines, 50);
+
+        // 极小字节值不应折算成 0 行
+        let p: ChunkedWritePolicy =
+            serde_json::from_str(r#"{"enabled": true, "chunkBytes": 10}"#).unwrap();
+        assert_eq!(p.chunk_lines, 1);
+    }
+
+    /// 阈值小于块大小时抬到块大小（否则等于每次都分块）
+    #[test]
+    fn test_trigger_lines_raised_to_chunk_lines() {
+        let p: ChunkedWritePolicy =
+            serde_json::from_str(r#"{"enabled": true, "triggerLines": 10, "chunkLines": 50}"#)
+                .unwrap();
+        assert_eq!(p.trigger_lines, 50);
+        assert_eq!(p.chunk_lines, 50);
+    }
+
+    /// 对象写法省略行数字段时回退默认值
+    #[test]
+    fn test_chunked_write_policy_partial_object() {
+        let p: ChunkedWritePolicy = serde_json::from_str(r#"{"enabled": true}"#).unwrap();
+        assert!(p.enabled);
+        assert_eq!(p.trigger_lines, 150);
+        assert_eq!(p.chunk_lines, 50);
+    }
+
     /// 缺省 models 时回退内置默认表
     #[test]
     fn test_effective_models_defaults_when_absent() {
@@ -518,11 +754,7 @@ mod tests {
         let cfg: Config = serde_json::from_str(json).expect("config.example.json 应能解析");
         let example = cfg.models.expect("样例应包含 models");
         let defaults = default_models();
-        assert_eq!(
-            example.len(),
-            defaults.len(),
-            "样例模型数量应与默认表一致"
-        );
+        assert_eq!(example.len(), defaults.len(), "样例模型数量应与默认表一致");
         for (e, d) in example.iter().zip(defaults.iter()) {
             assert_eq!(e.family, d.family);
             assert_eq!(e.version, d.version);

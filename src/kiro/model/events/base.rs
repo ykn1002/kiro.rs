@@ -16,6 +16,10 @@ pub enum EventType {
     Metering,
     /// 上下文使用率事件
     ContextUsage,
+    /// 元数据事件（含精确 token 用量）
+    Metadata,
+    /// 非法状态事件
+    InvalidState,
     /// 未知事件类型
     Unknown,
 }
@@ -28,6 +32,8 @@ impl EventType {
             "toolUseEvent" => Self::ToolUse,
             "meteringEvent" => Self::Metering,
             "contextUsageEvent" => Self::ContextUsage,
+            "metadataEvent" => Self::Metadata,
+            "invalidStateEvent" => Self::InvalidState,
             _ => Self::Unknown,
         }
     }
@@ -39,6 +45,8 @@ impl EventType {
             Self::ToolUse => "toolUseEvent",
             Self::Metering => "meteringEvent",
             Self::ContextUsage => "contextUsageEvent",
+            Self::Metadata => "metadataEvent",
+            Self::InvalidState => "invalidStateEvent",
             Self::Unknown => "unknown",
         }
     }
@@ -71,6 +79,10 @@ pub enum Event {
     Metering(()),
     /// 上下文使用率
     ContextUsage(super::ContextUsageEvent),
+    /// 元数据（含精确 token 用量）
+    Metadata(super::MetadataEvent),
+    /// 非法状态
+    InvalidState(super::InvalidStateEvent),
     /// 未知事件 (保留原始帧数据)
     Unknown {},
     /// 服务端错误
@@ -120,6 +132,14 @@ impl Event {
             EventType::ContextUsage => {
                 let payload = super::ContextUsageEvent::from_frame(&frame)?;
                 Ok(Self::ContextUsage(payload))
+            }
+            EventType::Metadata => {
+                let payload = super::MetadataEvent::from_frame(&frame)?;
+                Ok(Self::Metadata(payload))
+            }
+            EventType::InvalidState => {
+                let payload = super::InvalidStateEvent::from_frame(&frame)?;
+                Ok(Self::InvalidState(payload))
             }
             EventType::Unknown => Ok(Self::Unknown {}),
         }

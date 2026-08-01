@@ -22,7 +22,7 @@ use std::time::Duration;
 use tokio::time::interval;
 use uuid::Uuid;
 
-use super::converter::{convert_request, conversion_error_parts};
+use super::converter::{conversion_error_parts, convert_request};
 use super::middleware::AppState;
 use super::stream::{SseEvent, StreamContext};
 use super::types::{
@@ -115,7 +115,10 @@ pub async fn metrics(State(state): State<AppState>) -> impl IntoResponse {
         None => (0, 0),
     };
     (
-        [(header::CONTENT_TYPE, "text/plain; version=0.0.4; charset=utf-8")],
+        [(
+            header::CONTENT_TYPE,
+            "text/plain; version=0.0.4; charset=utf-8",
+        )],
         crate::metrics::METRICS.render_prometheus(available, total),
     )
 }
@@ -390,11 +393,7 @@ fn create_ping_sse() -> Bytes {
 }
 
 /// 流式解码错误处理：连续失败时标记流失败并向前端发送 error 事件
-fn handle_stream_decode_error(
-    events: &mut Vec<SseEvent>,
-    ctx: &mut StreamContext,
-    e: &ParseError,
-) {
+fn handle_stream_decode_error(events: &mut Vec<SseEvent>, ctx: &mut StreamContext, e: &ParseError) {
     if matches!(
         e,
         ParseError::TooManyErrors { .. } | ParseError::BufferOverflow { .. }
@@ -542,6 +541,7 @@ async fn handle_non_stream_request(
     let mut stop_reason = "end_turn".to_string();
     // 从 contextUsageEvent 计算的实际输入 tokens
     let mut context_input_tokens: Option<i32> = None;
+    let mut token_usage: Option<crate::kiro::model::events::TokenUsage> = None;
 
     // 收集工具调用的增量 JSON
     let mut tool_json_buffers: std::collections::HashMap<String, String> =
@@ -609,6 +609,34 @@ async fn handle_non_stream_request(
                                 actual_input_tokens
                             );
                         }
+                        Event::Metadata(metadata) => {
+                            if let Some(usage) =
+                                metadata.token_usage.as_ref().filter(|u| u.has_counts())
+                            {
+                                tracing::debug!(
+                                    uncached_input_tokens = ?usage.uncached_input_tokens,
+                                    output_tokens = ?usage.output_tokens,
+                                    total_tokens = ?usage.total_tokens,
+                                    "收到 metadataEvent，使用上游精确 token 用量"
+                                );
+                                token_usage = Some(usage.clone());
+                            }
+                        }
+                        Event::InvalidState(invalid) => {
+                            tracing::error!(
+                                reason = %invalid.reason,
+                                message = %invalid.message,
+                                "收到 invalidStateEvent，上游报告会话状态非法"
+                            );
+                            return (
+                                StatusCode::BAD_GATEWAY,
+                                Json(ErrorResponse::new(
+                                    "api_error",
+                                    format!("Upstream reported invalid state: {invalid}"),
+                                )),
+                            )
+                                .into_response();
+                        }
                         Event::Error {
                             error_code,
                             error_message,
@@ -627,6 +655,22 @@ async fn handle_non_stream_request(
                             message,
                         } => {
                             if exception_type == "ContentLengthExceededException" {
+                                // 模型输出被截断：tool_use 参数 JSON 不完整，整次调用作废。
+                                // bytes 与 chars 都记，便于对照 Kiro 官方 WRITE_LIMIT（50 行）。
+                                let largest = tool_json_buffers
+                                    .iter()
+                                    .max_by_key(|(_, buf)| buf.len())
+                                    .map(|(id, buf)| (id.clone(), buf.len(), buf.chars().count()));
+                                tracing::warn!(
+                                    model = %model,
+                                    text_bytes = text_content.len(),
+                                    tool_count = tool_json_buffers.len(),
+                                    largest_tool_id = ?largest.as_ref().map(|(id, _, _)| id),
+                                    largest_tool_input_bytes = ?largest.as_ref().map(|(_, b, _)| b),
+                                    largest_tool_input_chars = ?largest.as_ref().map(|(_, _, c)| c),
+                                    upstream_message = %message,
+                                    "上游内容长度超限，输出被截断（stop_reason=max_tokens）"
+                                );
                                 stop_reason = "max_tokens".to_string();
                             } else {
                                 return (
@@ -696,11 +740,16 @@ async fn handle_non_stream_request(
 
     content.extend(tool_uses);
 
-    // 估算输出 tokens
-    let output_tokens = token::estimate_output_tokens(&content);
-
-    // 使用从 contextUsageEvent 计算的 input_tokens，如果没有则使用估算值
-    let final_input_tokens = context_input_tokens.unwrap_or(input_tokens);
+    // token 用量优先级：metadataEvent 精确值 > contextUsageEvent 反推值 > 本地估算
+    let final_input_tokens = token_usage
+        .as_ref()
+        .and_then(|u| u.anthropic_input_tokens())
+        .or(context_input_tokens)
+        .unwrap_or(input_tokens);
+    let final_output_tokens = token_usage
+        .as_ref()
+        .and_then(|u| u.anthropic_output_tokens())
+        .unwrap_or_else(|| token::estimate_output_tokens(&content));
 
     // 构建 Anthropic 响应
     let response_body = json!({
@@ -713,7 +762,7 @@ async fn handle_non_stream_request(
         "stop_sequence": null,
         "usage": {
             "input_tokens": final_input_tokens,
-            "output_tokens": output_tokens
+            "output_tokens": final_output_tokens
         }
     });
 
@@ -793,7 +842,9 @@ mod tests {
         let resp = map_provider_error(err, true);
         assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
         assert_eq!(
-            resp.headers().get(header::RETRY_AFTER).and_then(|v| v.to_str().ok()),
+            resp.headers()
+                .get(header::RETRY_AFTER)
+                .and_then(|v| v.to_str().ok()),
             Some("30")
         );
     }
@@ -820,7 +871,9 @@ mod tests {
         let resp = map_provider_error(err, true);
         assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
         assert_eq!(
-            resp.headers().get(header::RETRY_AFTER).and_then(|v| v.to_str().ok()),
+            resp.headers()
+                .get(header::RETRY_AFTER)
+                .and_then(|v| v.to_str().ok()),
             Some("12")
         );
     }

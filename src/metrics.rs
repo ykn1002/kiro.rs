@@ -22,7 +22,11 @@ impl Metrics {
         }
     }
 
-    pub fn render_prometheus(&self, credentials_available: usize, credentials_total: usize) -> String {
+    pub fn render_prometheus(
+        &self,
+        credentials_available: usize,
+        credentials_total: usize,
+    ) -> String {
         let success = self.requests_success.load(Ordering::Relaxed);
         let error = self.requests_error.load(Ordering::Relaxed);
         let local_rpm = self.local_rpm_rejected.load(Ordering::Relaxed);
@@ -79,11 +83,15 @@ pub fn inc_local_rpm_rejected() {
 }
 
 pub fn inc_stream_decode_failure() {
-    METRICS.stream_decode_failures.fetch_add(1, Ordering::Relaxed);
+    METRICS
+        .stream_decode_failures
+        .fetch_add(1, Ordering::Relaxed);
 }
 
 pub fn inc_upstream_rate_limited() {
-    METRICS.upstream_rate_limited.fetch_add(1, Ordering::Relaxed);
+    METRICS
+        .upstream_rate_limited
+        .fetch_add(1, Ordering::Relaxed);
 }
 
 #[cfg(test)]

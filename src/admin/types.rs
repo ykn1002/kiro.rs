@@ -4,7 +4,7 @@ use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 
-use crate::model::config::ModelDef;
+use crate::model::config::{ChunkedWritePolicy, ModelDef};
 
 // ============ 凭据状态 ============
 
@@ -238,6 +238,8 @@ pub struct AppConfigResponse {
     pub default_model: Option<String>,
     /// 客户端模型名 → 本服务模型名
     pub model_aliases: HashMap<String, String>,
+    /// Write/Edit 分块写入策略
+    pub chunked_write_policy: ChunkedWritePolicy,
 }
 
 /// 更新应用配置请求（全量替换可编辑子集）
@@ -279,6 +281,9 @@ pub struct UpdateAppConfigRequest {
     /// 客户端模型名 → 本服务模型名
     #[serde(default)]
     pub model_aliases: HashMap<String, String>,
+    /// Write/Edit 分块写入策略；缺省时不更新（兼容旧 Admin UI）
+    #[serde(default)]
+    pub chunked_write_policy: Option<ChunkedWritePolicy>,
 }
 
 // ============ 通用响应 ============

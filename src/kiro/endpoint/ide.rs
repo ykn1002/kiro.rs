@@ -33,9 +33,7 @@ impl IdeEndpoint {
     fn x_amz_user_agent(&self, ctx: &RequestContext<'_>) -> String {
         format!(
             "aws-sdk-js/{} KiroIDE-{}-{}",
-            ctx.config.streaming_sdk_version,
-            ctx.config.kiro_version,
-            ctx.machine_id
+            ctx.config.streaming_sdk_version, ctx.config.kiro_version, ctx.machine_id
         )
     }
 

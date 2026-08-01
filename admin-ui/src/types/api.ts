@@ -118,6 +118,14 @@ export interface ModelDef {
   contextWindow: number
 }
 
+// Write/Edit 分块写入策略
+// triggerLines：多大才需要分块；chunkLines：每块上限（与 Kiro 官方 WRITE_LIMIT 对齐）
+export interface ChunkedWritePolicy {
+  enabled: boolean
+  triggerLines: number
+  chunkLines: number
+}
+
 // 应用配置（页面可编辑子集）当前值
 export interface AppConfig {
   apiKey: string
@@ -134,6 +142,7 @@ export interface AppConfig {
   models: ModelDef[]
   defaultModel?: string | null
   modelAliases: Record<string, string>
+  chunkedWritePolicy: ChunkedWritePolicy
 }
 
 // 更新应用配置请求（全量替换可编辑子集）
@@ -152,4 +161,5 @@ export interface UpdateAppConfigRequest {
   models: ModelDef[]
   defaultModel?: string | null
   modelAliases: Record<string, string>
+  chunkedWritePolicy: ChunkedWritePolicy
 }

@@ -16,7 +16,9 @@ use futures::{Stream, StreamExt, stream};
 use tokio::time::interval;
 use uuid::Uuid;
 
-use crate::anthropic::{AppState, convert_request, conversion_error_parts, get_context_window_size};
+use crate::anthropic::{
+    AppState, conversion_error_parts, convert_request, get_context_window_size,
+};
 use crate::kiro::model::events::Event;
 use crate::kiro::model::requests::kiro::KiroRequest;
 use crate::kiro::parser::decoder::EventStreamDecoder;
@@ -148,7 +150,9 @@ pub async fn chat_completions(
     }
 }
 
-pub(crate) fn override_thinking_from_model_name(payload: &mut crate::anthropic::types::MessagesRequest) {
+pub(crate) fn override_thinking_from_model_name(
+    payload: &mut crate::anthropic::types::MessagesRequest,
+) {
     let model_lower = payload.model.to_lowercase();
     if !model_lower.contains("thinking") {
         return;
@@ -451,8 +455,7 @@ async fn handle_non_stream_request(
         content_text = remaining;
     } else if content_text.contains("<thinking>") {
         // 未启用 thinking 时仍剥离标签，避免泄露给客户端
-        let (_, remaining) =
-            crate::anthropic::extract_thinking_from_complete_text(&text_content);
+        let (_, remaining) = crate::anthropic::extract_thinking_from_complete_text(&text_content);
         content_text = remaining;
     }
 
@@ -461,7 +464,10 @@ async fn handle_non_stream_request(
         .map(|(id, (name, args))| ResponseToolCall {
             id,
             call_type: "function".to_string(),
-            function: FunctionCall { name, arguments: args },
+            function: FunctionCall {
+                name,
+                arguments: args,
+            },
         })
         .collect();
 
