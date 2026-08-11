@@ -326,7 +326,7 @@ async fn handle_messages(
     if payload.stream {
         handle_stream_request(
             provider,
-            &request_body,
+            request_body,
             &model,
             input_tokens,
             thinking_enabled,
@@ -349,10 +349,68 @@ async fn handle_messages(
     }
 }
 
+/// 上游断流后允许的透明重连次数
+///
+/// 大请求体（长对话）下的典型失败形态：上游在返回首个字节前思考数分钟，
+/// 中间链路按空闲超时切断连接，hyper 报 `UnexpectedEof`。这类断开发生在
+/// 我们向客户端发出任何 SSE 之前，可以原样重放请求，客户端无感知。
+const MAX_STREAM_RESTARTS: usize = 2;
+
+/// 断流重连所需的全部输入：重放上游请求并重建 [`StreamContext`]
+///
+/// 只在「尚未向客户端输出任何事件」时使用——已经发出 `message_start` 之后
+/// 无法重来（协议不允许第二个 `message_start`，且已输出的内容无法撤回）。
+struct StreamRestarter {
+    provider: std::sync::Arc<crate::kiro::provider::KiroProvider>,
+    request_body: String,
+    model: String,
+    input_tokens: i32,
+    thinking_enabled: bool,
+    tool_name_map: std::collections::HashMap<String, String>,
+    delay_message_start: bool,
+    /// 剩余可用的重连次数
+    remaining: usize,
+}
+
+impl StreamRestarter {
+    /// 构建一个全新的流上下文（重连后旧上下文的 SSE 状态必须丢弃）
+    fn build_ctx(&self) -> StreamContext {
+        StreamContext::new_with_thinking(
+            self.model.as_str(),
+            self.input_tokens,
+            self.thinking_enabled,
+            self.tool_name_map.clone(),
+            self.delay_message_start,
+        )
+    }
+
+    /// 重放上游请求；次数用尽或重放失败返回 None
+    async fn restart(&mut self) -> Option<reqwest::Response> {
+        if self.remaining == 0 {
+            return None;
+        }
+        self.remaining -= 1;
+        match self
+            .provider
+            .call_api_stream(&self.request_body, Some(&self.model))
+            .await
+        {
+            Ok(resp) => {
+                crate::metrics::inc_stream_restarted();
+                Some(resp)
+            }
+            Err(e) => {
+                tracing::error!("断流重连失败: {}", e);
+                None
+            }
+        }
+    }
+}
+
 /// 处理流式请求
 async fn handle_stream_request(
     provider: std::sync::Arc<crate::kiro::provider::KiroProvider>,
-    request_body: &str,
+    request_body: String,
     model: &str,
     input_tokens: i32,
     thinking_enabled: bool,
@@ -360,20 +418,28 @@ async fn handle_stream_request(
     delay_message_start: bool,
     passthrough_retry_after: bool,
 ) -> Response {
-    let response = match provider.call_api_stream(request_body, Some(model)).await {
-        Ok(resp) => resp,
-        Err(e) => return map_provider_error(e, passthrough_retry_after),
-    };
-
-    let ctx = StreamContext::new_with_thinking(
-        model,
+    let restarter = StreamRestarter {
+        provider: provider.clone(),
+        request_body,
+        model: model.to_string(),
         input_tokens,
         thinking_enabled,
         tool_name_map,
         delay_message_start,
-    );
+        remaining: MAX_STREAM_RESTARTS,
+    };
 
-    let stream = create_sse_stream(response, ctx);
+    let response = match provider
+        .call_api_stream(&restarter.request_body, Some(model))
+        .await
+    {
+        Ok(resp) => resp,
+        Err(e) => return map_provider_error(e, passthrough_retry_after),
+    };
+
+    let ctx = restarter.build_ctx();
+
+    let stream = create_sse_stream(response, ctx, restarter);
 
     Response::builder()
         .status(StatusCode::OK)
@@ -409,87 +475,151 @@ fn handle_stream_decode_error(events: &mut Vec<SseEvent>, ctx: &mut StreamContex
     }
 }
 
+/// SSE 转换状态机的可变状态
+///
+/// `body` 泛型化而非装箱：重连时赋的新值来自同一个
+/// `reqwest::Response::bytes_stream()`，类型完全相同。
+struct SseStreamState<S> {
+    /// 上游响应体字节流
+    body: S,
+    /// Anthropic SSE 转换上下文
+    ctx: StreamContext,
+    /// event-stream 帧解码器
+    decoder: EventStreamDecoder,
+    /// 是否已终止（不再拉取上游）
+    finished: bool,
+    /// ping 保活定时器
+    ping: tokio::time::Interval,
+    /// 断流重连器
+    restarter: StreamRestarter,
+}
+
 /// 创建 SSE 事件流
 fn create_sse_stream(
     response: reqwest::Response,
     ctx: StreamContext,
+    restarter: StreamRestarter,
 ) -> impl Stream<Item = Result<Bytes, Infallible>> {
-    let body_stream = response.bytes_stream();
+    let init = SseStreamState {
+        body: response.bytes_stream(),
+        ctx,
+        decoder: EventStreamDecoder::new(),
+        finished: false,
+        ping: interval(Duration::from_secs(PING_INTERVAL_SECS)),
+        restarter,
+    };
 
-    let processing_stream = stream::unfold(
-        (
-            body_stream,
-            ctx,
-            EventStreamDecoder::new(),
-            false,
-            interval(Duration::from_secs(PING_INTERVAL_SECS)),
-        ),
-        |(mut body_stream, mut ctx, mut decoder, finished, mut ping_interval)| async move {
-            if finished {
-                return None;
-            }
+    let processing_stream = stream::unfold(init, |state| async move {
+        let SseStreamState {
+            mut body,
+            mut ctx,
+            mut decoder,
+            finished,
+            mut ping,
+            mut restarter,
+        } = state;
 
-            tokio::select! {
-                chunk_result = body_stream.next() => {
-                    match chunk_result {
-                        Some(Ok(chunk)) => {
-                            let mut events = Vec::new();
-                            if let Err(e) = decoder.feed(&chunk) {
-                                handle_stream_decode_error(&mut events, &mut ctx, &e);
-                            }
+        if finished {
+            return None;
+        }
 
-                            for result in decoder.decode_iter() {
-                                match result {
-                                    Ok(frame) => {
-                                        if let Ok(event) = Event::from_frame(frame) {
-                                            events.extend(ctx.take_events_for_kiro(&event));
-                                        }
-                                    }
-                                    Err(e) => {
-                                        handle_stream_decode_error(&mut events, &mut ctx, &e);
+        macro_rules! next_state {
+            ($finished:expr) => {
+                SseStreamState {
+                    body,
+                    ctx,
+                    decoder,
+                    finished: $finished,
+                    ping,
+                    restarter,
+                }
+            };
+        }
+
+        tokio::select! {
+            chunk_result = body.next() => {
+                match chunk_result {
+                    Some(Ok(chunk)) => {
+                        let mut events = Vec::new();
+                        if let Err(e) = decoder.feed(&chunk) {
+                            handle_stream_decode_error(&mut events, &mut ctx, &e);
+                        }
+
+                        for result in decoder.decode_iter() {
+                            match result {
+                                Ok(frame) => {
+                                    if let Ok(event) = Event::from_frame(frame) {
+                                        events.extend(ctx.take_events_for_kiro(&event));
                                     }
                                 }
+                                Err(e) => {
+                                    handle_stream_decode_error(&mut events, &mut ctx, &e);
+                                }
                             }
+                        }
 
-                            let bytes: Vec<Result<Bytes, Infallible>> = events
-                                .into_iter()
-                                .map(|e| Ok(Bytes::from(e.to_sse_string())))
-                                .collect();
+                        let bytes: Vec<Result<Bytes, Infallible>> = events
+                            .into_iter()
+                            .map(|e| Ok(Bytes::from(e.to_sse_string())))
+                            .collect();
 
-                            let stream_failed = ctx.stream_failed;
-                            Some((stream::iter(bytes), (body_stream, ctx, decoder, stream_failed, ping_interval)))
+                        let stream_failed = ctx.stream_failed;
+                        Some((stream::iter(bytes), next_state!(stream_failed)))
+                    }
+                    Some(Err(e)) => {
+                        crate::metrics::inc_stream_interrupted();
+
+                        // 尚未向客户端输出任何事件时，断流可以透明重放：
+                        // 长对话下上游常在首字节前思考数分钟，链路按空闲超时切断
+                        // （hyper 报 UnexpectedEof）。此时客户端还没收到 message_start，
+                        // 重放后完全无感知，比返回 error 让客户端整轮失败要好。
+                        // 排除本地 720s 超时：那不是链路瞬断，重放只会再等 12 分钟
+                        // 并多扣一次配额。
+                        if !ctx.client_saw_output()
+                            && !e.is_timeout()
+                            && let Some(resp) = restarter.restart().await
+                        {
+                            tracing::warn!(
+                                "上游断流且尚未向客户端输出，重放请求（剩余 {} 次）: {}",
+                                restarter.remaining,
+                                e
+                            );
+                            body = resp.bytes_stream();
+                            decoder = EventStreamDecoder::new();
+                            ctx = restarter.build_ctx();
+                            let empty: Vec<Result<Bytes, Infallible>> = Vec::new();
+                            return Some((stream::iter(empty), next_state!(false)));
                         }
-                        Some(Err(e)) => {
-                            tracing::error!("读取响应流失败: {:?}", e);
-                            ctx.stream_failed = true;
-                            let mut events = vec![StreamContext::create_error_event(&format!(
-                                "Upstream stream error: {e}"
-                            ))];
-                            events.extend(ctx.finalize_stream_on_failure());
-                            let bytes: Vec<Result<Bytes, Infallible>> = events
-                                .into_iter()
-                                .map(|ev| Ok(Bytes::from(ev.to_sse_string())))
-                                .collect();
-                            Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval)))
-                        }
-                        None => {
-                            let final_events = ctx.finalize_stream();
-                            let bytes: Vec<Result<Bytes, Infallible>> = final_events
-                                .into_iter()
-                                .map(|e| Ok(Bytes::from(e.to_sse_string())))
-                                .collect();
-                            Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval)))
-                        }
+
+                        tracing::error!("读取响应流失败: {:?}", e);
+                        ctx.stream_failed = true;
+                        let mut events = vec![StreamContext::create_error_event(&format!(
+                            "Upstream stream error: {e}"
+                        ))];
+                        events.extend(ctx.finalize_stream_on_failure());
+                        let bytes: Vec<Result<Bytes, Infallible>> = events
+                            .into_iter()
+                            .map(|ev| Ok(Bytes::from(ev.to_sse_string())))
+                            .collect();
+                        Some((stream::iter(bytes), next_state!(true)))
+                    }
+                    None => {
+                        let final_events = ctx.finalize_stream();
+                        let bytes: Vec<Result<Bytes, Infallible>> = final_events
+                            .into_iter()
+                            .map(|e| Ok(Bytes::from(e.to_sse_string())))
+                            .collect();
+                        Some((stream::iter(bytes), next_state!(true)))
                     }
                 }
-                _ = ping_interval.tick() => {
-                    tracing::trace!("发送 ping 保活事件");
-                    let bytes: Vec<Result<Bytes, Infallible>> = vec![Ok(create_ping_sse())];
-                    Some((stream::iter(bytes), (body_stream, ctx, decoder, false, ping_interval)))
-                }
             }
-        },
-    )
+            _ = ping.tick() => {
+                tracing::trace!("发送 ping 保活事件");
+                let bytes: Vec<Result<Bytes, Infallible>> = vec![Ok(create_ping_sse())];
+                Some((stream::iter(bytes), next_state!(false)))
+            }
+        }
+    })
     .flatten();
 
     processing_stream

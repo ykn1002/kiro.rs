@@ -9,6 +9,10 @@ pub struct Metrics {
     pub local_rpm_rejected: AtomicU64,
     pub stream_decode_failures: AtomicU64,
     pub upstream_rate_limited: AtomicU64,
+    /// 上游响应体在传输中途断开（HTTP 头已 200，body 读取失败）的次数
+    pub stream_interrupted: AtomicU64,
+    /// 断流后透明重连重放请求的次数
+    pub stream_restarted: AtomicU64,
 }
 
 impl Metrics {
@@ -19,6 +23,8 @@ impl Metrics {
             local_rpm_rejected: AtomicU64::new(0),
             stream_decode_failures: AtomicU64::new(0),
             upstream_rate_limited: AtomicU64::new(0),
+            stream_interrupted: AtomicU64::new(0),
+            stream_restarted: AtomicU64::new(0),
         }
     }
 
@@ -32,6 +38,8 @@ impl Metrics {
         let local_rpm = self.local_rpm_rejected.load(Ordering::Relaxed);
         let decode_fail = self.stream_decode_failures.load(Ordering::Relaxed);
         let upstream_429 = self.upstream_rate_limited.load(Ordering::Relaxed);
+        let interrupted = self.stream_interrupted.load(Ordering::Relaxed);
+        let restarted = self.stream_restarted.load(Ordering::Relaxed);
 
         format!(
             concat!(
@@ -50,6 +58,12 @@ impl Metrics {
                 "# HELP kiro_upstream_rate_limited_total 上游返回 429 且重试耗尽次数\n",
                 "# TYPE kiro_upstream_rate_limited_total counter\n",
                 "kiro_upstream_rate_limited_total {upstream_429}\n",
+                "# HELP kiro_stream_interrupted_total 上游响应体传输中途断开次数\n",
+                "# TYPE kiro_stream_interrupted_total counter\n",
+                "kiro_stream_interrupted_total {interrupted}\n",
+                "# HELP kiro_stream_restarted_total 断流后透明重连重放请求次数\n",
+                "# TYPE kiro_stream_restarted_total counter\n",
+                "kiro_stream_restarted_total {restarted}\n",
                 "# HELP kiro_credentials_available 当前可用（未禁用）凭据数\n",
                 "# TYPE kiro_credentials_available gauge\n",
                 "kiro_credentials_available {credentials_available}\n",
@@ -62,6 +76,8 @@ impl Metrics {
             local_rpm = local_rpm,
             decode_fail = decode_fail,
             upstream_429 = upstream_429,
+            interrupted = interrupted,
+            restarted = restarted,
             credentials_available = credentials_available,
             credentials_total = credentials_total,
         )
@@ -92,6 +108,14 @@ pub fn inc_upstream_rate_limited() {
     METRICS
         .upstream_rate_limited
         .fetch_add(1, Ordering::Relaxed);
+}
+
+pub fn inc_stream_interrupted() {
+    METRICS.stream_interrupted.fetch_add(1, Ordering::Relaxed);
+}
+
+pub fn inc_stream_restarted() {
+    METRICS.stream_restarted.fetch_add(1, Ordering::Relaxed);
 }
 
 #[cfg(test)]

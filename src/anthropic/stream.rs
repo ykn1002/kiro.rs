@@ -529,7 +529,10 @@ use super::converter::{active_chunk_lines, get_context_window_size};
 ///
 /// 用于缓冲模式下区分「属于 tool_use 块的事件」与「关闭前置 text 块的事件」。
 fn event_block_index(e: &SseEvent) -> Option<i32> {
-    e.data.get("index").and_then(|v| v.as_i64()).map(|v| v as i32)
+    e.data
+        .get("index")
+        .and_then(|v| v.as_i64())
+        .map(|v| v as i32)
 }
 
 /// tool_use 被截断时回灌给模型的纠正文本
@@ -646,6 +649,23 @@ impl StreamContext {
             tool_input_bytes: HashMap::new(),
             buffered_tool_events: Vec::new(),
             completed_tool_ids: std::collections::HashSet::new(),
+        }
+    }
+
+    /// 客户端是否已收到过正文事件（`message_start` 及其后续）
+    ///
+    /// 用于判断上游断流后能否透明重放请求：只要客户端还没看到 `message_start`，
+    /// 就可以丢弃本次上下文重新来一遍；一旦发出，协议上不允许第二个
+    /// `message_start`，也无法撤回已输出的内容，只能走失败收尾。
+    ///
+    /// 延迟模式（`/cc`）下事件先缓冲，故以「是否已释放」为准；
+    /// 直通模式下首个事件即已发出，以「是否已初始化」为准。
+    /// ping 保活不算正文事件，不影响重放。
+    pub fn client_saw_output(&self) -> bool {
+        if self.delay_message_start {
+            self.message_start_released
+        } else {
+            self.stream_initialized
         }
     }
 
@@ -1608,16 +1628,21 @@ mod tests {
         })));
 
         // 3. contextUsage 到达
-        all.extend(ctx.take_events_for_kiro(&Event::ContextUsage(ContextUsageEvent {
-            context_usage_percentage: 12.5,
-        })));
+        all.extend(
+            ctx.take_events_for_kiro(&Event::ContextUsage(ContextUsageEvent {
+                context_usage_percentage: 12.5,
+            })),
+        );
 
         // 4. 收尾
         all.extend(ctx.finalize_stream());
 
         // message_start 必须恰好一次
         let starts = all.iter().filter(|e| e.event == "message_start").count();
-        assert_eq!(starts, 1, "message_start 应恰好一次，实际 {starts}: {all:?}");
+        assert_eq!(
+            starts, 1,
+            "message_start 应恰好一次，实际 {starts}: {all:?}"
+        );
 
         // 收集 tool_use 块的 partial_json，拼起来必须是合法 JSON
         let tool_json: String = all
@@ -1680,7 +1705,10 @@ mod tests {
 
         // message_start 必须恰好一次
         let starts = all.iter().filter(|e| e.event == "message_start").count();
-        assert_eq!(starts, 1, "message_start 应恰好一次，实际 {starts}: {all:?}");
+        assert_eq!(
+            starts, 1,
+            "message_start 应恰好一次，实际 {starts}: {all:?}"
+        );
 
         // 不应外泄任何 partial_json（半截参数）
         let leaked: Vec<&str> = all
@@ -1688,7 +1716,10 @@ mod tests {
             .filter(|e| e.event == "content_block_delta")
             .filter_map(|e| e.data["delta"]["partial_json"].as_str())
             .collect();
-        assert!(leaked.is_empty(), "不应外泄 tool_use 半截参数，实际: {leaked:?}");
+        assert!(
+            leaked.is_empty(),
+            "不应外泄 tool_use 半截参数，实际: {leaked:?}"
+        );
 
         // 应发出纠正文本
         let text: String = all
@@ -1696,7 +1727,10 @@ mod tests {
             .filter(|e| e.event == "content_block_delta")
             .filter_map(|e| e.data["delta"]["text"].as_str())
             .collect();
-        assert!(text.contains("output was truncated"), "应有纠正文本: {all:?}");
+        assert!(
+            text.contains("output was truncated"),
+            "应有纠正文本: {all:?}"
+        );
 
         // 块 start/stop 必须配对
         let mut opened: std::collections::HashMap<i64, i64> = std::collections::HashMap::new();
@@ -1712,20 +1746,23 @@ mod tests {
             }
         }
         for (idx, bal) in &opened {
-            assert_eq!(*bal, 0, "块 {idx} 的 start/stop 不配对（差值 {bal}）: {all:?}");
+            assert_eq!(
+                *bal, 0,
+                "块 {idx} 的 start/stop 不配对（差值 {bal}）: {all:?}"
+            );
         }
 
         // 纠正文本用的 text 块必须真的发过 content_block_start
         let text_delta_indices: std::collections::HashSet<i64> = all
             .iter()
-            .filter(|e| e.event == "content_block_delta"
-                && e.data["delta"]["type"] == "text_delta")
+            .filter(|e| e.event == "content_block_delta" && e.data["delta"]["type"] == "text_delta")
             .filter_map(|e| e.data["index"].as_i64())
             .collect();
         let text_start_indices: std::collections::HashSet<i64> = all
             .iter()
-            .filter(|e| e.event == "content_block_start"
-                && e.data["content_block"]["type"] == "text")
+            .filter(|e| {
+                e.event == "content_block_start" && e.data["content_block"]["type"] == "text"
+            })
             .filter_map(|e| e.data["index"].as_i64())
             .collect();
         for idx in &text_delta_indices {
@@ -1818,8 +1855,10 @@ mod tests {
         // 第一帧可能放行「关闭前置 text 块」的 content_block_stop（index 0），
         // 但绝不能外泄 tool_use 块的任何事件（start / partial_json）。
         assert!(
-            !buffered.iter().any(|e| e.event == "content_block_start"
-                || e.data["delta"]["partial_json"].is_string()),
+            !buffered
+                .iter()
+                .any(|e| e.event == "content_block_start"
+                    || e.data["delta"]["partial_json"].is_string()),
             "不完整的 tool_use 不应外泄 start 或参数增量，实际: {buffered:?}"
         );
 
@@ -2610,6 +2649,52 @@ mod tests {
             events.iter().any(|e| e.event == "message_delta"),
             "failure finalize should emit message_delta"
         );
+    }
+
+    /// 直通模式（/v1）：首个事件一到就已发给客户端，此后不可重放
+    #[test]
+    fn test_client_saw_output_passthrough() {
+        let mut ctx =
+            StreamContext::new_with_thinking("test-model", 1, false, HashMap::new(), false);
+        assert!(!ctx.client_saw_output(), "尚未处理任何事件时应可重放");
+
+        let out = ctx.take_events_for_kiro(&Event::AssistantResponse(
+            serde_json::from_str(r#"{"content":"hi"}"#).unwrap(),
+        ));
+        assert!(
+            out.iter().any(|e| e.event == "message_start"),
+            "直通模式首个事件应带 message_start，实际: {out:?}"
+        );
+        assert!(ctx.client_saw_output(), "message_start 已发出后不可重放");
+    }
+
+    /// 缓冲模式（/cc）：message_start 释放前仍可重放
+    #[test]
+    fn test_client_saw_output_delayed() {
+        use crate::kiro::model::events::ContextUsageEvent;
+
+        let mut ctx =
+            StreamContext::new_with_thinking("test-model", 1, false, HashMap::new(), true);
+        assert!(!ctx.client_saw_output());
+
+        // 不产出任何 SSE 的事件（metering 等）只会触发内部初始化，
+        // 客户端什么也没收到，仍应允许重放
+        let out = ctx.take_events_for_kiro(&Event::Unknown {});
+        assert!(out.is_empty(), "该事件不应产出 SSE，实际: {out:?}");
+        assert!(
+            !ctx.client_saw_output(),
+            "缓冲模式下未释放 message_start 前应仍可重放"
+        );
+
+        // contextUsage 到达 → 释放 message_start
+        let out = ctx.take_events_for_kiro(&Event::ContextUsage(ContextUsageEvent {
+            context_usage_percentage: 10.0,
+        }));
+        assert!(
+            out.iter().any(|e| e.event == "message_start"),
+            "contextUsage 应释放 message_start，实际: {out:?}"
+        );
+        assert!(ctx.client_saw_output(), "message_start 已释放后不可重放");
     }
 
     /// 从 message_delta 里取出 usage
