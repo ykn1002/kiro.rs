@@ -797,6 +797,22 @@ impl StreamContext {
         // 本方法用于两种收尾：调用方已发过 error 事件（解码失败等），或紧随其后
         // 补全 SSE 序列。无论哪种，残留的不完整 tool_use 事件都必须丢弃，避免半个
         // 参数 JSON 外泄。
+        //
+        // 关键：这些 tool_use 块的 content_block_start 只进了 buffered_tool_events、
+        // **从未发给客户端**，但块已登记进 active_blocks（started=true）。若只 clear()
+        // 缓冲而不注销块，generate_final_events 会为其补发一个孤立的 content_block_stop，
+        // 客户端收到「未曾 start 的 index 的 stop」即报 "Content block not found"。
+        // 因此必须先 discard_block 再 clear（与 take_truncated_tool_correction 一致）。
+        let dropped_ids: Vec<String> = self
+            .buffered_tool_events
+            .iter()
+            .map(|(id, _)| id.clone())
+            .collect();
+        for id in &dropped_ids {
+            if let Some(&idx) = self.tool_block_indices.get(id) {
+                self.state_manager.discard_block(idx);
+            }
+        }
         self.buffered_tool_events.clear();
         out.extend(
             self.state_manager
@@ -1851,6 +1867,55 @@ mod tests {
         assert!(
             !text.contains("truncated"),
             "完整调用不应触发纠正文本，实际: {text}"
+        );
+    }
+
+    /// 缓冲模式下中途断流：未收到 stop 的 tool_use 块只进了缓冲、从未发给客户端，
+    /// 优雅收尾时不能为其补发孤立的 content_block_stop（否则客户端报
+    /// "Content block not found"）。
+    #[test]
+    fn test_cc_interrupt_discards_buffered_tool_block() {
+        let mut ctx =
+            StreamContext::new_with_thinking("test-model", 1, false, HashMap::new(), true);
+        let _ = ctx.generate_initial_events();
+
+        // tool_use 参数流开始但收不到 stop —— 被截断，事件全进缓冲
+        let buffered = ctx.process_tool_use(&crate::kiro::model::events::ToolUseEvent {
+            name: "Write".to_string(),
+            tool_use_id: "toolu_01".to_string(),
+            input: r#"{"path":"/big.rs","content":"line1"#.to_string(),
+            stop: false,
+        });
+        // tool_use 块的 start 必须没放行（否则不是「未发出」的前提）
+        assert!(
+            !buffered.iter().any(|e| e.event == "content_block_start"),
+            "tool_use start 不应在 stop 前放行，实际: {buffered:?}"
+        );
+        // 记下 tool_use 块的 index，用于校验收尾不为它补 stop
+        let tool_idx = ctx.tool_block_indices["toolu_01"];
+
+        // 中途断流 → 优雅收尾
+        let final_events = ctx.finalize_stream_on_interrupt();
+
+        // 不能出现该 tool_use 块 index 的 content_block_stop（它从未 start 过）
+        assert!(
+            !final_events
+                .iter()
+                .any(|e| e.event == "content_block_stop" && e.data["index"] == tool_idx),
+            "不应为未发出的 tool_use 块补发孤立 content_block_stop，实际: {final_events:?}"
+        );
+        // 仍应正常封口
+        assert_eq!(
+            final_events
+                .iter()
+                .find(|e| e.event == "message_delta")
+                .expect("应有 message_delta")
+                .data["delta"]["stop_reason"],
+            "max_tokens"
+        );
+        assert!(
+            final_events.iter().any(|e| e.event == "message_stop"),
+            "应有 message_stop，实际: {final_events:?}"
         );
     }
 
