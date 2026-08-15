@@ -794,14 +794,30 @@ impl StreamContext {
 
         let final_input_tokens = self.effective_input_tokens();
         let final_output_tokens = self.effective_output_tokens().max(1);
-        // 失败路径已向客户端发过 error 事件，无需再追加纠正文本；但残留的不完整
-        // tool_use 事件必须丢弃，避免半个参数 JSON 外泄。
+        // 本方法用于两种收尾：调用方已发过 error 事件（解码失败等），或紧随其后
+        // 补全 SSE 序列。无论哪种，残留的不完整 tool_use 事件都必须丢弃，避免半个
+        // 参数 JSON 外泄。
         self.buffered_tool_events.clear();
         out.extend(
             self.state_manager
                 .generate_final_events(final_input_tokens, final_output_tokens),
         );
         out
+    }
+
+    /// 中途断流（已输出正文、无法透明重放）时的优雅收尾。
+    ///
+    /// 与 [`Self::finalize_stream_on_failure`] 的区别：**不向客户端发送 SSE `error`
+    /// 事件**，而是把已输出的内容以 `stop_reason=max_tokens` 正常封口
+    /// （`message_delta` + `message_stop`）。这样 Claude Code 会把已生成的部分当作
+    /// 一次有效（被截断）的回答接收，拿去继续补全，而不是判定整轮失败后重试整轮
+    /// ——后者既多扣配额又可能形成重试循环。
+    ///
+    /// 语义选 `max_tokens` 而非 `end_turn`：它明确表示「输出被截断」，客户端据此
+    /// 知道内容不完整、需要续写，避免把半截内容误当作模型主动结束的完整回答。
+    pub fn finalize_stream_on_interrupt(&mut self) -> Vec<SseEvent> {
+        self.state_manager.set_stop_reason("max_tokens");
+        self.finalize_stream_on_failure()
     }
 
     /// 生成 message_start 事件
@@ -2695,6 +2711,38 @@ mod tests {
             "contextUsage 应释放 message_start，实际: {out:?}"
         );
         assert!(ctx.client_saw_output(), "message_start 已释放后不可重放");
+    }
+
+    /// 中途断流的优雅收尾：不发 error，以 stop_reason=max_tokens 正常封口
+    #[test]
+    fn test_finalize_on_interrupt_no_error_max_tokens() {
+        let mut ctx =
+            StreamContext::new_with_thinking("test-model", 1, false, HashMap::new(), false);
+
+        // 先输出一段正文，模拟「已向客户端发过内容后中途断流」
+        let _ = ctx.take_events_for_kiro(&Event::AssistantResponse(
+            serde_json::from_str(r#"{"content":"hello"}"#).unwrap(),
+        ));
+        assert!(ctx.client_saw_output(), "输出正文后应视为已输出");
+
+        let events = ctx.finalize_stream_on_interrupt();
+
+        assert!(
+            !events.iter().any(|e| e.event == "error"),
+            "优雅收尾不应发送 error 事件，实际: {events:?}"
+        );
+        let delta = events
+            .iter()
+            .find(|e| e.event == "message_delta")
+            .expect("应有 message_delta");
+        assert_eq!(
+            delta.data["delta"]["stop_reason"], "max_tokens",
+            "中途断流收尾 stop_reason 应为 max_tokens"
+        );
+        assert!(
+            events.iter().any(|e| e.event == "message_stop"),
+            "优雅收尾应有 message_stop，实际: {events:?}"
+        );
     }
 
     /// 从 message_delta 里取出 usage

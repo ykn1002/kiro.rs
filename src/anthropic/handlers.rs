@@ -492,6 +492,8 @@ struct SseStreamState<S> {
     ping: tokio::time::Interval,
     /// 断流重连器
     restarter: StreamRestarter,
+    /// 流建立（拿到 200 响应头）的时刻，用于诊断断流距开始的耗时
+    started_at: std::time::Instant,
 }
 
 /// 创建 SSE 事件流
@@ -507,6 +509,7 @@ fn create_sse_stream(
         finished: false,
         ping: interval(Duration::from_secs(PING_INTERVAL_SECS)),
         restarter,
+        started_at: std::time::Instant::now(),
     };
 
     let processing_stream = stream::unfold(init, |state| async move {
@@ -517,6 +520,7 @@ fn create_sse_stream(
             finished,
             mut ping,
             mut restarter,
+            started_at,
         } = state;
 
         if finished {
@@ -532,6 +536,7 @@ fn create_sse_stream(
                     finished: $finished,
                     ping,
                     restarter,
+                    started_at,
                 }
             };
         }
@@ -580,8 +585,9 @@ fn create_sse_stream(
                             && let Some(resp) = restarter.restart().await
                         {
                             tracing::warn!(
-                                "上游断流且尚未向客户端输出，重放请求（剩余 {} 次）: {}",
+                                "上游断流且尚未向客户端输出，重放请求（剩余 {} 次，距流建立 {}ms）: {}",
                                 restarter.remaining,
+                                started_at.elapsed().as_millis(),
                                 e
                             );
                             body = resp.bytes_stream();
@@ -591,12 +597,47 @@ fn create_sse_stream(
                             return Some((stream::iter(empty), next_state!(false)));
                         }
 
-                        tracing::error!("读取响应流失败: {:?}", e);
+                        // 走到这里说明透明重放不适用或已兜不住，区分三种原因便于定位根因：
+                        // - saw_output：已向客户端输出正文，协议上无法重放（中途断流）
+                        // - timeout：本地 720s 硬超时，故意不重放
+                        // - 其余：首帧前断流但重放次数用尽 / 重放请求本身失败
+                        let elapsed_ms = started_at.elapsed().as_millis();
                         ctx.stream_failed = true;
-                        let mut events = vec![StreamContext::create_error_event(&format!(
-                            "Upstream stream error: {e}"
-                        ))];
-                        events.extend(ctx.finalize_stream_on_failure());
+                        let events = if ctx.client_saw_output() {
+                            // 中途断流：已输出正文，协议上无法重放。不向客户端发 error
+                            // （那会让 Claude Code 判定整轮失败、重试整轮，多扣配额且
+                            // 可能循环），而是以 stop_reason=max_tokens 优雅封口，让客户端
+                            // 把已生成部分当作被截断的有效回答接着补全。
+                            tracing::warn!(
+                                "上游中途断流（已输出正文，无法重放，优雅收尾 max_tokens，距流建立 {}ms）: {:?}",
+                                elapsed_ms,
+                                e
+                            );
+                            ctx.finalize_stream_on_interrupt()
+                        } else {
+                            // 未输出正文却仍走到这里：本地超时（故意不重放），或首帧前
+                            // 断流但重放次数用尽 / 重放请求本身失败。此时客户端还没收到
+                            // 任何正文，发 error 让它重试整轮是正确的。
+                            if e.is_timeout() {
+                                tracing::error!(
+                                    "读取响应流失败（本地超时，不重放，距流建立 {}ms）: {:?}",
+                                    elapsed_ms,
+                                    e
+                                );
+                            } else {
+                                tracing::error!(
+                                    "读取响应流失败（首帧前断流，重放未兜住，剩余 {} 次，距流建立 {}ms）: {:?}",
+                                    restarter.remaining,
+                                    elapsed_ms,
+                                    e
+                                );
+                            }
+                            let mut events = vec![StreamContext::create_error_event(&format!(
+                                "Upstream stream error: {e}"
+                            ))];
+                            events.extend(ctx.finalize_stream_on_failure());
+                            events
+                        };
                         let bytes: Vec<Result<Bytes, Infallible>> = events
                             .into_iter()
                             .map(|ev| Ok(Bytes::from(ev.to_sse_string())))
