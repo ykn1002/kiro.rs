@@ -136,6 +136,12 @@ pub async fn create_response(
 
     let tool_name_map = conversion_result.tool_name_map;
 
+    // code mode：请求 input 里含 additional_tools（codex gpt-5.6 responses-lite）
+    let code_mode = super::code_mode::request_uses_code_mode(&payload.input);
+    if code_mode {
+        tracing::info!("检测到 code mode 请求（additional_tools），启用 exec 桥接");
+    }
+
     // Codex 恒为 stream=true；未指定时也走流式
     if payload.stream {
         handle_responses_stream(
@@ -146,6 +152,7 @@ pub async fn create_response(
             thinking_enabled,
             tool_name_map,
             state.passthrough_retry_after,
+            code_mode,
         )
         .await
     } else {
@@ -157,11 +164,13 @@ pub async fn create_response(
             thinking_enabled,
             tool_name_map,
             state.passthrough_retry_after,
+            code_mode,
         )
         .await
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn handle_responses_stream(
     provider: std::sync::Arc<crate::kiro::provider::KiroProvider>,
     request_body: &str,
@@ -170,6 +179,7 @@ async fn handle_responses_stream(
     thinking_enabled: bool,
     tool_name_map: std::collections::HashMap<String, String>,
     passthrough_retry_after: bool,
+    code_mode: bool,
 ) -> Response {
     let response = match provider.call_api_stream(request_body, Some(model)).await {
         Ok(r) => r,
@@ -177,6 +187,7 @@ async fn handle_responses_stream(
     };
 
     let mut ctx = ResponsesStreamContext::new(model, input_tokens, thinking_enabled, tool_name_map);
+    ctx.set_code_mode(code_mode);
     let initial = ctx.generate_initial_events();
     let stream = create_responses_sse_stream(response, ctx, initial);
 
@@ -270,6 +281,7 @@ fn create_responses_sse_stream(
     initial_stream.chain(processing_stream)
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn handle_responses_non_stream(
     provider: std::sync::Arc<crate::kiro::provider::KiroProvider>,
     request_body: &str,
@@ -278,6 +290,7 @@ async fn handle_responses_non_stream(
     thinking_enabled: bool,
     tool_name_map: std::collections::HashMap<String, String>,
     passthrough_retry_after: bool,
+    code_mode: bool,
 ) -> Response {
     let response = match provider.call_api(request_body, Some(model)).await {
         Ok(r) => r,
@@ -328,14 +341,35 @@ async fn handle_responses_non_stream(
                             let (name, args) = tool_buffers
                                 .remove(&tool_use.tool_use_id)
                                 .unwrap_or_default();
-                            tool_items.push(json!({
-                                "id": format!("fc_{}", Uuid::new_v4().simple()),
-                                "type": "function_call",
-                                "status": "completed",
-                                "call_id": tool_use.tool_use_id,
-                                "name": name,
-                                "arguments": args
-                            }));
+                            if code_mode {
+                                // 合成 exec custom_tool_call（JS）
+                                let args_val: serde_json::Value = if args.trim().is_empty() {
+                                    json!({})
+                                } else {
+                                    serde_json::from_str(&args)
+                                        .unwrap_or_else(|_| json!({ "input": args }))
+                                };
+                                let freeform = super::code_mode::is_freeform_subtool(&name);
+                                let js =
+                                    super::code_mode::generate_exec_js(&name, &args_val, freeform);
+                                tool_items.push(json!({
+                                    "id": format!("ctc_{}", Uuid::new_v4().simple()),
+                                    "type": "custom_tool_call",
+                                    "status": "completed",
+                                    "call_id": format!("call_{}", Uuid::new_v4().simple()),
+                                    "name": super::code_mode::EXEC_TOOL_NAME,
+                                    "input": js
+                                }));
+                            } else {
+                                tool_items.push(json!({
+                                    "id": format!("fc_{}", Uuid::new_v4().simple()),
+                                    "type": "function_call",
+                                    "status": "completed",
+                                    "call_id": tool_use.tool_use_id,
+                                    "name": name,
+                                    "arguments": args
+                                }));
+                            }
                         }
                     }
                     Event::ContextUsage(cu) => {

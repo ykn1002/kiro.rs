@@ -24,6 +24,7 @@
 //!
 //! 然后设置环境变量：`export KIRO_RS_API_KEY=<config.json 中的 apiKey>`
 
+mod code_mode;
 mod converter;
 mod handlers;
 mod responses_converter;

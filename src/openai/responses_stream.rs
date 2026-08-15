@@ -63,6 +63,8 @@ pub struct ResponsesStreamContext {
     thinking_extracted: bool,
     reasoning_text: String,
     pub stream_failed: bool,
+    /// code mode：把子工具调用合成为 exec 的 custom_tool_call（内含 JS）回传给 codex。
+    code_mode: bool,
 }
 
 impl ResponsesStreamContext {
@@ -98,7 +100,13 @@ impl ResponsesStreamContext {
             thinking_extracted: false,
             reasoning_text: String::new(),
             stream_failed: false,
+            code_mode: false,
         }
+    }
+
+    /// 启用 code mode 输出转换（子工具调用 → exec custom_tool_call）。
+    pub fn set_code_mode(&mut self, enabled: bool) {
+        self.code_mode = enabled;
     }
 
     pub fn create_error_event(message: &str) -> ResponsesSseEvent {
@@ -407,6 +415,12 @@ impl ResponsesStreamContext {
             .cloned()
             .unwrap_or_else(|| tool_use.name.clone());
 
+        // code mode：把子工具调用合成为 exec 的 custom_tool_call。
+        // JS 需要完整参数，故仅缓冲，待 stop 时一次性发出 exec 事件序列。
+        if self.code_mode {
+            return self.process_tool_use_code_mode(tool_use, &original_name);
+        }
+
         let (item_id, call_id, name, item_added) = {
             if let Some(state) = self.tool_calls.get(&tool_use.tool_use_id) {
                 (
@@ -515,6 +529,117 @@ impl ResponsesStreamContext {
             ));
         }
 
+        events
+    }
+
+    /// code mode 下的工具输出：缓冲参数，stop 时合成一个 exec 的 custom_tool_call。
+    /// 其 input 是 `await tools.<subtool>(<args>);` 形式的 JS，由 codex 本地 code-mode-host 执行。
+    fn process_tool_use_code_mode(
+        &mut self,
+        tool_use: &crate::kiro::model::events::ToolUseEvent,
+        sub_name: &str,
+    ) -> Vec<ResponsesSseEvent> {
+        // 缓冲参数（沿用 tool_calls 的 arguments 字段，name 记子工具名）
+        let (item_id, call_id) = {
+            if let Some(state) = self.tool_calls.get(&tool_use.tool_use_id) {
+                (state.item_id.clone(), state.call_id.clone())
+            } else {
+                let item_id = format!("ctc_{}", Uuid::new_v4().simple());
+                let call_id = format!("call_{}", Uuid::new_v4().simple());
+                self.tool_calls.insert(
+                    tool_use.tool_use_id.clone(),
+                    ToolCallState {
+                        item_id: item_id.clone(),
+                        call_id: call_id.clone(),
+                        name: sub_name.to_string(),
+                        arguments: String::new(),
+                        item_added: false,
+                    },
+                );
+                (item_id, call_id)
+            }
+        };
+
+        if !tool_use.input.is_empty() {
+            if let Some(state) = self.tool_calls.get_mut(&tool_use.tool_use_id) {
+                state.arguments.push_str(&tool_use.input);
+            }
+            self.output_tokens += (tool_use.input.len() as i32 + 3) / 4;
+        }
+
+        if !tool_use.stop {
+            return Vec::new();
+        }
+
+        // stop：解析完整参数，生成 JS，发出 exec custom_tool_call 事件序列
+        let args_raw = self
+            .tool_calls
+            .get(&tool_use.tool_use_id)
+            .map(|s| s.arguments.clone())
+            .unwrap_or_default();
+        let args_val: Value = if args_raw.trim().is_empty() {
+            json!({})
+        } else {
+            serde_json::from_str(&args_raw).unwrap_or_else(|_| json!({ "input": args_raw }))
+        };
+        let freeform = super::code_mode::is_freeform_subtool(sub_name);
+        let js = super::code_mode::generate_exec_js(sub_name, &args_val, freeform);
+
+        let output_index = self.next_output_index;
+        self.next_output_index += 1;
+
+        let mut events = Vec::new();
+        let added_item = json!({
+            "id": item_id,
+            "type": "custom_tool_call",
+            "status": "in_progress",
+            "call_id": call_id,
+            "name": super::code_mode::EXEC_TOOL_NAME,
+            "input": ""
+        });
+        events.push(self.event(
+            "response.output_item.added",
+            json!({
+                "type": "response.output_item.added",
+                "output_index": output_index,
+                "item": added_item
+            }),
+        ));
+        events.push(self.event(
+            "response.custom_tool_call_input.delta",
+            json!({
+                "type": "response.custom_tool_call_input.delta",
+                "item_id": item_id,
+                "output_index": output_index,
+                "delta": js
+            }),
+        ));
+        events.push(self.event(
+            "response.custom_tool_call_input.done",
+            json!({
+                "type": "response.custom_tool_call_input.done",
+                "item_id": item_id,
+                "output_index": output_index,
+                "input": js
+            }),
+        ));
+        let done_item = json!({
+            "id": item_id,
+            "type": "custom_tool_call",
+            "status": "completed",
+            "call_id": call_id,
+            "name": super::code_mode::EXEC_TOOL_NAME,
+            "input": js
+        });
+        self.output_items.push(done_item.clone());
+        events.push(self.event(
+            "response.output_item.done",
+            json!({
+                "type": "response.output_item.done",
+                "output_index": output_index,
+                "item": done_item
+            }),
+        ));
         events
     }
 
@@ -686,6 +811,85 @@ mod tests {
                 .iter()
                 .any(|e| e.event_type == "response.completed")
         );
+    }
+
+    #[test]
+    fn test_code_mode_tool_use_emits_exec_custom_tool_call() {
+        let mut ctx = ResponsesStreamContext::new("gpt-5.6-terra", 10, false, HashMap::new());
+        ctx.set_code_mode(true);
+
+        // 模拟上游分块下发 apply_patch 调用
+        let patch = "*** Begin Patch\n*** Add File: a.txt\n+hi\n*** End Patch";
+        let args = serde_json::json!({ "input": patch }).to_string();
+        let ev1: crate::kiro::model::events::ToolUseEvent = serde_json::from_value(json!({
+            "toolUseId": "tu_1", "name": "apply_patch", "input": args, "stop": false
+        }))
+        .unwrap();
+        let out1 = ctx.process_kiro_event(&Event::ToolUse(ev1));
+        assert!(out1.is_empty(), "未 stop 前不应发事件（缓冲中）");
+
+        let ev2: crate::kiro::model::events::ToolUseEvent = serde_json::from_value(json!({
+            "toolUseId": "tu_1", "name": "apply_patch", "input": "", "stop": true
+        }))
+        .unwrap();
+        let out2 = ctx.process_kiro_event(&Event::ToolUse(ev2));
+
+        // 应发出 custom_tool_call（name=exec）序列，且 input 是 JS
+        let done = out2
+            .iter()
+            .find(|e| e.event_type == "response.output_item.done")
+            .expect("应有 output_item.done");
+        let item = &done.data["item"];
+        assert_eq!(item["type"], "custom_tool_call");
+        assert_eq!(item["name"], "exec");
+        let js = item["input"].as_str().unwrap();
+        assert!(js.starts_with("await tools.apply_patch("));
+        assert!(js.contains("Begin Patch"));
+
+        // 有 input.delta 事件
+        assert!(
+            out2.iter()
+                .any(|e| e.event_type == "response.custom_tool_call_input.delta")
+        );
+    }
+
+    #[test]
+    fn test_code_mode_exec_command_wraps_text() {
+        // 取值型子工具（exec_command）：JS 应用 text() 包裹返回值，模型才看得到输出
+        let mut ctx = ResponsesStreamContext::new("gpt-5.6-terra", 10, false, HashMap::new());
+        ctx.set_code_mode(true);
+        let ev: crate::kiro::model::events::ToolUseEvent = serde_json::from_value(json!({
+            "toolUseId": "tu_2", "name": "exec_command",
+            "input": "{\"cmd\":\"free -h\"}", "stop": true
+        }))
+        .unwrap();
+        let out = ctx.process_kiro_event(&Event::ToolUse(ev));
+        let done = out
+            .iter()
+            .find(|e| e.event_type == "response.output_item.done")
+            .expect("应有 output_item.done");
+        let js = done.data["item"]["input"].as_str().unwrap();
+        assert!(
+            js.starts_with("text(await tools.exec_command("),
+            "实际: {js}"
+        );
+        assert!(js.contains("free -h"));
+    }
+
+    #[test]
+    fn test_non_code_mode_tool_use_stays_function_call() {
+        let mut ctx = ResponsesStreamContext::new("claude-sonnet-4-6", 10, false, HashMap::new());
+        // 未启用 code mode
+        let ev: crate::kiro::model::events::ToolUseEvent = serde_json::from_value(json!({
+            "toolUseId": "tu_1", "name": "get_weather", "input": "{\"city\":\"SG\"}", "stop": true
+        }))
+        .unwrap();
+        let out = ctx.process_kiro_event(&Event::ToolUse(ev));
+        let done = out
+            .iter()
+            .find(|e| e.event_type == "response.output_item.done")
+            .expect("应有 output_item.done");
+        assert_eq!(done.data["item"]["type"], "function_call");
     }
 
     #[test]

@@ -5,6 +5,7 @@ use std::collections::HashMap;
 use crate::anthropic::types::{Message, MessagesRequest, SystemMessage, Thinking, Tool};
 use crate::anthropic::{ConversionError, map_model, metadata_from_openai_extra};
 
+use super::code_mode;
 use super::responses_types::ResponsesRequest;
 
 /// 将 Responses API 请求转换为 Anthropic MessagesRequest
@@ -67,7 +68,15 @@ pub fn responses_to_anthropic(req: &ResponsesRequest) -> Result<MessagesRequest,
         }])
     };
 
-    let tools = convert_response_tools(&req.tools);
+    // code mode：工具在 input 的 additional_tools item 里，需拆解合并到顶层 tools
+    let mut tools = convert_response_tools(&req.tools);
+    let code_mode_tools = extract_code_mode_tools_as_anthropic(&req.input);
+    if !code_mode_tools.is_empty() {
+        let mut merged = tools.take().unwrap_or_default();
+        merged.extend(code_mode_tools);
+        tools = Some(merged);
+    }
+
     let tool_choice = convert_response_tool_choice(&req.tool_choice);
     let (thinking, output_config) = infer_thinking_from_responses(req);
 
@@ -426,6 +435,19 @@ fn extract_custom_tool_call(item: &serde_json::Value) -> (String, serde_json::Va
         .and_then(|v| v.as_str())
         .unwrap_or("custom")
         .to_string();
+
+    // code mode：name=exec 的 custom_tool_call 是我们上一轮合成的 JS，
+    // 还原成真实子工具调用，让上游看到连贯历史（assistant 调 apply_patch 而非 exec）。
+    if name == code_mode::EXEC_TOOL_NAME {
+        if let Some(raw) = item.get("input").and_then(|v| v.as_str()) {
+            if let Some((sub_name, sub_input)) = code_mode::parse_exec_js(raw) {
+                return (sub_name, sub_input);
+            }
+            // 解析失败：把整段 JS 作为 exec 的原始输入透传
+            return (name, serde_json::json!({ "input": raw }));
+        }
+    }
+
     let input = match item.get("input") {
         Some(serde_json::Value::String(raw)) => {
             serde_json::from_str(raw).unwrap_or_else(|_| serde_json::json!({ "input": raw }))
@@ -606,6 +628,33 @@ fn parse_data_url(url: &str) -> Option<(String, String)> {
     let (meta, data) = rest.split_once(',')?;
     let media_type = meta.split(';').next()?.to_string();
     Some((media_type, data.to_string()))
+}
+
+/// 从 code mode 的 additional_tools item 中拆解子工具，转成 Anthropic Tool 列表。
+/// 非 code mode 请求（无 additional_tools）返回空。
+fn extract_code_mode_tools_as_anthropic(input: &[serde_json::Value]) -> Vec<Tool> {
+    let mut result = Vec::new();
+    for item in input {
+        if !code_mode::is_additional_tools_item(item) {
+            continue;
+        }
+        for cmt in code_mode::extract_code_mode_tools(item) {
+            let normalized = crate::anthropic::normalize_tool_schema(cmt.parameters);
+            let input_schema = if let serde_json::Value::Object(obj) = normalized {
+                obj.into_iter().collect()
+            } else {
+                HashMap::new()
+            };
+            result.push(Tool {
+                tool_type: None,
+                name: cmt.name,
+                description: cmt.description,
+                input_schema,
+                max_uses: None,
+            });
+        }
+    }
+    result
 }
 
 fn convert_response_tools(tools: &Option<Vec<serde_json::Value>>) -> Option<Vec<Tool>> {
