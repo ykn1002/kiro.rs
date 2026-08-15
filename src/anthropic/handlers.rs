@@ -520,7 +520,7 @@ fn create_sse_stream(
             finished,
             mut ping,
             mut restarter,
-            started_at,
+            mut started_at,
         } = state;
 
         if finished {
@@ -585,7 +585,7 @@ fn create_sse_stream(
                             && let Some(resp) = restarter.restart().await
                         {
                             tracing::warn!(
-                                "上游断流且尚未向客户端输出，重放请求（剩余 {} 次，距流建立 {}ms）: {}",
+                                "上游断流且尚未向客户端输出，重放请求（剩余 {} 次，本次尝试等待 {}ms）: {}",
                                 restarter.remaining,
                                 started_at.elapsed().as_millis(),
                                 e
@@ -593,6 +593,9 @@ fn create_sse_stream(
                             body = resp.bytes_stream();
                             decoder = EventStreamDecoder::new();
                             ctx = restarter.build_ctx();
+                            // 重置计时：后续 elapsed 反映「本次重放尝试」等了多久，
+                            // 而非从最初尝试累计（否则第 2 次重放的数字会误导）。
+                            started_at = std::time::Instant::now();
                             let empty: Vec<Result<Bytes, Infallible>> = Vec::new();
                             return Some((stream::iter(empty), next_state!(false)));
                         }
