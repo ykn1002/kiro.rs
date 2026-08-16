@@ -74,6 +74,7 @@ export function SettingsDialog({ open, onOpenChange }: SettingsDialogProps) {
   const [chunkedEnabled, setChunkedEnabled] = useState(false)
   const [chunkedTriggerLines, setChunkedTriggerLines] = useState('150')
   const [chunkedChunkLines, setChunkedChunkLines] = useState('50')
+  const [codexTruncationCorrection, setCodexTruncationCorrection] = useState(true)
 
   // 打开对话框（或拉到数据）时用服务端值回填表单
   useEffect(() => {
@@ -96,6 +97,7 @@ export function SettingsDialog({ open, onOpenChange }: SettingsDialogProps) {
     setChunkedEnabled(config.chunkedWritePolicy?.enabled ?? false)
     setChunkedTriggerLines(String(config.chunkedWritePolicy?.triggerLines ?? 150))
     setChunkedChunkLines(String(config.chunkedWritePolicy?.chunkLines ?? 50))
+    setCodexTruncationCorrection(config.codexTruncationCorrection ?? true)
   }, [open, config])
 
   const updateModel = (index: number, patch: Partial<ModelDef>) => {
@@ -224,6 +226,7 @@ export function SettingsDialog({ open, onOpenChange }: SettingsDialogProps) {
           triggerLines: triggerLines || 150,
           chunkLines: chunkLines || 50,
         },
+        codexTruncationCorrection,
       },
       {
         onSuccess: () => {
@@ -390,6 +393,27 @@ export function SettingsDialog({ open, onOpenChange }: SettingsDialogProps) {
                   <span className="text-amber-600 dark:text-amber-500">
                     {' '}
                     注意：Kiro 按请求次数计费，分块会把一次写入拆成多次工具往返，显著增加配额消耗。
+                  </span>
+                </p>
+              </section>
+
+              {/* codex 截断纠正 */}
+              <section className="space-y-2">
+                <div className="flex items-center justify-between">
+                  <h3 className="text-sm font-semibold">codex 截断纠正</h3>
+                  <Switch
+                    checked={codexTruncationCorrection}
+                    onCheckedChange={setCodexTruncationCorrection}
+                    disabled={isPending}
+                  />
+                </div>
+                <p className="text-xs text-muted-foreground">
+                  codex（/v1/responses）端工具参数被 max_tokens 截断时（收到开始却无 stop），
+                  追加一段分块纠正文本提示模型分块写，行数取上面的「每块行数」。关闭后仅停用纠正文本，
+                  挂空 item 的封口修复（补 output_item.done、置 status=incomplete）仍无条件生效。
+                  <span className="text-muted-foreground">
+                    {' '}
+                    注意：此开关只作用于 codex 客户端，其对纠正文本的实际响应需自行验证。
                   </span>
                 </p>
               </section>

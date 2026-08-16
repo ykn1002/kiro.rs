@@ -240,6 +240,8 @@ pub struct AppConfigResponse {
     pub model_aliases: HashMap<String, String>,
     /// Write/Edit 分块写入策略
     pub chunked_write_policy: ChunkedWritePolicy,
+    /// codex（/v1/responses）工具参数截断纠正开关
+    pub codex_truncation_correction: bool,
 }
 
 /// 更新应用配置请求（全量替换可编辑子集）
@@ -284,6 +286,9 @@ pub struct UpdateAppConfigRequest {
     /// Write/Edit 分块写入策略；缺省时不更新（兼容旧 Admin UI）
     #[serde(default)]
     pub chunked_write_policy: Option<ChunkedWritePolicy>,
+    /// codex 工具参数截断纠正开关；缺省时不更新（兼容旧 Admin UI）
+    #[serde(default)]
+    pub codex_truncation_correction: Option<bool>,
 }
 
 // ============ 通用响应 ============

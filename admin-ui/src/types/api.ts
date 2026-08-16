@@ -143,6 +143,7 @@ export interface AppConfig {
   defaultModel?: string | null
   modelAliases: Record<string, string>
   chunkedWritePolicy: ChunkedWritePolicy
+  codexTruncationCorrection: boolean
 }
 
 // 更新应用配置请求（全量替换可编辑子集）
@@ -162,4 +163,5 @@ export interface UpdateAppConfigRequest {
   defaultModel?: string | null
   modelAliases: Record<string, string>
   chunkedWritePolicy: ChunkedWritePolicy
+  codexTruncationCorrection?: boolean
 }

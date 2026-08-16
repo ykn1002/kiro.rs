@@ -353,6 +353,7 @@ impl AdminService {
             default_model: config.default_model.clone(),
             model_aliases: config.model_aliases.clone(),
             chunked_write_policy: config.chunked_write_policy.clone(),
+            codex_truncation_correction: config.codex_truncation_correction,
         }
     }
 
@@ -499,6 +500,9 @@ impl AdminService {
         if let Some(ref policy) = req.chunked_write_policy {
             new_config.chunked_write_policy = policy.clone();
         }
+        if let Some(enabled) = req.codex_truncation_correction {
+            new_config.codex_truncation_correction = enabled;
+        }
 
         if config_path.is_some() {
             new_config.save().map_err(|e| {
@@ -512,6 +516,7 @@ impl AdminService {
         *self.shared_api_key.write() = api_key.to_string();
         crate::anthropic::init_model_mapping(req.models, normalized_aliases, default_model);
         crate::anthropic::set_chunked_write_policy(new_config.chunked_write_policy.clone());
+        crate::openai::set_codex_truncation_correction(new_config.codex_truncation_correction);
         self.token_manager.replace_config(new_config);
 
         tracing::info!("应用配置已更新并热生效");
