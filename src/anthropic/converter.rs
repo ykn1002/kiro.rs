@@ -760,6 +760,12 @@ fn process_message_content(
                         }
                         "tool_result" => {
                             if let Some(tool_use_id) = block.tool_use_id {
+                                // 提取 tool_result 内嵌的图片，提升到顶层 images。
+                                // Claude Code 读取图片时，图片作为工具返回值嵌在
+                                // tool_result.content 里，而 Kiro 的 tool_result 通道只支持
+                                // 文本，因此这些图片必须改走消息的 images 字段才能传到上游。
+                                images.extend(extract_tool_result_images(&block.content));
+
                                 let result_content = extract_tool_result_content(&block.content);
                                 let is_error = block.is_error.unwrap_or(false);
 
@@ -784,6 +790,34 @@ fn process_message_content(
     }
 
     Ok((text_parts.join("\n"), images, tool_results))
+}
+
+/// 从 tool_result 内容中提取内嵌的图片
+///
+/// Claude Code 读取图片时会把图片作为工具返回值放进 tool_result.content 数组，
+/// 形如 `{ "type": "image", "source": { "media_type": "image/jpeg", "data": "..." } }`。
+/// Kiro 的 tool_result 通道不支持图片，因此这里把它们抽出来，交由调用方提升到消息的
+/// 顶层 images 字段。
+fn extract_tool_result_images(content: &Option<serde_json::Value>) -> Vec<KiroImage> {
+    let mut images = Vec::new();
+    if let Some(serde_json::Value::Array(arr)) = content {
+        for item in arr {
+            if item.get("type").and_then(|v| v.as_str()) != Some("image") {
+                continue;
+            }
+            let Some(source) = item.get("source") else {
+                continue;
+            };
+            let media_type = source.get("media_type").and_then(|v| v.as_str());
+            let data = source.get("data").and_then(|v| v.as_str());
+            if let (Some(media_type), Some(data)) = (media_type, data) {
+                if let Some(format) = get_image_format(media_type) {
+                    images.push(KiroImage::from_base64(format, data));
+                }
+            }
+        }
+    }
+    images
 }
 
 /// 从 media_type 获取图片格式
@@ -2325,6 +2359,77 @@ mod tests {
                 .len(),
             1
         );
+    }
+
+    #[test]
+    fn test_extract_tool_result_images() {
+        let content = Some(serde_json::json!([
+            {
+                "type": "image",
+                "source": {"type": "base64", "media_type": "image/jpeg", "data": "AAAA"}
+            },
+            {"type": "text", "text": "看这张图"},
+            {
+                "type": "image",
+                "source": {"type": "base64", "media_type": "image/svg+xml", "data": "ZZZZ"}
+            }
+        ]));
+
+        let images = extract_tool_result_images(&content);
+        // svg+xml 不在支持列表中，应被跳过；只保留 jpeg 一张
+        assert_eq!(images.len(), 1);
+        assert_eq!(images[0].format, "jpeg");
+        assert_eq!(images[0].source.bytes, "AAAA");
+    }
+
+    #[test]
+    fn test_convert_request_promotes_tool_result_image_to_images() {
+        let req = MessagesRequest {
+            model: "claude-sonnet-4-6".to_string(),
+            max_tokens: 1024,
+            messages: vec![
+                super::super::types::Message {
+                    role: "user".to_string(),
+                    content: serde_json::json!("读取这张图片"),
+                },
+                super::super::types::Message {
+                    role: "assistant".to_string(),
+                    content: serde_json::json!([{
+                        "type": "tool_use",
+                        "id": "call_read",
+                        "name": "Read",
+                        "input": {"file_path": "/tmp/a.jpeg"}
+                    }]),
+                },
+                super::super::types::Message {
+                    role: "user".to_string(),
+                    content: serde_json::json!([{
+                        "type": "tool_result",
+                        "tool_use_id": "call_read",
+                        "content": [
+                            {
+                                "type": "image",
+                                "source": {"type": "base64", "media_type": "image/jpeg", "data": "AAAA"}
+                            }
+                        ]
+                    }]),
+                },
+            ],
+            stream: true,
+            system: None,
+            tools: None,
+            tool_choice: None,
+            thinking: None,
+            output_config: None,
+            metadata: None,
+        };
+
+        let result = convert_request(&req).unwrap();
+        let user_input = &result.conversation_state.current_message.user_input_message;
+        // 图片应从 tool_result 提升到当前消息的 images
+        assert_eq!(user_input.images.len(), 1);
+        assert_eq!(user_input.images[0].format, "jpeg");
+        assert_eq!(user_input.images[0].source.bytes, "AAAA");
     }
 
     #[test]

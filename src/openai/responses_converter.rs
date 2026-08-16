@@ -297,22 +297,8 @@ fn convert_response_content_array(parts: &[serde_json::Value]) -> serde_json::Va
         }
         match typ {
             "input_image" => {
-                let url = part.get("image_url").and_then(|v| {
-                    v.as_str()
-                        .map(str::to_string)
-                        .or_else(|| v.get("url").and_then(|u| u.as_str()).map(str::to_string))
-                });
-                if let Some(url) = url {
-                    if let Some((media_type, data)) = parse_data_url(&url) {
-                        blocks.push(serde_json::json!({
-                            "type": "image",
-                            "source": {
-                                "type": "base64",
-                                "media_type": media_type,
-                                "data": data
-                            }
-                        }));
-                    }
+                if let Some(image) = convert_input_image_part(part) {
+                    blocks.push(image);
                 }
             }
             "input_file" => {
@@ -345,6 +331,24 @@ fn convert_response_content_array(parts: &[serde_json::Value]) -> serde_json::Va
     } else {
         serde_json::Value::Array(blocks)
     }
+}
+
+/// 将 Responses 的 input_image 内容块转换为 Anthropic image 块。
+fn convert_input_image_part(part: &serde_json::Value) -> Option<serde_json::Value> {
+    let url = part.get("image_url").and_then(|v| {
+        v.as_str()
+            .map(str::to_string)
+            .or_else(|| v.get("url").and_then(|u| u.as_str()).map(str::to_string))
+    })?;
+    let (media_type, data) = parse_data_url(&url)?;
+    Some(serde_json::json!({
+        "type": "image",
+        "source": {
+            "type": "base64",
+            "media_type": media_type,
+            "data": data
+        }
+    }))
 }
 
 fn convert_agent_message_item(item: &serde_json::Value) -> Message {
@@ -513,13 +517,22 @@ fn convert_function_output_item(item: &serde_json::Value) -> Message {
         .map(extract_output_value)
         .unwrap_or_default();
 
+    let mut blocks = vec![serde_json::json!({
+        "type": "tool_result",
+        "tool_use_id": call_id,
+        "content": output
+    })];
+
+    // code-mode-host 会把 image(await tools.view_image(...)) 的结果编码为
+    // custom_tool_call_output.output 中的 input_image。不能将它压成工具结果文本，
+    // 否则图片会在本层丢失，无法传到 Kiro 上游。
+    if let Some(parts) = item.get("output").and_then(|v| v.as_array()) {
+        blocks.extend(parts.iter().filter_map(convert_input_image_part));
+    }
+
     Message {
         role: "user".to_string(),
-        content: serde_json::json!([{
-            "type": "tool_result",
-            "tool_use_id": call_id,
-            "content": output
-        }]),
+        content: serde_json::Value::Array(blocks),
     }
 }
 
@@ -1146,5 +1159,57 @@ mod tests {
         };
         let anthropic = responses_to_anthropic(&req).unwrap();
         assert_eq!(anthropic.messages.len(), 3);
+    }
+
+    #[test]
+    fn test_custom_tool_output_keeps_view_image_result() {
+        setup();
+        let req = ResponsesRequest {
+            model: "claude-sonnet-4-6".to_string(),
+            instructions: None,
+            input: vec![
+                serde_json::json!({
+                    "type": "custom_tool_call",
+                    "call_id": "call_image",
+                    "name": "exec",
+                    "input": "image(await tools.view_image({\"path\":\"/tmp/a.png\"}));"
+                }),
+                serde_json::json!({
+                    "type": "custom_tool_call_output",
+                    "call_id": "call_image",
+                    "output": [
+                        {"type": "input_text", "text": "图片已读取"},
+                        {"type": "input_image", "image_url": "data:image/png;base64,aGVsbG8="}
+                    ]
+                }),
+            ],
+            tools: None,
+            tool_choice: None,
+            stream: true,
+            max_output_tokens: None,
+            reasoning: None,
+            extra: HashMap::new(),
+        };
+
+        let anthropic = responses_to_anthropic(&req).unwrap();
+        let output = anthropic
+            .messages
+            .iter()
+            .find(|message| {
+                message.role == "user"
+                    && message.content.as_array().is_some_and(|blocks| {
+                        blocks.iter().any(|block| block["type"] == "tool_result")
+                    })
+            })
+            .expect("应保留工具输出");
+        let blocks = output.content.as_array().unwrap();
+
+        assert_eq!(blocks[0]["content"], "图片已读取");
+        let image = blocks
+            .iter()
+            .find(|block| block["type"] == "image")
+            .expect("input_image 应转换为 Anthropic image 块");
+        assert_eq!(image["source"]["media_type"], "image/png");
+        assert_eq!(image["source"]["data"], "aGVsbG8=");
     }
 }
