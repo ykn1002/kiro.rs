@@ -542,7 +542,7 @@ fn event_block_index(e: &SseEvent) -> Option<i32> {
 /// `str_replace` 替换为 Claude Code 侧实际可用的 `Write` / `Edit`。
 /// `{limit}` 由生效的 `chunkedWritePolicy.writeLimitLines` 代入（默认 50，
 /// 与官方 `WRITE_LIMIT` 一致）。
-fn truncated_tool_correction(chunk_lines: u32) -> String {
+pub(crate) fn truncated_tool_correction(chunk_lines: u32) -> String {
     format!(
         "The model output was truncated before this tool call was complete. The tool was NOT \
          executed. When writing files, limit each Write call to {chunk_lines} lines or \

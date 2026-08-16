@@ -201,6 +201,7 @@ docker-compose up
 | `passthroughRetryAfter` | boolean | `false` | 向客户端透传 429 时是否附带 `Retry-After` 响应头（上游或本地 RPM 计算的等待秒数）。默认关闭，避免部分客户端按大值长时间退避 |
 | `extractThinking` | boolean | `true` | 非流式响应的 thinking 块提取。启用后 `<thinking>` 标签会被解析为独立的 `thinking` 内容块 |
 | `chunkedWritePolicy` | object | 关闭 | Write/Edit 分块写入策略，字段 `enabled` / `triggerLines`（默认 150）/ `chunkLines`（默认 50）。启用后向工具描述与系统提示词注入「超长内容分块写入」约束，规避模型输出被截断导致 tool_use 参数不完整、整次调用作废。内容超过 `triggerLines` 才分块，每块不超过 `chunkLines`。每块的 50 对齐 Kiro IDE 本体导出的 `WRITE_LIMIT` 常量（值为 `"50 lines"`，官方用行数且该常量仅为提示词文本、不参与程序校验）；官方对 `fs_write` 用同一个 50 既作阈值又作块大小，这里把阈值放宽到 150，让中小文件一次写完少扣一次配额。`/cc` 截断后回灌给模型的纠正指令使用 `chunkLines`。注意 Kiro 按请求次数计费，分块会拆成多次工具往返，**增加**配额消耗，故默认关闭。兼容旧写法：裸布尔 `true`、单值 `writeLimitLines`（同时作阈值与块大小）、`triggerBytes`/`chunkBytes`（按 35 字节/行折回行数并打告警）。`triggerLines` 小于 `chunkLines` 时会被抬到 `chunkLines`。可在 Admin UI 设置中调整 |
+| `codexTruncationCorrection` | bool | `true` | codex（`/v1/responses`）端点工具参数被 `max_tokens` 截断时（收到开始却无 `stop`）是否回灌一段分块纠正文本，提示模型分块写。code mode 下写文件走标准 JSON tool_call，截断的残缺调用原本会被静默丢弃、客户端一无所知；开启后追加与 `/cc` 一致的纠正文本，纠正行数取 `chunkedWritePolicy.chunkLines`（默认 50）。关闭后仅追加纠正文本这一步停用，**挂空 item 的封口修复（补 `output_item.done`、置 `status=incomplete`）无条件生效**。注意此开关只作用于 codex 客户端，其对纠正文本的实际响应需自行验证 |
 | `defaultEndpoint` | string | `ide` | 默认 Kiro 端点。凭据未显式指定 `endpoint` 时使用。当前支持：`ide` |
 | `models` | array | 内置默认表 | 模型列表（驱动 `/v1/models` 展示、模型名映射、上下文窗口判断）。未配置时使用内置默认表，**完全向后兼容**；一旦提供则整张表以配置为准。每项字段见下方说明 |
 

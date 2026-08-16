@@ -319,6 +319,16 @@ pub struct Config {
     #[serde(default)]
     pub chunked_write_policy: ChunkedWritePolicy,
 
+    /// codex（`/v1/responses`）端点工具参数被截断时是否回灌分块纠正文本（默认开）
+    ///
+    /// code mode 下模型写文件走标准 JSON tool_call，参数被 `max_tokens` 截断时
+    /// （收到开始却无 `stop`），残缺调用会被静默丢弃、客户端一无所知。开启后追加
+    /// 一段与 `/cc` 一致的纠正文本，提示模型分块写。行数取 `chunkedWritePolicy.chunk_lines`。
+    ///
+    /// 注意：挂空 item 的封口修复无条件生效，此开关只控制纠正文本的追加。
+    #[serde(default = "default_codex_truncation_correction")]
+    pub codex_truncation_correction: bool,
+
     /// 默认端点名称（凭据未显式指定 endpoint 时使用，默认 "ide"）
     #[serde(default = "default_endpoint")]
     pub default_endpoint: String,
@@ -399,6 +409,10 @@ fn default_load_balancing_mode() -> String {
 }
 
 fn default_extract_thinking() -> bool {
+    true
+}
+
+fn default_codex_truncation_correction() -> bool {
     true
 }
 
@@ -534,6 +548,7 @@ impl Default for Config {
             passthrough_retry_after: false,
             extract_thinking: default_extract_thinking(),
             chunked_write_policy: ChunkedWritePolicy::default(),
+            codex_truncation_correction: default_codex_truncation_correction(),
             default_endpoint: default_endpoint(),
             endpoints: HashMap::new(),
             models: None,

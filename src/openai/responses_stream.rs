@@ -34,6 +34,11 @@ struct ToolCallState {
     name: String,
     arguments: String,
     item_added: bool,
+    /// 是否已收到 `stop`（完整）。流结束时 `!finished` 且已开始输出即视为被截断。
+    finished: bool,
+    /// `output_item.added` 时分配的 output_index，截断收尾补 `output_item.done` 时复用。
+    /// code mode 下 item 在 `stop` 时才分配 index，截断时为 `None`（从未发出任何事件，无需封口）。
+    output_index: Option<i32>,
 }
 
 /// Responses 流式上下文
@@ -440,6 +445,8 @@ impl ResponsesStreamContext {
                         name: original_name.clone(),
                         arguments: String::new(),
                         item_added: false,
+                        finished: false,
+                        output_index: None,
                     },
                 );
                 (item_id, call_id, original_name, false)
@@ -460,6 +467,7 @@ impl ResponsesStreamContext {
         if !item_added {
             if let Some(state) = self.tool_calls.get_mut(&tool_use.tool_use_id) {
                 state.item_added = true;
+                state.output_index = Some(output_index);
             }
             events.push(self.event(
                 "response.output_item.added",
@@ -495,6 +503,9 @@ impl ResponsesStreamContext {
         }
 
         if tool_use.stop {
+            if let Some(state) = self.tool_calls.get_mut(&tool_use.tool_use_id) {
+                state.finished = true;
+            }
             let args = self
                 .tool_calls
                 .get(&tool_use.tool_use_id)
@@ -554,6 +565,8 @@ impl ResponsesStreamContext {
                         name: sub_name.to_string(),
                         arguments: String::new(),
                         item_added: false,
+                        finished: false,
+                        output_index: None,
                     },
                 );
                 (item_id, call_id)
@@ -569,6 +582,10 @@ impl ResponsesStreamContext {
 
         if !tool_use.stop {
             return Vec::new();
+        }
+
+        if let Some(state) = self.tool_calls.get_mut(&tool_use.tool_use_id) {
+            state.finished = true;
         }
 
         // stop：解析完整参数，生成 JS，发出 exec custom_tool_call 事件序列
@@ -643,6 +660,97 @@ impl ResponsesStreamContext {
         events
     }
 
+    /// 处理被截断的工具调用：模型输出在参数 JSON 写完前被 `max_tokens` 截断
+    /// （收到开始却无 `stop`）。
+    ///
+    /// - **普通 function_call**：`output_item.added` + 半截 `arguments.delta` 已透传给
+    ///   客户端，但缺 `output_item.done`。这里无条件补一个 `done` 封口，避免客户端挂着
+    ///   一个永不完成的 item（正确性修复，不受开关控制）。
+    /// - **code mode**：exec 事件在 `stop` 时才一次性发出，截断时一个事件都没发过，
+    ///   天然「丢弃」，无需封口。
+    ///
+    /// 若存在任一被截断的工具调用，把状态置为 `incomplete`，并在开关开启时追加一段
+    /// 与 `/cc` 一致的纠正文本（提示模型分块写）。挂空 item 的封口无条件生效，纠正
+    /// 文本受 `codexTruncationCorrection` 控制。
+    fn finalize_truncated_tool_calls(&mut self) -> Vec<ResponsesSseEvent> {
+        // 收集被截断的调用：未收到 stop 且已开始写参数
+        let mut truncated: Vec<(String, Option<i32>)> = self
+            .tool_calls
+            .values()
+            .filter(|s| !s.finished && !s.arguments.is_empty())
+            .map(|s| (s.item_id.clone(), s.output_index))
+            .collect();
+        if truncated.is_empty() {
+            return Vec::new();
+        }
+        // 输出顺序稳定：按 output_index 排序（code mode 的 None 排在最后）
+        truncated.sort_by_key(|(_, idx)| idx.unwrap_or(i32::MAX));
+
+        let mut events = Vec::new();
+
+        // 普通 function_call：补 output_item.done 封口挂空的 item
+        for (item_id, output_index) in &truncated {
+            let Some(output_index) = output_index else {
+                continue; // code mode：从未发出 added，无需封口
+            };
+            let args = self
+                .tool_calls
+                .values()
+                .find(|s| &s.item_id == item_id)
+                .map(|s| (s.call_id.clone(), s.name.clone(), s.arguments.clone()));
+            let Some((call_id, name, args)) = args else {
+                continue;
+            };
+            let fc_item = json!({
+                "id": item_id,
+                "type": "function_call",
+                "status": "incomplete",
+                "call_id": call_id,
+                "name": name,
+                "arguments": args
+            });
+            self.output_items.push(fc_item.clone());
+            events.push(self.event(
+                "response.output_item.done",
+                json!({
+                    "type": "response.output_item.done",
+                    "output_index": output_index,
+                    "item": fc_item
+                }),
+            ));
+        }
+
+        tracing::warn!(
+            model = %self.model,
+            truncated_tool_count = truncated.len(),
+            code_mode = self.code_mode,
+            "codex：模型输出在工具参数写完前被截断，已封口不完整调用"
+        );
+
+        // 追加纠正文本（受开关控制）
+        if super::codex_truncation_correction_enabled() {
+            let correction =
+                crate::anthropic::truncated_tool_correction(crate::anthropic::active_chunk_lines());
+            events.extend(self.ensure_message_started());
+            self.full_text.push_str(&correction);
+            events.push(self.event(
+                "response.output_text.delta",
+                json!({
+                    "type": "response.output_text.delta",
+                    "item_id": self.message_item_id,
+                    "output_index": self.output_index,
+                    "content_index": self.content_index,
+                    "delta": correction
+                }),
+            ));
+        }
+
+        // 标记为截断收尾语义
+        self.status = "incomplete".to_string();
+
+        events
+    }
+
     pub fn generate_final_events(&mut self) -> Vec<ResponsesSseEvent> {
         if self.stream_failed {
             return self.finalize_stream_on_failure();
@@ -685,6 +793,9 @@ impl ResponsesStreamContext {
             }
             self.text_buffer.clear();
         }
+
+        // 处理被截断（收到开始却无 stop）的工具调用：封口挂空 item + 追加纠正文本。
+        events.extend(self.finalize_truncated_tool_calls());
 
         if self.message_started && self.text_part_started {
             events.push(self.event(
@@ -908,6 +1019,113 @@ mod tests {
             .find(|e| e.event_type == "response.output_item.done")
             .expect("应有 output_item.done");
         assert_eq!(done.data["item"]["type"], "function_call");
+    }
+
+    #[test]
+    fn test_code_mode_truncated_tool_emits_correction_and_incomplete() {
+        // code mode 下写文件参数被截断（收到开始、无 stop）：
+        // 残缺 exec 从未发出（天然丢弃），最终应追加纠正文本 + status=incomplete
+        let mut ctx = ResponsesStreamContext::new("gpt-5.6-terra", 10, false, HashMap::new());
+        ctx.set_code_mode(true);
+
+        let args = serde_json::json!({ "input": "*** Begin Patch\n*** Add File: a" }).to_string();
+        let ev: crate::kiro::model::events::ToolUseEvent = serde_json::from_value(json!({
+            "toolUseId": "tu_1", "name": "apply_patch", "input": args, "stop": false
+        }))
+        .unwrap();
+        let out = ctx.process_kiro_event(&Event::ToolUse(ev));
+        assert!(out.is_empty(), "缓冲中不发事件");
+
+        // 流正常结束（Ok(None)），但 tu_1 从未收到 stop
+        let final_events = ctx.generate_final_events();
+
+        // 追加了纠正文本
+        let has_correction = final_events.iter().any(|e| {
+            e.event_type == "response.output_text.delta"
+                && e.data["delta"]
+                    .as_str()
+                    .is_some_and(|s| s.contains("truncated"))
+        });
+        assert!(has_correction, "应追加截断纠正文本");
+
+        // status=incomplete
+        let completed = final_events
+            .iter()
+            .find(|e| e.event_type == "response.completed")
+            .expect("应有 response.completed");
+        assert_eq!(completed.data["response"]["status"], json!("incomplete"));
+
+        // code mode 残缺调用不应产生 custom_tool_call（从未发出）
+        assert!(
+            !final_events
+                .iter()
+                .any(|e| e.event_type == "response.custom_tool_call_input.delta"),
+            "截断的 code mode 调用不应发出任何 exec 事件"
+        );
+    }
+
+    #[test]
+    fn test_function_call_truncated_closes_dangling_item() {
+        // 普通 function_call 参数被截断：added + 半截 delta 已透传，
+        // 收尾应补 output_item.done（status=incomplete）封口挂空 item
+        let mut ctx = ResponsesStreamContext::new("claude-sonnet-4-6", 10, false, HashMap::new());
+        let ev: crate::kiro::model::events::ToolUseEvent = serde_json::from_value(json!({
+            "toolUseId": "tu_1", "name": "Write", "input": "{\"path\":\"a.txt\",\"content\":\"line1", "stop": false
+        }))
+        .unwrap();
+        let out = ctx.process_kiro_event(&Event::ToolUse(ev));
+        // added + delta 已发
+        assert!(
+            out.iter()
+                .any(|e| e.event_type == "response.output_item.added")
+        );
+
+        let final_events = ctx.generate_final_events();
+
+        // 补了 function_call 的 output_item.done，status=incomplete
+        let fc_done = final_events.iter().find(|e| {
+            e.event_type == "response.output_item.done"
+                && e.data["item"]["type"] == json!("function_call")
+        });
+        let fc_done = fc_done.expect("应补 function_call 的 output_item.done");
+        assert_eq!(fc_done.data["item"]["status"], json!("incomplete"));
+        // 参数保留半截原样
+        assert_eq!(
+            fc_done.data["item"]["arguments"],
+            json!("{\"path\":\"a.txt\",\"content\":\"line1")
+        );
+
+        // 整体 status=incomplete
+        let completed = final_events
+            .iter()
+            .find(|e| e.event_type == "response.completed")
+            .unwrap();
+        assert_eq!(completed.data["response"]["status"], json!("incomplete"));
+    }
+
+    #[test]
+    fn test_completed_tool_no_truncation_correction() {
+        // 完整的工具调用（收到 stop）不应触发任何截断收尾
+        let mut ctx = ResponsesStreamContext::new("claude-sonnet-4-6", 10, false, HashMap::new());
+        let ev: crate::kiro::model::events::ToolUseEvent = serde_json::from_value(json!({
+            "toolUseId": "tu_1", "name": "get_weather", "input": "{\"city\":\"SG\"}", "stop": true
+        }))
+        .unwrap();
+        ctx.process_kiro_event(&Event::ToolUse(ev));
+        let final_events = ctx.generate_final_events();
+
+        let has_correction = final_events.iter().any(|e| {
+            e.event_type == "response.output_text.delta"
+                && e.data["delta"]
+                    .as_str()
+                    .is_some_and(|s| s.contains("truncated"))
+        });
+        assert!(!has_correction, "完整调用不应有纠正文本");
+        let completed = final_events
+            .iter()
+            .find(|e| e.event_type == "response.completed")
+            .unwrap();
+        assert_eq!(completed.data["response"]["status"], json!("completed"));
     }
 
     #[test]

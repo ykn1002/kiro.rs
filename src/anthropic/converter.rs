@@ -344,7 +344,7 @@ fn active_chunked_write_policy() -> Option<ChunkedWritePolicy> {
 /// 供 `/cc` 的截断纠正文本使用——即便未启用注入，截断发生时给出的建议行数也应
 /// 有意义。注意这里必须取 `chunk_lines` 而非 `trigger_lines`：纠正指令的语义是
 /// 「接下来每次写不超过 N 行」，取阈值会让模型按可能被截断的量继续分块。
-pub(super) fn active_chunk_lines() -> u32 {
+pub(crate) fn active_chunk_lines() -> u32 {
     CHUNKED_WRITE_POLICY
         .read()
         .as_ref()

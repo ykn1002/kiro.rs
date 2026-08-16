@@ -63,6 +63,12 @@ async fn main() {
         );
     }
 
+    // codex（/v1/responses）工具参数截断纠正开关（默认开）
+    openai::set_codex_truncation_correction(config.codex_truncation_correction);
+    if !config.codex_truncation_correction {
+        tracing::info!("codex 截断纠正文本已关闭（挂空 item 封口仍生效）");
+    }
+
     if config.default_model.is_some() || !config.model_aliases.is_empty() {
         tracing::info!(
             default_model = ?config.default_model,
