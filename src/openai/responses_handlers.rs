@@ -252,15 +252,30 @@ fn create_responses_sse_stream(
                     ))
                 }
                 Some(Err(e)) => {
-                    tracing::error!("读取响应流失败: {:?}", e);
-                    ctx.stream_failed = true;
-                    let mut sse_parts = vec![
-                        ResponsesStreamContext::create_error_event(&format!(
-                            "Upstream stream error: {e}"
-                        ))
-                        .to_sse_string(),
-                    ];
-                    append_responses_failure_tail(&mut ctx, &mut sse_parts);
+                    crate::metrics::inc_stream_interrupted();
+                    // Responses 端点的 initial 事件无条件先发，客户端从一开始就已收到，
+                    // 不存在「首帧前透明重放」窗口。中途断流（非本地超时）改为以
+                    // status=incomplete 优雅收尾：不发 error（那会让 codex 判定整轮失败、
+                    // 重试整轮，多扣配额且可能循环），让客户端把已生成部分当被截断的有效
+                    // 回答续写。本地 720s 超时不伪装成正常结束，仍发 error。
+                    let sse_parts: Vec<String> = if e.is_timeout() {
+                        tracing::error!("读取响应流失败（本地超时）: {:?}", e);
+                        ctx.stream_failed = true;
+                        let mut parts = vec![
+                            ResponsesStreamContext::create_error_event(&format!(
+                                "Upstream stream error: {e}"
+                            ))
+                            .to_sse_string(),
+                        ];
+                        append_responses_failure_tail(&mut ctx, &mut parts);
+                        parts
+                    } else {
+                        tracing::warn!("上游中途断流（优雅收尾 incomplete）: {:?}", e);
+                        ctx.finalize_stream_on_interrupt()
+                            .into_iter()
+                            .map(|ev| ev.to_sse_string())
+                            .collect()
+                    };
                     let bytes: Vec<Result<Bytes, Infallible>> =
                         sse_parts.into_iter().map(|s| Ok(Bytes::from(s))).collect();
                     Some((stream::iter(bytes), (body_stream, ctx, decoder, true)))

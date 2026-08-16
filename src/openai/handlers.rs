@@ -306,15 +306,37 @@ fn create_openai_sse_stream(
                             Some((stream::iter(bytes), (body_stream, ctx, decoder, stream_failed, ping_interval, include_usage)))
                         }
                         Some(Err(e)) => {
-                            tracing::error!("读取响应流失败: {:?}", e);
-                            ctx.stream_failed = true;
-                            let mut sse_parts = vec![
-                                OpenAiStreamContext::create_error_chunk(&format!(
-                                    "Upstream stream error: {e}"
-                                ))
-                                .to_sse_string(),
-                            ];
-                            append_openai_failure_tail(&mut ctx, &mut sse_parts, include_usage);
+                            crate::metrics::inc_stream_interrupted();
+                            // Chat Completions 首个 chunk（带 role）尽早发出，客户端从流
+                            // 开始就已收到，不存在「首帧前透明重放」窗口。中途断流（非本地
+                            // 超时）改为以 finish_reason=length 优雅收尾：不发 error chunk
+                            // （那会让客户端判定整轮失败、重试整轮，多扣配额且可能循环），
+                            // 让客户端把已生成部分当被截断的有效回答。本地 720s 超时不伪装
+                            // 成正常结束，仍发 error。
+                            let sse_parts: Vec<String> = if e.is_timeout() {
+                                tracing::error!("读取响应流失败（本地超时）: {:?}", e);
+                                ctx.stream_failed = true;
+                                let mut parts = vec![
+                                    OpenAiStreamContext::create_error_chunk(&format!(
+                                        "Upstream stream error: {e}"
+                                    ))
+                                    .to_sse_string(),
+                                ];
+                                append_openai_failure_tail(&mut ctx, &mut parts, include_usage);
+                                parts
+                            } else {
+                                tracing::warn!("上游中途断流（优雅收尾 length）: {:?}", e);
+                                ctx.finalize_stream_on_interrupt(include_usage)
+                                    .into_iter()
+                                    .map(|c| {
+                                        if c.data == serde_json::Value::String("[DONE]".to_string()) {
+                                            done_sse()
+                                        } else {
+                                            c.to_sse_string()
+                                        }
+                                    })
+                                    .collect()
+                            };
                             let bytes: Vec<Result<Bytes, Infallible>> = sse_parts
                                 .into_iter()
                                 .map(|s| Ok(Bytes::from(s)))

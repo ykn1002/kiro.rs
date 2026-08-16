@@ -787,6 +787,24 @@ impl ResponsesStreamContext {
 
         events
     }
+
+    /// 中途断流（已向客户端输出、无法透明重放）时的优雅收尾。
+    ///
+    /// 与 [`Self::finalize_stream_on_failure`] 的区别：**不发 error 事件、不置
+    /// status=failed**，而是把已输出的内容以 `status="incomplete"` 正常封口
+    /// （复用 `generate_final_events` 补齐 output_text.done / output_item.done /
+    /// response.completed）。`incomplete` 是 Responses 协议里「输出被截断」的语义
+    /// （与 `ContentLengthExceededException`、context 100% 同一状态），codex 客户端
+    /// 据此把已生成部分当作被截断的有效回答续写，而不是判定整轮失败后重试整轮
+    /// ——后者既多扣配额（见 kiro 按请求计费）又可能形成重试循环。
+    ///
+    /// 注意：Responses 端点的 initial 事件是无条件 chain 在流最前面的，客户端从一开始
+    /// 就已收到，故不存在「首帧前可透明重放」的窗口，这里只做优雅收尾。
+    pub fn finalize_stream_on_interrupt(&mut self) -> Vec<ResponsesSseEvent> {
+        // stream_failed 保持 false，确保 generate_final_events 走正常封口而非 failure 分支
+        self.status = "incomplete".to_string();
+        self.generate_final_events()
+    }
 }
 
 #[cfg(test)]
@@ -911,5 +929,40 @@ mod tests {
         ctx.stream_failed = true;
         let events = ctx.generate_final_events();
         assert!(events.iter().any(|e| e.event_type == "response.completed"));
+    }
+
+    /// 中途断流优雅收尾：不发 error，status=incomplete，正常封口
+    #[test]
+    fn test_finalize_on_interrupt_incomplete_no_error() {
+        let mut ctx = ResponsesStreamContext::new("claude-sonnet-4-6", 10, false, HashMap::new());
+        let _ = ctx.generate_initial_events();
+
+        // 先输出一段正文，模拟「已向客户端输出后中途断流」
+        let ev: crate::kiro::model::events::AssistantResponseEvent =
+            serde_json::from_str(r#"{"content":"partial answer"}"#).unwrap();
+        let _ = ctx.process_kiro_event(&Event::AssistantResponse(ev));
+
+        let events = ctx.finalize_stream_on_interrupt();
+
+        assert!(
+            !events.iter().any(|e| e.event_type == "error"),
+            "优雅收尾不应发 error 事件，实际: {events:?}"
+        );
+        let completed = events
+            .iter()
+            .find(|e| e.event_type == "response.completed")
+            .expect("应有 response.completed");
+        assert_eq!(
+            completed.data["response"]["status"],
+            json!("incomplete"),
+            "中途断流收尾 status 应为 incomplete"
+        );
+        // 已输出的正文应被正常封口
+        assert!(
+            events
+                .iter()
+                .any(|e| e.event_type == "response.output_text.done"),
+            "应有 output_text.done 封口已输出正文，实际: {events:?}"
+        );
     }
 }

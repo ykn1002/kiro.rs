@@ -433,6 +433,23 @@ impl OpenAiStreamContext {
         });
         chunks
     }
+
+    /// 中途断流（已向客户端输出、无法透明重放）时的优雅收尾。
+    ///
+    /// 与 [`Self::finalize_stream_on_failure`] 的区别：**不发 error chunk**，而是把
+    /// 已输出的内容以 `finish_reason="length"` 正常封口（复用 `generate_final_chunks`
+    /// 补齐 finish chunk + [DONE]）。`length` 是 Chat Completions 协议里「输出被截断」
+    /// 的语义（与 `ContentLengthExceededException`、context 100% 同一处理），客户端据此
+    /// 把已生成部分当作被截断的有效回答，而不是判定整轮失败后重试整轮——后者既多扣
+    /// 配额（见 kiro 按请求计费）又可能形成重试循环。
+    ///
+    /// 注意：Chat Completions 端点的首个 chunk（带 role）会尽早发出，客户端从流开始就
+    /// 已收到，故不存在「首帧前可透明重放」的窗口，这里只做优雅收尾。
+    pub fn finalize_stream_on_interrupt(&mut self, include_usage: bool) -> Vec<OpenAiChunk> {
+        // stream_failed 保持 false，确保 generate_final_chunks 走正常封口而非 failure 分支
+        self.finish_reason = Some("length".to_string());
+        self.generate_final_chunks(include_usage)
+    }
 }
 
 /// 将 [DONE] 标记转为 SSE 字符串
@@ -485,6 +502,33 @@ mod tests {
                 .any(|c| c.data["choices"][0]["finish_reason"] == json!("stop"))
         );
         assert!(chunks.iter().any(|c| c.data == json!("[DONE]")));
+    }
+
+    /// 中途断流优雅收尾：不发 error chunk，finish_reason=length，正常封口 + [DONE]
+    #[test]
+    fn test_finalize_on_interrupt_length_no_error() {
+        let mut ctx = OpenAiStreamContext::new("claude-sonnet-4-6", 10, false, HashMap::new());
+        // 先输出一段正文，模拟「已向客户端输出后中途断流」
+        let event: crate::kiro::model::events::AssistantResponseEvent =
+            serde_json::from_str(r#"{"content":"partial"}"#).unwrap();
+        let _ = ctx.process_kiro_event(&Event::AssistantResponse(event));
+
+        let chunks = ctx.finalize_stream_on_interrupt(false);
+
+        assert!(
+            !chunks.iter().any(|c| c.data.get("error").is_some()),
+            "优雅收尾不应发 error chunk，实际: {chunks:?}"
+        );
+        assert!(
+            chunks
+                .iter()
+                .any(|c| c.data["choices"][0]["finish_reason"] == json!("length")),
+            "中途断流收尾 finish_reason 应为 length，实际: {chunks:?}"
+        );
+        assert!(
+            chunks.iter().any(|c| c.data == json!("[DONE]")),
+            "应有 [DONE] 收尾，实际: {chunks:?}"
+        );
     }
 
     #[test]
