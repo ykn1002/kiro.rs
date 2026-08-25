@@ -272,42 +272,55 @@ function ModelStatsTable({ models }: { models: ModelStat[] }) {
         <div className="py-6 text-center text-sm text-muted-foreground">暂无调用记录</div>
       ) : (
         <div className="overflow-x-auto">
-          <table className="w-full text-sm">
+          <table className="w-full table-fixed text-sm">
+            {/* 显式列宽，保证两级表头与数据列边界一致 */}
+            <colgroup>
+              <col className="w-[28%]" />
+              <col className="w-[13%]" />
+              <col className="w-[16%]" />
+              <col className="w-[13%]" />
+              <col className="w-[16%]" />
+              <col className="w-[14%]" />
+            </colgroup>
             <thead>
               {/* 分组表头：今日 | 累计 | 实时 */}
               <tr className="text-[11px] text-muted-foreground">
-                <th className="pb-1 pr-3" />
-                <th className="pb-1 px-3 text-center font-medium" colSpan={2}>
+                <th className="pb-1" />
+                <th
+                  className="border-l pb-1 px-3 text-center font-medium"
+                  colSpan={2}
+                >
                   今日
                 </th>
-                <th className="pb-1 px-3 text-center font-medium" colSpan={2}>
+                <th
+                  className="border-l pb-1 px-3 text-center font-medium"
+                  colSpan={2}
+                >
                   累计
                 </th>
-                <th className="pb-1 pl-3" />
+                <th className="border-l pb-1 pl-3 text-center font-medium">实时</th>
               </tr>
               <tr className="border-b text-xs text-muted-foreground">
                 <th className="py-2 pr-3 text-left font-medium">模型</th>
-                <th className="py-2 px-3 text-right font-medium">调用</th>
+                <th className="border-l py-2 px-3 text-right font-medium">调用</th>
                 <th className="py-2 px-3 text-right font-medium">token</th>
-                <th className="py-2 px-3 text-right font-medium">调用</th>
+                <th className="border-l py-2 px-3 text-right font-medium">调用</th>
                 <th className="py-2 px-3 text-right font-medium">token</th>
-                <th className="py-2 pl-3 text-right font-medium">RPM</th>
+                <th className="border-l py-2 pl-3 text-right font-medium">RPM</th>
               </tr>
             </thead>
             <tbody>
               {models.map((m) => (
                 <tr key={m.model} className="border-b last:border-0 hover:bg-muted/40">
-                  <td className="py-2 pr-3 font-medium">
-                    <span className="truncate" title={m.model}>
-                      {m.model}
-                    </span>
+                  <td className="truncate py-2 pr-3 font-medium" title={m.model}>
+                    {m.model}
                   </td>
                   {/* 今日 */}
-                  <td className="py-2 px-3 text-right tabular-nums">
+                  <td className="border-l py-2 px-3 text-right tabular-nums">
                     {m.todayRequests > 0 ? (
                       m.todayRequests.toLocaleString()
                     ) : (
-                      <span className="text-muted-foreground">0</span>
+                      <span className="text-muted-foreground/50">0</span>
                     )}
                   </td>
                   <td
@@ -317,11 +330,11 @@ function ModelStatsTable({ models }: { models: ModelStat[] }) {
                     {m.todayTotalTokens > 0 ? (
                       formatTokens(m.todayTotalTokens)
                     ) : (
-                      <span className="text-muted-foreground">0</span>
+                      <span className="text-muted-foreground/50">0</span>
                     )}
                   </td>
                   {/* 累计 */}
-                  <td className="py-2 px-3 text-right tabular-nums text-muted-foreground">
+                  <td className="border-l py-2 px-3 text-right tabular-nums text-muted-foreground">
                     {m.requests.toLocaleString()}
                   </td>
                   <td
@@ -331,11 +344,11 @@ function ModelStatsTable({ models }: { models: ModelStat[] }) {
                     {formatTokens(m.totalTokens)}
                   </td>
                   {/* 实时 RPM */}
-                  <td className="py-2 pl-3 text-right tabular-nums">
+                  <td className="border-l py-2 pl-3 text-right tabular-nums">
                     {m.rpm > 0 ? (
                       <span className="font-medium text-success">{m.rpm}</span>
                     ) : (
-                      <span className="text-muted-foreground">0</span>
+                      <span className="text-muted-foreground/50">0</span>
                     )}
                   </td>
                 </tr>
