@@ -2,21 +2,6 @@
 
 一个用 Rust 编写的 Anthropic Claude API 兼容代理服务，将 Anthropic API 请求转换为 Kiro API 请求。
 
----
-
-<table>
-<tr>
-<td>
-<b>特别感谢</b>：<a href="https://co.yes.vg/register?ref=hank9999">YesCode</a> 为本项目提供了 AI API 额度赞助, YesCode 作为一家低调务实的 AI API 中转服务商 <br>
-长期以来提供稳定高可用的服务, 如您有意体验, 请点击链接注册体验 → <a href="https://co.yes.vg/register?ref=hank9999">立即访问</a>
-</td>
-</tr>
-</table>
-
----
-
-#### [LINUX DO 讨论帖](https://linux.do/t/topic/1571986)
-
 ## 免责声明
 
 本项目仅供研究使用, Use at your own risk, 使用本项目所导致的任何后果由使用人承担, 与本项目无关。
@@ -31,18 +16,22 @@
 
 ## 功能特性
 
-- **Anthropic API 兼容**: 完整支持 Anthropic Claude API 格式
+- **Anthropic API 兼容**: 完整支持 Anthropic Claude API 格式（`/v1/messages`）
+- **OpenAI / Codex 兼容**: 额外提供 `/v1/chat/completions`（转换模式）和 `/v1/responses`（Codex 默认的 Responses API），可直接对接 Codex CLI 等客户端
+- **Claude Code 端点**: `/cc/v1/messages` 延迟 `message_start` 以校正 `input_tokens`，并处理工具参数截断纠正
 - **流式响应**: 支持 SSE (Server-Sent Events) 流式输出
 - **Token 自动刷新**: 自动管理和刷新 OAuth Token
 - **多凭据支持**: 支持配置多个凭据，按优先级自动故障转移
 - **负载均衡**: 支持 `priority`（按优先级）、`balanced`（按累计成功数均衡）和 `round-robin`（真·轮询，不看使用次数）三种模式
+- **RPM 限流**: 按模型类别（Opus/Sonnet/Haiku）对单凭据限流，全部打满时向客户端返回 429
 - **智能重试**: 单凭据最多重试 3 次，单请求最多重试 9 次
 - **凭据回写**: 多凭据格式下自动回写刷新后的 Token
 - **Thinking 模式**: 支持 Claude 的 extended thinking 功能
 - **工具调用**: 完整支持 function calling / tool use
 - **WebSearch**: 内置 WebSearch 工具转换逻辑
-- **多模型支持**: 支持 Sonnet、Opus、Haiku 系列模型
-- **Admin 管理**: 可选的 Web 管理界面和 API，支持凭据管理、余额查询等
+- **多模型支持**: 模型表由配置驱动，内置默认表涵盖 Opus 4.5–4.8、Sonnet 4.5/4.6、Haiku 4.5，支持自定义与别名映射
+- **Admin 管理**: 可选的 Web 管理界面和 API，支持凭据管理、余额查询、实时监控与配置热更新
+- **可观测性**: 内置 `/healthz`、`/readyz` 探针与 Prometheus `/metrics`
 - **多级 Region 配置**: 支持全局和凭据级别的 Auth Region / API Region 配置
 - **凭据级代理**: 支持为每个凭据单独配置 HTTP/SOCKS5 代理，优先级：凭据代理 > 全局代理 > 无代理
 
@@ -64,6 +53,8 @@
 - [API 端点](#api-端点)
   - [标准端点 (/v1)](#标准端点-v1)
   - [Claude Code 兼容端点 (/cc/v1)](#claude-code-兼容端点-ccv1)
+  - [OpenAI / Codex 兼容端点](#openai--codex-兼容端点)
+  - [运维探针](#运维探针)
   - [Thinking 模式](#thinking-模式)
   - [工具调用](#工具调用)
 - [模型映射](#模型映射)
@@ -204,6 +195,8 @@ docker-compose up
 | `codexTruncationCorrection` | bool | `true` | codex（`/v1/responses`）端点工具参数被 `max_tokens` 截断时（收到开始却无 `stop`）是否回灌一段分块纠正文本，提示模型分块写。code mode 下写文件走标准 JSON tool_call，截断的残缺调用原本会被静默丢弃、客户端一无所知；开启后追加与 `/cc` 一致的纠正文本，纠正行数取 `chunkedWritePolicy.chunkLines`（默认 50）。关闭后仅追加纠正文本这一步停用，**挂空 item 的封口修复（补 `output_item.done`、置 `status=incomplete`）无条件生效**。注意此开关只作用于 codex 客户端，其对纠正文本的实际响应需自行验证 |
 | `defaultEndpoint` | string | `ide` | 默认 Kiro 端点。凭据未显式指定 `endpoint` 时使用。当前支持：`ide` |
 | `models` | array | 内置默认表 | 模型列表（驱动 `/v1/models` 展示、模型名映射、上下文窗口判断）。未配置时使用内置默认表，**完全向后兼容**；一旦提供则整张表以配置为准。每项字段见下方说明 |
+| `modelAliases` | object | `{}` | 客户端模型名 → 本服务模型名（`displayId` / `kiroId` / 别名）的显式映射，键不区分大小写。用于 Codex 等固定发送 `gpt-5.x` 的客户端，例如 `{"gpt-5.5": "claude-opus-4-6"}` |
+| `defaultModel` | string | - | 未命中任何模型规则时的回退模型名（`displayId` / `kiroId` / 别名）。适用于客户端发送未知模型名但后端统一走某个 Claude/Kiro 模型的场景 |
 
 #### `models` 项字段
 
@@ -525,12 +518,50 @@ RUST_LOG=debug ./target/release/kiro-rs
 
 | 端点 | 方法 | 描述 |
 |------|------|------|
-| `/cc/v1/messages` | POST | 创建消息（缓冲模式，确保 `input_tokens` 准确） |
+| `/cc/v1/models` | GET | 获取可用模型列表（与 `/v1` 相同） |
+| `/cc/v1/messages` | POST | 创建消息（延迟 `message_start` 以校正 `input_tokens`） |
 | `/cc/v1/messages/count_tokens` | POST | 估算 Token 数量（与 `/v1` 相同） |
 
-> **`/cc/v1/messages` 与 `/v1/messages` 的区别**：
+> **`/cc/v1/messages` 与 `/v1/messages` 的区别**（注意：`/cc` 并不会全程缓冲整个流）：
 > - `/v1/messages`：立即发送 `message_start`（`input_tokens` 为估算值），正文实时流式
-> - `/cc/v1/messages`：等待 `contextUsageEvent` 后再发送 `message_start`（准确 `input_tokens`），之后实时流式；等待期间每 25 秒发送 `ping` 保活
+> - `/cc/v1/messages`：等待上游 `contextUsageEvent` 后再发送 `message_start`（准确 `input_tokens`），之后实时流式；等待期间每 25 秒发送 `ping` 保活
+> - `/cc/v1/messages` 还会按 tool id 缓冲 `tool_use` 事件直到 `stop`，若流在参数写到一半时结束（模型输出被截断），丢弃残缺事件并回灌一段纠正文本，提示模型分块写入
+
+### OpenAI / Codex 兼容端点
+
+供 Codex CLI 等 OpenAI 客户端使用，与 `/v1` 共用同一套认证与凭据池。
+
+| 端点 | 方法 | 描述 |
+|------|------|------|
+| `/v1/chat/completions` | POST | Chat Completions（转换模式） |
+| `/v1/responses` | POST | Responses API（原生模式，Codex 默认） |
+
+`~/.codex/config.toml` 配置示例：
+
+```toml
+model_provider = "kiro"
+model = "claude-sonnet-4-6"
+
+[model_providers.kiro]
+name = "Kiro RS"
+base_url = "http://127.0.0.1:8990/v1"
+env_key = "KIRO_RS_API_KEY"
+wire_api = "responses"
+```
+
+然后设置环境变量：`export KIRO_RS_API_KEY=<config.json 中的 apiKey>`
+
+> Codex 常固定发送 `gpt-5.x` 之类的模型名，可通过 `config.json` 的 `modelAliases` / `defaultModel` 映射到实际 Kiro 模型。`/v1/responses` 端点的工具参数截断纠正由 `codexTruncationCorrection` 控制（默认开）。
+
+### 运维探针
+
+无需认证，适合健康检查与监控接入。
+
+| 端点 | 方法 | 描述 |
+|------|------|------|
+| `/healthz` | GET | 进程存活探针，恒返回 `{"status":"ok"}` |
+| `/readyz` | GET | 就绪探针，至少有一个未禁用凭据时返回就绪，否则返回 503 |
+| `/metrics` | GET | Prometheus 格式指标（含可用/总凭据数等） |
 
 ### Thinking 模式
 
@@ -575,28 +606,41 @@ RUST_LOG=debug ./target/release/kiro-rs
 
 ## 模型映射
 
-| Anthropic 模型 | Kiro 模型 |
-|----------------|-----------|
-| `*sonnet*` | `claude-sonnet-4.5` |
-| `*opus*`（含 4.5/4-5） | `claude-opus-4.5` |
-| `*opus*`（其他） | `claude-opus-4.6` |
-| `*haiku*` | `claude-haiku-4.5` |
+模型名映射由**模型注册表**驱动（`config.json` 的 `models`，未配置时用内置默认表），按 `family` + `version` 模糊匹配客户端传入的模型名（含日期后缀、`-thinking` 后缀），命中项的 `kiroId` 即为上游 Kiro 模型 ID。`match_model_def`（见 `src/anthropic/converter.rs`）是唯一的事实来源。
+
+内置默认表：
+
+| 客户端模型名（模糊匹配） | Kiro 模型 ID | 展示 ID | 上下文窗口 |
+|----------------|-----------|---------|-----------|
+| `*opus*` 4.8 | `claude-opus-4.8` | `claude-opus-4-8` | 1,000,000 |
+| `*opus*` 4.7 | `claude-opus-4.7` | `claude-opus-4-7` | 1,000,000 |
+| `*opus*` 4.6 | `claude-opus-4.6` | `claude-opus-4-6` | 1,000,000 |
+| `*opus*` 4.5 | `claude-opus-4.5` | `claude-opus-4-5-20251101` | 200,000 |
+| `*sonnet*` 4.6 | `claude-sonnet-4.6` | `claude-sonnet-4-6` | 1,000,000 |
+| `*sonnet*` 4.5 | `claude-sonnet-4.5` | `claude-sonnet-4-5-20250929` | 200,000 |
+| `*haiku*` | `claude-haiku-4.5` | `claude-haiku-4-5-20251001` | 200,000 |
+
+> 匹配按数组顺序取首个命中项。未命中任何规则时，若配置了 `defaultModel` 则回退到该模型，否则返回「模型不支持」。`modelAliases` 可为固定发送某模型名的客户端提供显式映射。
 
 ## Admin（可选）
 
 当 `config.json` 配置了非空 `adminApiKey` 时，会启用：
 
-- **Admin API（认证同 API Key）**
+- **Admin API（认证同 Admin API Key，`x-api-key` 或 `Authorization: Bearer`）**
   - `GET /api/admin/credentials` - 获取所有凭据状态
   - `POST /api/admin/credentials` - 添加新凭据
   - `DELETE /api/admin/credentials/:id` - 删除凭据
   - `POST /api/admin/credentials/:id/disabled` - 设置凭据禁用状态
   - `POST /api/admin/credentials/:id/priority` - 设置凭据优先级
   - `POST /api/admin/credentials/:id/reset` - 重置失败计数
+  - `POST /api/admin/credentials/:id/refresh` - 强制刷新 Token
   - `GET /api/admin/credentials/:id/balance` - 获取凭据余额
+  - `GET /api/admin/metrics` - 运行时监控指标（请求量、模型统计等）
+  - `GET|PUT /api/admin/config/load-balancing` - 查询 / 设置负载均衡模式
+  - `GET|PUT /api/admin/config/app` - 查询 / 热更新应用配置（RPM、分块写入等）
 
 - **Admin UI**
-  - `GET /admin` - 访问管理页面（需要在编译前构建 `admin-ui/dist`）
+  - `GET /admin` - 访问管理页面（需要在编译前构建 `admin-ui/dist`），提供凭据管理、实时监控与模型统计
 
 ## 注意事项
 
@@ -612,6 +656,8 @@ kiro-rs/
 │   ├── main.rs                 # 程序入口
 │   ├── http_client.rs          # HTTP 客户端构建
 │   ├── token.rs                # Token 计算模块
+│   ├── metrics.rs              # Prometheus 指标
+│   ├── model_stats.rs          # 模型级运行时统计
 │   ├── debug.rs                # 调试工具
 │   ├── test.rs                 # 测试
 │   ├── model/                  # 配置和参数模型
@@ -625,6 +671,14 @@ kiro-rs/
 │   │   ├── converter.rs        # 协议转换器
 │   │   ├── stream.rs           # 流式响应处理
 │   │   └── websearch.rs        # WebSearch 工具处理
+│   ├── openai/                 # OpenAI / Codex 兼容层
+│   │   ├── handlers.rs         # /v1/chat/completions 处理器
+│   │   ├── responses_handlers.rs # /v1/responses 处理器
+│   │   ├── converter.rs        # Chat Completions 转换
+│   │   ├── responses_converter.rs # Responses API 转换
+│   │   ├── code_mode.rs        # Codex code mode 处理
+│   │   ├── stream.rs           # 流式响应处理
+│   │   └── responses_stream.rs # Responses 流式响应处理
 │   ├── kiro/                   # Kiro API 客户端
 │   │   ├── provider.rs         # API 提供者
 │   │   ├── token_manager.rs    # Token 管理
