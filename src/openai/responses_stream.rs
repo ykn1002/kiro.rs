@@ -70,6 +70,8 @@ pub struct ResponsesStreamContext {
     pub stream_failed: bool,
     /// code mode：把子工具调用合成为 exec 的 custom_tool_call（内含 JS）回传给 codex。
     code_mode: bool,
+    /// 模型用量是否已上报（防止多个 finalize 出口重复计数）
+    usage_reported: bool,
 }
 
 impl ResponsesStreamContext {
@@ -106,6 +108,7 @@ impl ResponsesStreamContext {
             reasoning_text: String::new(),
             stream_failed: false,
             code_mode: false,
+            usage_reported: false,
         }
     }
 
@@ -751,10 +754,24 @@ impl ResponsesStreamContext {
         events
     }
 
+    /// 上报本次请求的模型累计用量（每请求恰好一次，多个 finalize 出口靠此 guard 去重）
+    fn report_usage_once(&mut self) {
+        if self.usage_reported {
+            return;
+        }
+        self.usage_reported = true;
+        crate::model_stats::record(
+            &self.model,
+            self.input_tokens as i64,
+            self.output_tokens.max(0) as i64,
+        );
+    }
+
     pub fn generate_final_events(&mut self) -> Vec<ResponsesSseEvent> {
         if self.stream_failed {
             return self.finalize_stream_on_failure();
         }
+        self.report_usage_once();
 
         let mut events = Vec::new();
 
@@ -871,6 +888,7 @@ impl ResponsesStreamContext {
 
     /// 流异常结束时发送 response.completed（status=failed）
     pub fn finalize_stream_on_failure(&mut self) -> Vec<ResponsesSseEvent> {
+        self.report_usage_once();
         let mut events = Vec::new();
         if !self.initialized {
             events.extend(self.generate_initial_events());

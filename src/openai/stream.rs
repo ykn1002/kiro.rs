@@ -50,6 +50,8 @@ pub struct OpenAiStreamContext {
     in_thinking: bool,
     thinking_extracted: bool,
     pub stream_failed: bool,
+    /// 模型用量是否已上报（防止多个 finalize 出口重复计数）
+    usage_reported: bool,
 }
 
 impl OpenAiStreamContext {
@@ -76,6 +78,7 @@ impl OpenAiStreamContext {
             in_thinking: false,
             thinking_extracted: false,
             stream_failed: false,
+            usage_reported: false,
         }
     }
 
@@ -347,10 +350,24 @@ impl OpenAiStreamContext {
         chunks
     }
 
+    /// 上报本次请求的模型累计用量（每请求恰好一次，多个 finalize 出口靠此 guard 去重）
+    fn report_usage_once(&mut self) {
+        if self.usage_reported {
+            return;
+        }
+        self.usage_reported = true;
+        crate::model_stats::record(
+            &self.model,
+            self.prompt_tokens as i64,
+            self.completion_tokens.max(0) as i64,
+        );
+    }
+
     pub fn generate_final_chunks(&mut self, include_usage: bool) -> Vec<OpenAiChunk> {
         if self.stream_failed {
             return self.finalize_stream_on_failure(include_usage);
         }
+        self.report_usage_once();
 
         let mut chunks = Vec::new();
 
@@ -407,6 +424,7 @@ impl OpenAiStreamContext {
 
     /// 流异常结束时补全 finish_reason + [DONE]
     pub fn finalize_stream_on_failure(&mut self, include_usage: bool) -> Vec<OpenAiChunk> {
+        self.report_usage_once();
         let mut chunks = Vec::new();
         if !self.sent_role {
             chunks.push(self.initial_chunk());

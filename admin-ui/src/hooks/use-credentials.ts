@@ -12,6 +12,7 @@ import {
   setLoadBalancingMode,
   getAppConfig,
   updateAppConfig,
+  getMetrics,
 } from '@/api/credentials'
 import type { AddCredentialRequest } from '@/types/api'
 
@@ -21,6 +22,15 @@ export function useCredentials() {
     queryKey: ['credentials'],
     queryFn: getCredentials,
     refetchInterval: 30000, // 每 30 秒刷新一次
+  })
+}
+
+// 查询监控指标（实时轮询）
+export function useMetrics() {
+  return useQuery({
+    queryKey: ['metrics'],
+    queryFn: getMetrics,
+    refetchInterval: 4000, // 每 4 秒刷新一次
   })
 }
 

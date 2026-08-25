@@ -68,6 +68,9 @@ pub struct CredentialStatusItem {
     pub endpoint: String,
     /// 凭据级 RPM 实时状态（各模型类别当前 60 秒窗口占用 + 生效上限）
     pub rpm: crate::kiro::token_manager::RpmStatus,
+    /// 本地缓存的余额（仅未过期时带回，供前端刷新后免手动查询即可展示；无缓存则为 None）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cached_balance: Option<BalanceResponse>,
 }
 
 // ============ 操作请求 ============
@@ -289,6 +292,64 @@ pub struct UpdateAppConfigRequest {
     /// codex 工具参数截断纠正开关；缺省时不更新（兼容旧 Admin UI）
     #[serde(default)]
     pub codex_truncation_correction: Option<bool>,
+}
+
+// ============ 监控指标 ============
+
+/// 单个模型的统计（累计调用/ token + 实时 RPM）
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelStat {
+    /// 模型展示名
+    pub model: String,
+    /// 累计调用次数
+    pub requests: u64,
+    /// 累计输入 token
+    pub input_tokens: u64,
+    /// 累计输出 token
+    pub output_tokens: u64,
+    /// 累计总 token
+    pub total_tokens: u64,
+    /// 今日调用次数
+    pub today_requests: u64,
+    /// 今日输入 token
+    pub today_input_tokens: u64,
+    /// 今日输出 token
+    pub today_output_tokens: u64,
+    /// 今日总 token
+    pub today_total_tokens: u64,
+    /// 最近 60 秒调用数（实时 RPM，跨凭据聚合）
+    pub rpm: u32,
+}
+
+/// 监控指标响应（进程级计数器快照 + 凭据池概览）
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MetricsResponse {
+    /// 成功完成的上游 API 请求数
+    pub requests_success: u64,
+    /// 重试耗尽或不可恢复的上游 API 错误数
+    pub requests_error: u64,
+    /// 本地凭据 RPM 限流拒绝数（客户端 429）
+    pub local_rpm_rejected: u64,
+    /// 上游 event-stream 解码失败数
+    pub stream_decode_failures: u64,
+    /// 上游返回 429 且重试耗尽次数
+    pub upstream_rate_limited: u64,
+    /// 上游响应体传输中途断开次数
+    pub stream_interrupted: u64,
+    /// 断流后透明重连重放请求次数
+    pub stream_restarted: u64,
+    /// 进程运行时长（秒）
+    pub uptime_seconds: u64,
+    /// 当前可用（未禁用）凭据数
+    pub credentials_available: usize,
+    /// 凭据总数
+    pub credentials_total: usize,
+    /// 当前活跃凭据 ID
+    pub current_id: u64,
+    /// 各模型统计（按调用次数降序）
+    pub models: Vec<ModelStat>,
 }
 
 // ============ 通用响应 ============

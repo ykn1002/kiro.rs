@@ -21,6 +21,12 @@ pub async fn get_all_credentials(State(state): State<AdminState>) -> impl IntoRe
     Json(response)
 }
 
+/// GET /api/admin/metrics
+/// 获取监控指标（进程级计数器快照 + 凭据池概览）
+pub async fn get_metrics(State(state): State<AdminState>) -> impl IntoResponse {
+    Json(state.service.get_metrics())
+}
+
 /// POST /api/admin/credentials/:id/disabled
 /// 设置凭据禁用状态
 pub async fn set_credential_disabled(

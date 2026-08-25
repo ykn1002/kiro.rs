@@ -36,9 +36,9 @@ pub(crate) use stream::{
 mod websearch;
 
 pub(crate) use converter::{
-    ConversionError, active_chunk_lines, conversion_error_parts, convert_request,
-    convert_responses_request, get_context_window_size, map_model, metadata_from_openai_extra,
-    normalize_tool_schema,
+    ConversionError, active_chunk_lines, canonical_model_display, conversion_error_parts,
+    convert_request, convert_responses_request, get_context_window_size, map_model,
+    metadata_from_openai_extra, normalize_tool_schema,
 };
 pub use converter::{
     init_model_mapping, init_model_registry, set_chunked_write_policy, set_model_registry,

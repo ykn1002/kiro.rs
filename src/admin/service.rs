@@ -15,8 +15,8 @@ use crate::kiro::token_manager::MultiTokenManager;
 use super::error::AdminServiceError;
 use super::types::{
     AddCredentialRequest, AddCredentialResponse, AppConfigResponse, BalanceResponse,
-    CredentialStatusItem, CredentialsStatusResponse, LoadBalancingModeResponse,
-    SetLoadBalancingModeRequest, UpdateAppConfigRequest,
+    CredentialStatusItem, CredentialsStatusResponse, LoadBalancingModeResponse, MetricsResponse,
+    ModelStat, SetLoadBalancingModeRequest, UpdateAppConfigRequest,
 };
 
 /// 余额缓存过期时间（秒），5 分钟
@@ -94,6 +94,7 @@ impl AdminService {
                 disabled_reason: entry.disabled_reason,
                 endpoint: entry.endpoint.unwrap_or_else(|| default_endpoint.clone()),
                 rpm: entry.rpm,
+                cached_balance: self.cached_balance_fresh(entry.id),
             })
             .collect();
 
@@ -106,6 +107,92 @@ impl AdminService {
             current_id: snapshot.current_id,
             credentials,
         }
+    }
+
+    /// 获取监控指标（进程级计数器快照 + 凭据池概览 + 各模型统计）
+    pub fn get_metrics(&self) -> MetricsResponse {
+        let m = crate::metrics::METRICS.snapshot();
+        let snapshot = self.token_manager.snapshot();
+        MetricsResponse {
+            requests_success: m.requests_success,
+            requests_error: m.requests_error,
+            local_rpm_rejected: m.local_rpm_rejected,
+            stream_decode_failures: m.stream_decode_failures,
+            upstream_rate_limited: m.upstream_rate_limited,
+            stream_interrupted: m.stream_interrupted,
+            stream_restarted: m.stream_restarted,
+            uptime_seconds: m.uptime_seconds,
+            credentials_available: snapshot.available,
+            credentials_total: snapshot.total,
+            current_id: snapshot.current_id,
+            models: self.build_model_stats(),
+        }
+    }
+
+    /// 合并累计统计（次数/token）与实时 RPM，按归一化模型展示名聚合。
+    ///
+    /// 两个来源都以「客户端原始模型名」为键，这里统一归一为 displayId 后合并，
+    /// 使 thinking 变体、别名归并到同一行。
+    fn build_model_stats(&self) -> Vec<ModelStat> {
+        use std::collections::HashMap;
+
+        // 累计统计：原始名 → 各项，归一后累加
+        #[derive(Default)]
+        struct Agg {
+            requests: u64,
+            input_tokens: u64,
+            output_tokens: u64,
+            total_tokens: u64,
+            today_requests: u64,
+            today_input_tokens: u64,
+            today_output_tokens: u64,
+            today_total_tokens: u64,
+            rpm: u32,
+        }
+        let mut merged: HashMap<String, Agg> = HashMap::new();
+
+        for s in crate::model_stats::global().snapshot() {
+            let key = crate::anthropic::canonical_model_display(&s.model);
+            let e = merged.entry(key).or_default();
+            e.requests += s.requests;
+            e.input_tokens += s.input_tokens;
+            e.output_tokens += s.output_tokens;
+            e.total_tokens += s.total_tokens;
+            e.today_requests += s.today_requests;
+            e.today_input_tokens += s.today_input_tokens;
+            e.today_output_tokens += s.today_output_tokens;
+            e.today_total_tokens += s.today_total_tokens;
+        }
+
+        for (raw, count) in self.token_manager.model_rpm_snapshot() {
+            let key = crate::anthropic::canonical_model_display(&raw);
+            let e = merged.entry(key).or_default();
+            e.rpm += count;
+        }
+
+        let mut list: Vec<ModelStat> = merged
+            .into_iter()
+            .map(|(model, a)| ModelStat {
+                model,
+                requests: a.requests,
+                input_tokens: a.input_tokens,
+                output_tokens: a.output_tokens,
+                total_tokens: a.total_tokens,
+                today_requests: a.today_requests,
+                today_input_tokens: a.today_input_tokens,
+                today_output_tokens: a.today_output_tokens,
+                today_total_tokens: a.today_total_tokens,
+                rpm: a.rpm,
+            })
+            .collect();
+        // 按累计次数降序，其次按实时 RPM 降序，最后按名称稳定排序
+        list.sort_by(|a, b| {
+            b.requests
+                .cmp(&a.requests)
+                .then_with(|| b.rpm.cmp(&a.rpm))
+                .then_with(|| a.model.cmp(&b.model))
+        });
+        list
     }
 
     /// 设置凭据禁用状态
@@ -137,6 +224,18 @@ impl AdminService {
         self.token_manager
             .reset_and_enable(id)
             .map_err(|e| self.classify_error(e, id))
+    }
+
+    /// 读取本地缓存中未过期的余额（不触发上游请求）
+    fn cached_balance_fresh(&self, id: u64) -> Option<BalanceResponse> {
+        let cache = self.balance_cache.lock();
+        let cached = cache.get(&id)?;
+        let now = Utc::now().timestamp() as f64;
+        if (now - cached.cached_at) < BALANCE_CACHE_TTL_SECS as f64 {
+            Some(cached.data.clone())
+        } else {
+            None
+        }
     }
 
     /// 获取凭据余额（带缓存）

@@ -613,6 +613,8 @@ pub struct StreamContext {
     buffered_tool_events: Vec<(String, SseEvent)>,
     /// 已收到 `stop: true` 的 tool_use id 集合（缓冲模式下用于判定是否完整）
     completed_tool_ids: std::collections::HashSet<String>,
+    /// 模型用量是否已上报（防止多个 finalize 出口重复计数）
+    usage_reported: bool,
 }
 
 impl StreamContext {
@@ -649,6 +651,7 @@ impl StreamContext {
             tool_input_bytes: HashMap::new(),
             buffered_tool_events: Vec::new(),
             completed_tool_ids: std::collections::HashSet::new(),
+            usage_reported: false,
         }
     }
 
@@ -698,6 +701,19 @@ impl StreamContext {
             .as_ref()
             .and_then(|u| u.anthropic_output_tokens())
             .unwrap_or(self.output_tokens)
+    }
+
+    /// 上报本次请求的模型累计用量（每请求恰好一次，多个 finalize 出口靠此 guard 去重）
+    fn report_usage_once(&mut self) {
+        if self.usage_reported {
+            return;
+        }
+        self.usage_reported = true;
+        crate::model_stats::record(
+            &self.model,
+            self.effective_input_tokens() as i64,
+            self.effective_output_tokens() as i64,
+        );
     }
 
     fn patch_message_start_tokens(events: &mut [SseEvent], input_tokens: i32) {
@@ -762,6 +778,7 @@ impl StreamContext {
         if self.stream_failed {
             return self.finalize_stream_on_failure();
         }
+        self.report_usage_once();
         let mut out = Vec::new();
         if self.delay_message_start && !self.message_start_released {
             if !self.stream_initialized {
@@ -778,6 +795,7 @@ impl StreamContext {
 
     /// 流异常结束时补全 SSE 序列（关闭块 + message_delta + message_stop）
     pub fn finalize_stream_on_failure(&mut self) -> Vec<SseEvent> {
+        self.report_usage_once();
         let mut out = Vec::new();
 
         if self.delay_message_start && !self.message_start_released {

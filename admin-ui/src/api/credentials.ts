@@ -10,6 +10,7 @@ import type {
   AddCredentialResponse,
   AppConfig,
   UpdateAppConfigRequest,
+  MetricsResponse,
 } from '@/types/api'
 
 // 创建 axios 实例
@@ -32,6 +33,12 @@ api.interceptors.request.use((config) => {
 // 获取所有凭据状态
 export async function getCredentials(): Promise<CredentialsStatusResponse> {
   const { data } = await api.get<CredentialsStatusResponse>('/credentials')
+  return data
+}
+
+// 获取监控指标
+export async function getMetrics(): Promise<MetricsResponse> {
+  const { data } = await api.get<MetricsResponse>('/metrics')
   return data
 }
 

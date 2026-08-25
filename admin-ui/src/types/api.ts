@@ -45,6 +45,38 @@ export interface CredentialStatusItem {
   disabledReason?: string
   endpoint: string
   rpm: RpmStatus
+  // 后端带回的本地缓存余额（未过期时才有），用于刷新页面后免手动查询即可展示
+  cachedBalance?: BalanceResponse
+}
+
+// 单个模型的统计（累计调用/token + 实时 RPM）
+export interface ModelStat {
+  model: string
+  requests: number
+  inputTokens: number
+  outputTokens: number
+  totalTokens: number
+  todayRequests: number
+  todayInputTokens: number
+  todayOutputTokens: number
+  todayTotalTokens: number
+  rpm: number
+}
+
+// 监控指标响应（进程级计数器快照 + 凭据池概览 + 各模型统计）
+export interface MetricsResponse {
+  requestsSuccess: number
+  requestsError: number
+  localRpmRejected: number
+  streamDecodeFailures: number
+  upstreamRateLimited: number
+  streamInterrupted: number
+  streamRestarted: number
+  uptimeSeconds: number
+  credentialsAvailable: number
+  credentialsTotal: number
+  currentId: number
+  models: ModelStat[]
 }
 
 // 余额响应

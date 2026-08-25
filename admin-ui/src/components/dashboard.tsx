@@ -1,12 +1,14 @@
 import { useState, useEffect, useRef } from 'react'
-import { RefreshCw, LogOut, Moon, Sun, Server, Plus, Upload, FileUp, Trash2, RotateCcw, CheckCircle2, Settings } from 'lucide-react'
+import { RefreshCw, LogOut, Moon, Sun, Server, Plus, Upload, FileUp, Trash2, RotateCcw, CheckCircle2, Settings, Activity, KeyRound } from 'lucide-react'
 import { useQueryClient } from '@tanstack/react-query'
 import { toast } from 'sonner'
 import { storage } from '@/lib/storage'
-import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
+import { Card, CardContent } from '@/components/ui/card'
 import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
 import { CredentialCard } from '@/components/credential-card'
+import { MonitorPanel } from '@/components/monitor-panel'
+import { TabNav, type TabItem } from '@/components/ui/tabs'
 import { BalanceDialog } from '@/components/balance-dialog'
 import { AddCredentialDialog } from '@/components/add-credential-dialog'
 import { BatchImportDialog } from '@/components/batch-import-dialog'
@@ -23,6 +25,12 @@ import type { BalanceResponse } from '@/types/api'
 interface DashboardProps {
   onLogout: () => void
 }
+
+// 主视图分组：实时监控 / 凭据管理
+const MAIN_TABS: TabItem[] = [
+  { value: 'monitor', label: '实时监控', icon: Activity },
+  { value: 'credentials', label: '凭据管理', icon: KeyRound },
+]
 
 export function Dashboard({ onLogout }: DashboardProps) {
   const [selectedCredentialId, setSelectedCredentialId] = useState<number | null>(null)
@@ -44,6 +52,7 @@ export function Dashboard({ onLogout }: DashboardProps) {
   const [batchRefreshing, setBatchRefreshing] = useState(false)
   const [batchRefreshProgress, setBatchRefreshProgress] = useState({ current: 0, total: 0 })
   const cancelVerifyRef = useRef(false)
+  const [mainTab, setMainTab] = useState<'monitor' | 'credentials'>('monitor')
   const [currentPage, setCurrentPage] = useState(1)
   const itemsPerPage = 12
   const [darkMode, setDarkMode] = useState(() => {
@@ -88,12 +97,21 @@ export function Dashboard({ onLogout }: DashboardProps) {
 
     setBalanceMap(prev => {
       const next = new Map<number, BalanceResponse>()
+      // 保留仍存在凭据的已有余额（含手动查询结果）
       prev.forEach((value, id) => {
         if (validIds.has(id)) {
           next.set(id, value)
         }
       })
-      return next.size === prev.size ? prev : next
+      // 用后端带回的缓存余额补齐尚未加载的项（刷新页面后免手动查询即可展示）
+      let changed = next.size !== prev.size
+      data.credentials.forEach(credential => {
+        if (credential.cachedBalance && !next.has(credential.id)) {
+          next.set(credential.id, credential.cachedBalance)
+          changed = true
+        }
+      })
+      return changed ? next : prev
     })
 
     setLoadingBalanceIds(prev => {
@@ -496,21 +514,20 @@ export function Dashboard({ onLogout }: DashboardProps) {
     setVerifying(false)
   }
 
-  // 切换负载均衡模式（三态循环：priority → balanced → round-robin → priority）
-  const handleToggleLoadBalancing = () => {
-    const currentMode = loadBalancingData?.mode || 'priority'
-    const nextModeMap: Record<string, LoadBalancingMode> = {
-      priority: 'balanced',
-      balanced: 'round-robin',
-      'round-robin': 'priority',
-    }
-    const newMode: LoadBalancingMode = nextModeMap[currentMode] ?? 'priority'
+  // 负载均衡模式：三种模式并排展示，点击直接切到目标模式
+  const loadBalancingModes: { value: LoadBalancingMode; label: string }[] = [
+    { value: 'priority', label: '优先级' },
+    { value: 'balanced', label: '均衡负载' },
+    { value: 'round-robin', label: '轮询' },
+  ]
+
+  const handleSetLoadBalancing = (newMode: LoadBalancingMode) => {
+    if (newMode === loadBalancingData?.mode) return
     const modeNameMap: Record<string, string> = {
       priority: '优先级模式',
       balanced: '均衡负载模式',
       'round-robin': '轮询模式',
     }
-
     setLoadBalancingMode(newMode, {
       onSuccess: () => {
         toast.success(`已切换到${modeNameMap[newMode] ?? newMode}`)
@@ -537,7 +554,7 @@ export function Dashboard({ onLogout }: DashboardProps) {
       <div className="min-h-screen flex items-center justify-center bg-background p-4">
         <Card className="w-full max-w-md">
           <CardContent className="pt-6 text-center">
-            <div className="text-red-500 mb-4">加载失败</div>
+            <div className="text-destructive mb-4">加载失败</div>
             <p className="text-muted-foreground mb-4">{(error as Error).message}</p>
             <div className="space-x-2">
               <Button onClick={() => refetch()}>重试</Button>
@@ -553,35 +570,46 @@ export function Dashboard({ onLogout }: DashboardProps) {
     <div className="min-h-screen bg-background">
       {/* 顶部导航 */}
       <header className="sticky top-0 z-50 w-full border-b bg-background/95 backdrop-blur supports-[backdrop-filter]:bg-background/60">
-        <div className="container flex h-14 items-center justify-between px-4 md:px-8">
+        <div className="container flex h-14 items-center justify-between gap-3 px-4 md:px-8">
           <div className="flex items-center gap-2">
-            <Server className="h-5 w-5" />
+            <div className="flex h-8 w-8 items-center justify-center rounded-md bg-primary text-primary-foreground">
+              <Server className="h-4 w-4" />
+            </div>
             <span className="font-semibold">Kiro Admin</span>
           </div>
           <div className="flex items-center gap-2">
-            <Button
-              variant="outline"
-              size="sm"
-              onClick={handleToggleLoadBalancing}
-              disabled={isLoadingMode || isSettingMode}
-              title="切换负载均衡模式"
-            >
-              {isLoadingMode ? '加载中...' : (
-                loadBalancingData?.mode === 'priority' ? '优先级模式'
-                  : loadBalancingData?.mode === 'round-robin' ? '轮询模式'
-                  : '均衡负载'
-              )}
-            </Button>
+            {/* 负载均衡模式分段选择器 */}
+            <div className="hidden items-center rounded-md border bg-muted/40 p-0.5 sm:flex">
+              {loadBalancingModes.map((m) => {
+                const active = loadBalancingData?.mode === m.value
+                return (
+                  <button
+                    key={m.value}
+                    type="button"
+                    onClick={() => handleSetLoadBalancing(m.value)}
+                    disabled={isLoadingMode || isSettingMode}
+                    className={`rounded px-2.5 py-1 text-xs font-medium transition-colors disabled:opacity-50 ${
+                      active
+                        ? 'bg-background text-foreground shadow-sm'
+                        : 'text-muted-foreground hover:text-foreground'
+                    }`}
+                  >
+                    {m.label}
+                  </button>
+                )
+              })}
+            </div>
+            <div className="mx-1 hidden h-6 w-px bg-border sm:block" />
             <Button variant="ghost" size="icon" onClick={() => setSettingsDialogOpen(true)} title="系统设置">
               <Settings className="h-5 w-5" />
             </Button>
-            <Button variant="ghost" size="icon" onClick={toggleDarkMode}>
+            <Button variant="ghost" size="icon" onClick={toggleDarkMode} title={darkMode ? '切换到亮色' : '切换到暗色'}>
               {darkMode ? <Sun className="h-5 w-5" /> : <Moon className="h-5 w-5" />}
             </Button>
-            <Button variant="ghost" size="icon" onClick={handleRefresh}>
+            <Button variant="ghost" size="icon" onClick={handleRefresh} title="刷新凭据列表">
               <RefreshCw className="h-5 w-5" />
             </Button>
-            <Button variant="ghost" size="icon" onClick={handleLogout}>
+            <Button variant="ghost" size="icon" onClick={handleLogout} title="退出登录">
               <LogOut className="h-5 w-5" />
             </Button>
           </div>
@@ -589,49 +617,22 @@ export function Dashboard({ onLogout }: DashboardProps) {
       </header>
 
       {/* 主内容 */}
-      <main className="container mx-auto px-4 md:px-8 py-6">
-        {/* 统计卡片 */}
-        <div className="grid gap-4 md:grid-cols-3 mb-6">
-          <Card>
-            <CardHeader className="pb-2">
-              <CardTitle className="text-sm font-medium text-muted-foreground">
-                凭据总数
-              </CardTitle>
-            </CardHeader>
-            <CardContent>
-              <div className="text-2xl font-bold">{data?.total || 0}</div>
-            </CardContent>
-          </Card>
-          <Card>
-            <CardHeader className="pb-2">
-              <CardTitle className="text-sm font-medium text-muted-foreground">
-                可用凭据
-              </CardTitle>
-            </CardHeader>
-            <CardContent>
-              <div className="text-2xl font-bold text-green-600">{data?.available || 0}</div>
-            </CardContent>
-          </Card>
-          <Card>
-            <CardHeader className="pb-2">
-              <CardTitle className="text-sm font-medium text-muted-foreground">
-                当前活跃
-              </CardTitle>
-            </CardHeader>
-            <CardContent>
-              <div className="text-2xl font-bold flex items-center gap-2">
-                #{data?.currentId || '-'}
-                <Badge variant="success">活跃</Badge>
-              </div>
-            </CardContent>
-          </Card>
-        </div>
+      <main className="container mx-auto px-4 md:px-8 py-6 space-y-6">
+        {/* 主视图 Tab 切换 */}
+        <TabNav
+          items={MAIN_TABS}
+          value={mainTab}
+          onChange={(v) => setMainTab(v as 'monitor' | 'credentials')}
+          orientation="horizontal"
+        />
+
+        {/* 实时监控 */}
+        {mainTab === 'monitor' && <MonitorPanel />}
 
         {/* 凭据列表 */}
-        <div className="space-y-4">
+        <div className={`space-y-4 ${mainTab === 'credentials' ? '' : 'hidden'}`}>
           <div className="flex items-center justify-between">
             <div className="flex items-center gap-4">
-              <h2 className="text-xl font-semibold">凭据管理</h2>
               {selectedIds.size > 0 && (
                 <div className="flex items-center gap-2">
                   <Badge variant="secondary">已选择 {selectedIds.size} 个</Badge>

@@ -1,5 +1,17 @@
 import { useState, useEffect } from 'react'
-import { ChevronDown, ChevronRight, Eye, EyeOff, Plus, Trash2 } from 'lucide-react'
+import {
+  ChevronDown,
+  ChevronRight,
+  Eye,
+  EyeOff,
+  Plus,
+  Trash2,
+  KeyRound,
+  Gauge,
+  FileText,
+  Fingerprint,
+  Boxes,
+} from 'lucide-react'
 import { toast } from 'sonner'
 import {
   Dialog,
@@ -11,9 +23,21 @@ import {
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Switch } from '@/components/ui/switch'
+import { TabNav, type TabItem } from '@/components/ui/tabs'
 import { useAppConfig, useUpdateAppConfig } from '@/hooks/use-credentials'
 import { extractErrorMessage } from '@/lib/utils'
 import type { ModelDef } from '@/types/api'
+
+// 设置分组 Tab
+type SettingsTab = 'general' | 'rpm' | 'write' | 'fingerprint' | 'models'
+
+const SETTINGS_TABS: TabItem[] = [
+  { value: 'general', label: '常规', icon: KeyRound },
+  { value: 'rpm', label: 'RPM 限流', icon: Gauge },
+  { value: 'write', label: '写入与截断', icon: FileText },
+  { value: 'fingerprint', label: '版本指纹', icon: Fingerprint },
+  { value: 'models', label: '模型与别名', icon: Boxes },
+]
 
 interface SettingsDialogProps {
   open: boolean
@@ -54,6 +78,7 @@ export function SettingsDialog({ open, onOpenChange }: SettingsDialogProps) {
   const { data: config, isLoading, error } = useAppConfig()
   const { mutate: updateConfig, isPending } = useUpdateAppConfig()
 
+  const [activeTab, setActiveTab] = useState<SettingsTab>('general')
   const [apiKey, setApiKey] = useState('')
   const [showApiKey, setShowApiKey] = useState(false)
   const [credentialRpm, setCredentialRpm] = useState('0')
@@ -79,6 +104,7 @@ export function SettingsDialog({ open, onOpenChange }: SettingsDialogProps) {
   // 打开对话框（或拉到数据）时用服务端值回填表单
   useEffect(() => {
     if (!open || !config) return
+    setActiveTab('general')
     setModelsExpanded(false)
     setApiKey(config.apiKey)
     setCredentialRpm(String(config.credentialRpm ?? 0))
@@ -140,6 +166,7 @@ export function SettingsDialog({ open, onOpenChange }: SettingsDialogProps) {
     e.preventDefault()
 
     if (!apiKey.trim()) {
+      setActiveTab('general')
       toast.error('apiKey 不能为空')
       return
     }
@@ -149,10 +176,12 @@ export function SettingsDialog({ open, onOpenChange }: SettingsDialogProps) {
       !nodeVersion.trim() ||
       !streamingSdkVersion.trim()
     ) {
+      setActiveTab('fingerprint')
       toast.error('版本信息均不能为空')
       return
     }
     if (models.length === 0) {
+      setActiveTab('models')
       setModelsExpanded(true)
       toast.error('至少需要一个模型定义')
       return
@@ -160,11 +189,13 @@ export function SettingsDialog({ open, onOpenChange }: SettingsDialogProps) {
     for (let i = 0; i < models.length; i++) {
       const m = models[i]
       if (!m.family.trim() || !m.kiroId.trim() || !m.displayId.trim() || !m.displayName.trim()) {
+        setActiveTab('models')
         setModelsExpanded(true)
         toast.error(`第 ${i + 1} 个模型的 family / kiroId / displayId / displayName 均不能为空`)
         return
       }
       if (m.maxTokens <= 0 || m.contextWindow <= 0) {
+        setActiveTab('models')
         setModelsExpanded(true)
         toast.error(`第 ${i + 1} 个模型的 maxTokens / contextWindow 必须为正数`)
         return
@@ -176,6 +207,7 @@ export function SettingsDialog({ open, onOpenChange }: SettingsDialogProps) {
       const hasFrom = row.from.trim().length > 0
       const hasTo = row.to.trim().length > 0
       if (hasFrom !== hasTo) {
+        setActiveTab('models')
         setAliasesExpanded(true)
         toast.error(`第 ${i + 1} 条模型别名的「客户端名」和「映射目标」需同时填写或同时留空`)
         return
@@ -185,10 +217,12 @@ export function SettingsDialog({ open, onOpenChange }: SettingsDialogProps) {
     const triggerLines = parseInt(chunkedTriggerLines, 10) || 0
     const chunkLines = parseInt(chunkedChunkLines, 10) || 0
     if (chunkedEnabled && chunkLines <= 0) {
+      setActiveTab('write')
       toast.error('分块写入的每块行数必须为正数')
       return
     }
     if (chunkedEnabled && triggerLines < chunkLines) {
+      setActiveTab('write')
       toast.error('分块写入的触发行数不能小于每块行数')
       return
     }
@@ -242,22 +276,32 @@ export function SettingsDialog({ open, onOpenChange }: SettingsDialogProps) {
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent className="sm:max-w-3xl max-h-[88vh] flex flex-col">
+      <DialogContent className="sm:max-w-3xl h-[85vh] flex flex-col">
         <DialogHeader>
           <DialogTitle>系统设置</DialogTitle>
         </DialogHeader>
 
         {isLoading ? (
-          <div className="py-12 text-center text-muted-foreground">加载配置中...</div>
+          <div className="flex flex-1 items-center justify-center text-muted-foreground">加载配置中...</div>
         ) : error ? (
-          <div className="py-12 text-center text-red-500">
+          <div className="flex flex-1 items-center justify-center text-center text-destructive">
             加载配置失败：{extractErrorMessage(error)}
           </div>
         ) : (
           <form onSubmit={handleSubmit} className="flex flex-col min-h-0 flex-1">
-            <div className="space-y-6 py-4 overflow-y-auto flex-1 pr-1">
+            <div className="flex min-h-0 flex-1 gap-4 py-4">
+              {/* 左侧 Tab 导航 */}
+              <TabNav
+                items={SETTINGS_TABS}
+                value={activeTab}
+                onChange={(v) => setActiveTab(v as SettingsTab)}
+                className="w-36 shrink-0 border-r pr-2"
+              />
+
+              {/* 右侧内容区（按 Tab 切换） */}
+              <div className="space-y-6 overflow-y-auto flex-1 pr-1">
               {/* API Key */}
-              <section className="space-y-2">
+              <section className={`space-y-2 ${activeTab === 'general' ? '' : 'hidden'}`}>
                 <h3 className="text-sm font-semibold">客户端 API Key</h3>
                 <div className="relative">
                   <Input
@@ -283,7 +327,7 @@ export function SettingsDialog({ open, onOpenChange }: SettingsDialogProps) {
               </section>
 
               {/* RPM 限制 */}
-              <section className="space-y-2">
+              <section className={`space-y-2 ${activeTab === 'rpm' ? '' : 'hidden'}`}>
                 <h3 className="text-sm font-semibold">凭据 RPM 限制</h3>
                 <div className="grid grid-cols-2 gap-3 md:grid-cols-4">
                   <div className="space-y-1">
@@ -349,7 +393,7 @@ export function SettingsDialog({ open, onOpenChange }: SettingsDialogProps) {
               </section>
 
               {/* 分块写入策略 */}
-              <section className="space-y-2">
+              <section className={`space-y-2 ${activeTab === 'write' ? '' : 'hidden'}`}>
                 <div className="flex items-center justify-between">
                   <h3 className="text-sm font-semibold">Write/Edit 分块写入</h3>
                   <Switch
@@ -398,7 +442,7 @@ export function SettingsDialog({ open, onOpenChange }: SettingsDialogProps) {
               </section>
 
               {/* codex 截断纠正 */}
-              <section className="space-y-2">
+              <section className={`space-y-2 ${activeTab === 'write' ? '' : 'hidden'}`}>
                 <div className="flex items-center justify-between">
                   <h3 className="text-sm font-semibold">codex 截断纠正</h3>
                   <Switch
@@ -419,7 +463,7 @@ export function SettingsDialog({ open, onOpenChange }: SettingsDialogProps) {
               </section>
 
               {/* 版本信息 */}
-              <section className="space-y-2">
+              <section className={`space-y-2 ${activeTab === 'fingerprint' ? '' : 'hidden'}`}>
                 <h3 className="text-sm font-semibold">版本信息（上游指纹）</h3>
                 <div className="grid grid-cols-1 gap-3 md:grid-cols-2 lg:grid-cols-4">
                   <div className="space-y-1">
@@ -468,7 +512,7 @@ export function SettingsDialog({ open, onOpenChange }: SettingsDialogProps) {
               </section>
 
               {/* OpenAI/Codex 模型映射 */}
-              <section className="space-y-3">
+              <section className={`space-y-3 ${activeTab === 'models' ? '' : 'hidden'}`}>
                 <button
                   type="button"
                   onClick={() => setAliasesExpanded((v) => !v)}
@@ -550,7 +594,7 @@ export function SettingsDialog({ open, onOpenChange }: SettingsDialogProps) {
               </section>
 
               {/* 模型列表 */}
-              <section className="space-y-3">
+              <section className={`space-y-3 ${activeTab === 'models' ? '' : 'hidden'}`}>
                 <button
                   type="button"
                   onClick={() => setModelsExpanded((v) => !v)}
@@ -599,6 +643,7 @@ export function SettingsDialog({ open, onOpenChange }: SettingsDialogProps) {
                   </>
                 )}
               </section>
+              </div>
             </div>
 
             <DialogFooter>

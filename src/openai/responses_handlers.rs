@@ -721,6 +721,9 @@ async fn handle_responses_non_stream(
         "text": text_content
     })]);
 
+    // 记录模型累计用量（codex 非流式，每请求一次）
+    crate::model_stats::record(model, prompt_tokens as i64, completion_tokens.max(1) as i64);
+
     let resp = json!({
         "id": format!("resp_{}", Uuid::new_v4().simple()),
         "object": "response",

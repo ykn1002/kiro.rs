@@ -6,6 +6,7 @@ mod http_client;
 mod kiro;
 mod metrics;
 mod model;
+mod model_stats;
 mod openai;
 pub mod token;
 
@@ -32,6 +33,9 @@ async fn main() {
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
         )
         .init();
+
+    // 记录进程启动时刻（供监控指标计算运行时长）
+    metrics::init_start_time();
 
     // 加载配置
     let config_path = args
@@ -179,6 +183,14 @@ async fn main() {
         std::process::exit(1);
     });
     let token_manager = Arc::new(token_manager);
+
+    // 初始化模型统计落盘路径（与 kiro_stats.json 同目录），加载既有累计值
+    model_stats::global().init_path(
+        token_manager
+            .cache_dir()
+            .map(|d| d.join("kiro_model_stats.json")),
+    );
+
     let kiro_provider = KiroProvider::with_proxy(
         token_manager.clone(),
         proxy_config.clone(),

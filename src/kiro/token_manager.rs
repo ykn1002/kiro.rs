@@ -846,6 +846,9 @@ pub struct MultiTokenManager {
     last_stats_save_at: Mutex<Option<Instant>>,
     /// 统计数据是否有未落盘更新
     stats_dirty: AtomicBool,
+    /// 按模型展示名的全局 RPM 滑动窗口（跨所有凭据聚合，仅用于监控展示，
+    /// 不参与限流决策；限流仍走凭据级四大类窗口）
+    model_rpm_windows: Mutex<HashMap<String, std::collections::VecDeque<Instant>>>,
 }
 
 /// 每个凭据最大 API 调用失败次数
@@ -977,6 +980,7 @@ impl MultiTokenManager {
             round_robin_cursor: AtomicU64::new(0),
             last_stats_save_at: Mutex::new(None),
             stats_dirty: AtomicBool::new(false),
+            model_rpm_windows: Mutex::new(HashMap::new()),
         };
 
         // 如果有新分配的 ID 或新生成的 machineId，立即持久化到配置文件
@@ -1350,6 +1354,8 @@ impl MultiTokenManager {
             // 尝试获取/刷新 Token
             match self.try_ensure_token(id, &credentials).await {
                 Ok(ctx) => {
+                    // 记录一次模型级 RPM（用于监控展示，跨凭据聚合）
+                    self.record_model_rpm(model, Instant::now());
                     return Ok(ctx);
                 }
                 Err(e) => {
@@ -1587,6 +1593,48 @@ impl MultiTokenManager {
 
         tracing::debug!("已回写凭据到文件: {:?}", path);
         Ok(true)
+    }
+
+    /// 记录一次某模型的调用到全局 RPM 滑动窗口（仅用于监控展示，不参与限流）。
+    /// 以原始客户端模型名为键，归一化在 Admin 读取时统一处理。
+    fn record_model_rpm(&self, model: Option<&str>, now: Instant) {
+        let name = match model {
+            Some(m) if !m.trim().is_empty() => m.trim().to_string(),
+            _ => return,
+        };
+        let mut windows = self.model_rpm_windows.lock();
+        let window = windows.entry(name).or_default();
+        let cutoff = StdDuration::from_secs(60);
+        while let Some(&front) = window.front() {
+            if now.duration_since(front) >= cutoff {
+                window.pop_front();
+            } else {
+                break;
+            }
+        }
+        window.push_back(now);
+    }
+
+    /// 各模型当前 60 秒窗口内的调用数（原始模型名 → 计数），供监控展示。
+    /// 读取时顺带清理过期时间戳并移除空窗口。
+    pub fn model_rpm_snapshot(&self) -> HashMap<String, u32> {
+        let now = Instant::now();
+        let cutoff = StdDuration::from_secs(60);
+        let mut windows = self.model_rpm_windows.lock();
+        windows.retain(|_, w| {
+            while let Some(&front) = w.front() {
+                if now.duration_since(front) >= cutoff {
+                    w.pop_front();
+                } else {
+                    break;
+                }
+            }
+            !w.is_empty()
+        });
+        windows
+            .iter()
+            .map(|(k, w)| (k.clone(), w.len() as u32))
+            .collect()
     }
 
     /// 获取缓存目录（凭据文件所在目录）

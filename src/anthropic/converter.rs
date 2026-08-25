@@ -361,6 +361,28 @@ pub fn map_model(model: &str) -> Option<String> {
     match_model_def(model).map(|def| def.kiro_id.clone())
 }
 
+/// 将客户端原始模型名归一为展示名（用于监控统计聚合）。
+///
+/// 命中模型表则返回其 `display_id`（thinking 变体、别名、kiroId 都归并到同一展示名）；
+/// 未命中则返回去掉 `-thinking`/`thinking` 后缀后的原名，作为兜底展示。
+pub fn canonical_model_display(model: &str) -> String {
+    if let Some(def) = match_model_def(model) {
+        return def.display_id;
+    }
+    let lower = model.to_lowercase();
+    if let Some(idx) = lower.find("thinking") {
+        // 去掉 thinking 及其前面的分隔符（- 或空格），保留基础模型名
+        let mut base = model[..idx].to_string();
+        while base.ends_with(['-', ' ', '_']) {
+            base.pop();
+        }
+        if !base.is_empty() {
+            return base;
+        }
+    }
+    model.to_string()
+}
+
 /// 根据模型名称返回对应的上下文窗口大小
 ///
 /// 由全局模型注册表驱动；命中返回该模型的 `context_window`，未命中回退 200K。
@@ -1553,6 +1575,24 @@ mod tests {
             default_model: None,
         });
         assert!(map_model("gpt-4").is_none());
+    }
+
+    #[test]
+    fn test_canonical_model_display() {
+        let _lock = REGISTRY_TEST_LOCK.lock().unwrap();
+        set_model_registry_settings(ModelRegistrySettings {
+            models: default_models(),
+            aliases: HashMap::new(),
+            default_model: None,
+        });
+        // 命中模型表 → displayId；thinking 变体归并到基础模型
+        let base = canonical_model_display("claude-opus-4-6");
+        let thinking = canonical_model_display("claude-opus-4-6-thinking");
+        assert_eq!(base, thinking, "thinking 变体应归并到基础模型的 displayId");
+        // 未命中模型表 → 去掉 thinking 后缀的兜底名
+        assert_eq!(canonical_model_display("gpt-foo-thinking"), "gpt-foo");
+        // 完全未识别 → 原样返回
+        assert_eq!(canonical_model_display("gpt-4"), "gpt-4");
     }
 
     #[test]

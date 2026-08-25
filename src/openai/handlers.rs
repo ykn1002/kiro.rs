@@ -537,6 +537,9 @@ async fn handle_non_stream_request(
         },
     };
 
+    // 记录模型累计用量（openai 非流式，每请求一次）
+    crate::model_stats::record(model, prompt_tokens as i64, completion_tokens.max(1) as i64);
+
     (StatusCode::OK, Json(resp)).into_response()
 }
 

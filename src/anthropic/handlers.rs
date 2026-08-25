@@ -925,6 +925,9 @@ async fn handle_non_stream_request(
         .and_then(|u| u.anthropic_output_tokens())
         .unwrap_or_else(|| token::estimate_output_tokens(&content));
 
+    // 记录模型累计用量（非流式路径，每请求一次）
+    crate::model_stats::record(model, final_input_tokens as i64, final_output_tokens as i64);
+
     // 构建 Anthropic 响应
     let response_body = json!({
         "id": format!("msg_{}", Uuid::new_v4().to_string().replace('-', "")),

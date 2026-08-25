@@ -1,6 +1,22 @@
 //! 轻量 Prometheus 文本格式指标（无额外依赖）
 
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Instant;
+
+use serde::Serialize;
+
+/// 进程启动时刻（首次读取时初始化），用于计算运行时长
+static START_INSTANT: OnceLock<Instant> = OnceLock::new();
+
+fn start_instant() -> Instant {
+    *START_INSTANT.get_or_init(Instant::now)
+}
+
+/// 记录进程启动时刻（在 main 早期调用一次即可，未调用时首次读取会惰性初始化）
+pub fn init_start_time() {
+    let _ = start_instant();
+}
 
 /// 进程级指标计数器
 pub struct Metrics {
@@ -15,6 +31,21 @@ pub struct Metrics {
     pub stream_restarted: AtomicU64,
 }
 
+/// 指标快照（供 Admin JSON 接口序列化）
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MetricsSnapshot {
+    pub requests_success: u64,
+    pub requests_error: u64,
+    pub local_rpm_rejected: u64,
+    pub stream_decode_failures: u64,
+    pub upstream_rate_limited: u64,
+    pub stream_interrupted: u64,
+    pub stream_restarted: u64,
+    /// 进程运行时长（秒）
+    pub uptime_seconds: u64,
+}
+
 impl Metrics {
     pub const fn new() -> Self {
         Self {
@@ -25,6 +56,20 @@ impl Metrics {
             upstream_rate_limited: AtomicU64::new(0),
             stream_interrupted: AtomicU64::new(0),
             stream_restarted: AtomicU64::new(0),
+        }
+    }
+
+    /// 读取当前计数器快照
+    pub fn snapshot(&self) -> MetricsSnapshot {
+        MetricsSnapshot {
+            requests_success: self.requests_success.load(Ordering::Relaxed),
+            requests_error: self.requests_error.load(Ordering::Relaxed),
+            local_rpm_rejected: self.local_rpm_rejected.load(Ordering::Relaxed),
+            stream_decode_failures: self.stream_decode_failures.load(Ordering::Relaxed),
+            upstream_rate_limited: self.upstream_rate_limited.load(Ordering::Relaxed),
+            stream_interrupted: self.stream_interrupted.load(Ordering::Relaxed),
+            stream_restarted: self.stream_restarted.load(Ordering::Relaxed),
+            uptime_seconds: start_instant().elapsed().as_secs(),
         }
     }
 
@@ -129,5 +174,14 @@ mod tests {
         assert!(body.contains("kiro_requests_success_total 1"));
         assert!(body.contains("kiro_credentials_available 2"));
         assert!(body.contains("kiro_credentials_total 3"));
+    }
+
+    #[test]
+    fn test_snapshot_serializes_camel_case() {
+        let snap = METRICS.snapshot();
+        let json = serde_json::to_string(&snap).unwrap();
+        assert!(json.contains("requestsSuccess"));
+        assert!(json.contains("uptimeSeconds"));
+        assert!(json.contains("streamRestarted"));
     }
 }
