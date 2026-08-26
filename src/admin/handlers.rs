@@ -2,7 +2,7 @@
 
 use axum::{
     Json,
-    extract::{Path, State},
+    extract::{Path, Query, State},
     response::IntoResponse,
 };
 
@@ -10,7 +10,7 @@ use super::{
     middleware::AdminState,
     types::{
         AddCredentialRequest, SetDisabledRequest, SetLoadBalancingModeRequest, SetPriorityRequest,
-        SuccessResponse, UpdateAppConfigRequest,
+        SuccessResponse, TimeseriesQuery, UpdateAppConfigRequest,
     },
 };
 
@@ -25,6 +25,19 @@ pub async fn get_all_credentials(State(state): State<AdminState>) -> impl IntoRe
 /// 获取监控指标（进程级计数器快照 + 凭据池概览）
 pub async fn get_metrics(State(state): State<AdminState>) -> impl IntoResponse {
     Json(state.service.get_metrics())
+}
+
+/// GET /api/admin/metrics/timeseries
+/// 获取监控时间序列（按小时/天聚合 + 按模型/凭据分布）
+pub async fn get_timeseries(
+    State(state): State<AdminState>,
+    Query(query): Query<TimeseriesQuery>,
+) -> impl IntoResponse {
+    Json(
+        state
+            .service
+            .query_timeseries(query.from, query.to, query.bucket.as_deref()),
+    )
 }
 
 /// POST /api/admin/credentials/:id/disabled

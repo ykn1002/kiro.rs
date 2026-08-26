@@ -15,12 +15,26 @@ use crate::kiro::token_manager::MultiTokenManager;
 use super::error::AdminServiceError;
 use super::types::{
     AddCredentialRequest, AddCredentialResponse, AppConfigResponse, BalanceResponse,
-    CredentialStatusItem, CredentialsStatusResponse, LoadBalancingModeResponse, MetricsResponse,
-    ModelStat, SetLoadBalancingModeRequest, UpdateAppConfigRequest,
+    CredentialStatusItem, CredentialsStatusResponse, DimBucketDto, LoadBalancingModeResponse,
+    MetricsResponse, ModelStat, SetLoadBalancingModeRequest, TimeBucketDto, TimeseriesResponse,
+    UpdateAppConfigRequest,
 };
 
 /// 余额缓存过期时间（秒），5 分钟
 const BALANCE_CACHE_TTL_SECS: i64 = 300;
+
+/// 时间序列分布点 → DTO
+fn dim_to_dto(d: crate::stats_db::DimPoint) -> DimBucketDto {
+    DimBucketDto {
+        key: d.key,
+        requests: d.requests,
+        input_tokens: d.input_tokens,
+        output_tokens: d.output_tokens,
+        cache_read_tokens: d.cache_read_tokens,
+        cache_write_tokens: d.cache_write_tokens,
+        credits: d.credits,
+    }
+}
 
 /// 缓存的余额条目（含时间戳）
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -109,6 +123,49 @@ impl AdminService {
         }
     }
 
+    /// 查询监控时间序列（按小时/天聚合 + 按模型/凭据分布）
+    ///
+    /// `from`/`to` 为 Unix 秒，缺省为最近 24 小时。`bucket` 为 `hour`（默认）或 `day`。
+    pub fn query_timeseries(
+        &self,
+        from: Option<i64>,
+        to: Option<i64>,
+        bucket: Option<&str>,
+    ) -> TimeseriesResponse {
+        let now = Utc::now().timestamp();
+        let to = to.unwrap_or(now);
+        let from = from.unwrap_or(to - 24 * 3600);
+        let bucket_enum = crate::stats_db::Bucket::parse(bucket.unwrap_or("hour"));
+        let bucket_str = match bucket_enum {
+            crate::stats_db::Bucket::Day => "day",
+            crate::stats_db::Bucket::Hour => "hour",
+        }
+        .to_string();
+
+        let data = crate::stats_db::global().query(from, to, bucket_enum);
+
+        TimeseriesResponse {
+            from,
+            to,
+            bucket: bucket_str,
+            series: data
+                .series
+                .into_iter()
+                .map(|p| TimeBucketDto {
+                    bucket: p.bucket,
+                    requests: p.requests,
+                    input_tokens: p.input_tokens,
+                    output_tokens: p.output_tokens,
+                    cache_read_tokens: p.cache_read_tokens,
+                    cache_write_tokens: p.cache_write_tokens,
+                    credits: p.credits,
+                })
+                .collect(),
+            by_model: data.by_model.into_iter().map(dim_to_dto).collect(),
+            by_credential: data.by_credential.into_iter().map(dim_to_dto).collect(),
+        }
+    }
+
     /// 获取监控指标（进程级计数器快照 + 凭据池概览 + 各模型统计）
     pub fn get_metrics(&self) -> MetricsResponse {
         let m = crate::metrics::METRICS.snapshot();
@@ -143,10 +200,12 @@ impl AdminService {
             input_tokens: u64,
             output_tokens: u64,
             total_tokens: u64,
+            credits: f64,
             today_requests: u64,
             today_input_tokens: u64,
             today_output_tokens: u64,
             today_total_tokens: u64,
+            today_credits: f64,
             rpm: u32,
         }
         let mut merged: HashMap<String, Agg> = HashMap::new();
@@ -158,10 +217,12 @@ impl AdminService {
             e.input_tokens += s.input_tokens;
             e.output_tokens += s.output_tokens;
             e.total_tokens += s.total_tokens;
+            e.credits += s.credits;
             e.today_requests += s.today_requests;
             e.today_input_tokens += s.today_input_tokens;
             e.today_output_tokens += s.today_output_tokens;
             e.today_total_tokens += s.today_total_tokens;
+            e.today_credits += s.today_credits;
         }
 
         for (raw, count) in self.token_manager.model_rpm_snapshot() {
@@ -178,10 +239,12 @@ impl AdminService {
                 input_tokens: a.input_tokens,
                 output_tokens: a.output_tokens,
                 total_tokens: a.total_tokens,
+                credits: a.credits,
                 today_requests: a.today_requests,
                 today_input_tokens: a.today_input_tokens,
                 today_output_tokens: a.today_output_tokens,
                 today_total_tokens: a.today_total_tokens,
+                today_credits: a.today_credits,
                 rpm: a.rpm,
             })
             .collect();

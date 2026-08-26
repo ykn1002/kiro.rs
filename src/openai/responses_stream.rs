@@ -72,6 +72,10 @@ pub struct ResponsesStreamContext {
     code_mode: bool,
     /// 模型用量是否已上报（防止多个 finalize 出口重复计数）
     usage_reported: bool,
+    /// 本次流使用的上游凭据 id（-1 = 未知），供监控按凭据统计
+    credential_id: i64,
+    /// 本次请求上游计费的 credits 消耗（meteringEvent 累加）
+    credits_used: f64,
 }
 
 impl ResponsesStreamContext {
@@ -109,12 +113,19 @@ impl ResponsesStreamContext {
             stream_failed: false,
             code_mode: false,
             usage_reported: false,
+            credential_id: -1,
+            credits_used: 0.0,
         }
     }
 
     /// 启用 code mode 输出转换（子工具调用 → exec custom_tool_call）。
     pub fn set_code_mode(&mut self, enabled: bool) {
         self.code_mode = enabled;
+    }
+
+    /// 设置本次流使用的上游凭据 id（供监控按凭据统计）
+    pub fn set_credential_id(&mut self, id: u64) {
+        self.credential_id = id as i64;
     }
 
     pub fn create_error_event(message: &str) -> ResponsesSseEvent {
@@ -249,6 +260,12 @@ impl ResponsesStreamContext {
                 self.input_tokens = (cu.context_usage_percentage * (window as f64) / 100.0) as i32;
                 if cu.context_usage_percentage >= 100.0 {
                     self.status = "incomplete".to_string();
+                }
+                Vec::new()
+            }
+            Event::Metering(metering) => {
+                if metering.usage > 0.0 {
+                    self.credits_used += metering.usage;
                 }
                 Vec::new()
             }
@@ -760,10 +777,18 @@ impl ResponsesStreamContext {
             return;
         }
         self.usage_reported = true;
-        crate::model_stats::record(
+        let input = self.input_tokens as i64;
+        let output = self.output_tokens.max(0) as i64;
+        crate::model_stats::record(&self.model, input, output, self.credits_used);
+        // codex 兼容路径 token 为估算值，无缓存读写明细，记 0；credits 取上游 metering
+        crate::stats_db::record(
             &self.model,
-            self.input_tokens as i64,
-            self.output_tokens.max(0) as i64,
+            self.credential_id,
+            input,
+            output,
+            0,
+            0,
+            self.credits_used,
         );
     }
 

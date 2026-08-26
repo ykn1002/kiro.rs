@@ -166,21 +166,22 @@ impl KiroProvider {
     /// 发送非流式 API 请求
     ///
     /// `model_hint` 若提供则跳过从 request_body 解析 modelId（用于 RPM 凭据选择）。
+    /// 发送非流式 API 请求，返回响应与最终成功的凭据 id（供监控按凭据统计）
     pub async fn call_api(
         &self,
         request_body: &str,
         model_hint: Option<&str>,
-    ) -> anyhow::Result<reqwest::Response> {
+    ) -> anyhow::Result<(reqwest::Response, u64)> {
         self.call_api_with_retry(request_body, false, model_hint)
             .await
     }
 
-    /// 发送流式 API 请求
+    /// 发送流式 API 请求，返回响应与最终成功的凭据 id（供监控按凭据统计）
     pub async fn call_api_stream(
         &self,
         request_body: &str,
         model_hint: Option<&str>,
-    ) -> anyhow::Result<reqwest::Response> {
+    ) -> anyhow::Result<(reqwest::Response, u64)> {
         self.call_api_with_retry(request_body, true, model_hint)
             .await
     }
@@ -375,7 +376,7 @@ impl KiroProvider {
         request_body: &str,
         is_stream: bool,
         model_hint: Option<&str>,
-    ) -> anyhow::Result<reqwest::Response> {
+    ) -> anyhow::Result<(reqwest::Response, u64)> {
         let total_credentials = self.token_manager.total_count();
         let max_retries = (total_credentials * MAX_RETRIES_PER_CREDENTIAL).min(MAX_TOTAL_RETRIES);
         let mut last_error: Option<anyhow::Error> = None;
@@ -469,7 +470,7 @@ impl KiroProvider {
             if status.is_success() {
                 self.token_manager.report_success(ctx.id);
                 crate::metrics::inc_request_success();
-                return Ok(response);
+                return Ok((response, ctx.id));
             }
 
             // 在消费 body 前提取 Retry-After（429 限流时上游可能指示等待时长）

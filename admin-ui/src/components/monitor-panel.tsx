@@ -21,6 +21,15 @@ function formatTokens(n: number): string {
   return `${(n / 1_000_000).toFixed(2)}M`
 }
 
+// credits 费用格式化：小数保留 2-3 位，大数简写
+function formatCredits(n: number): string {
+  if (n === 0) return '0'
+  if (n < 1) return n.toFixed(3)
+  if (n < 1000) return n.toFixed(2)
+  if (n < 1_000_000) return `${(n / 1000).toFixed(1)}k`
+  return `${(n / 1_000_000).toFixed(2)}M`
+}
+
 // 累计计数器的字段名（用于计算轮询增量）
 type CounterKey =
   | 'requestsSuccess'
@@ -271,52 +280,51 @@ function ModelStatsTable({ models }: { models: ModelStat[] }) {
       {models.length === 0 ? (
         <div className="py-6 text-center text-sm text-muted-foreground">暂无调用记录</div>
       ) : (
-        <div className="overflow-x-auto">
+        // 默认显示约 3 行，超过纵向滚动；两级表头 sticky 固定
+        <div className="max-h-[140px] overflow-y-auto overflow-x-auto">
           <table className="w-full table-fixed text-sm">
             {/* 显式列宽，保证两级表头与数据列边界一致 */}
             <colgroup>
-              <col className="w-[28%]" />
-              <col className="w-[13%]" />
-              <col className="w-[16%]" />
-              <col className="w-[13%]" />
-              <col className="w-[16%]" />
-              <col className="w-[14%]" />
+              <col className="w-[22%]" />
+              <col className="w-[10%]" />
+              <col className="w-[12%]" />
+              <col className="w-[12%]" />
+              <col className="w-[10%]" />
+              <col className="w-[12%]" />
+              <col className="w-[12%]" />
+              <col className="w-[10%]" />
             </colgroup>
             <thead>
-              {/* 分组表头：今日 | 累计 | 实时 */}
+              {/* 分组表头：今日 | 累计 | 实时（sticky 第一行） */}
               <tr className="text-[11px] text-muted-foreground">
-                <th className="pb-1" />
-                <th
-                  className="border-l pb-1 px-3 text-center font-medium"
-                  colSpan={2}
-                >
+                <th className="sticky top-0 z-10 bg-card pb-1" />
+                <th className="sticky top-0 z-10 border-l bg-card pb-1 px-3 text-center font-medium" colSpan={3}>
                   今日
                 </th>
-                <th
-                  className="border-l pb-1 px-3 text-center font-medium"
-                  colSpan={2}
-                >
+                <th className="sticky top-0 z-10 border-l bg-card pb-1 px-3 text-center font-medium" colSpan={3}>
                   累计
                 </th>
-                <th className="border-l pb-1 pl-3 text-center font-medium">实时</th>
+                <th className="sticky top-0 z-10 border-l bg-card pb-1 pl-3 text-center font-medium">实时</th>
               </tr>
-              <tr className="border-b text-xs text-muted-foreground">
-                <th className="py-2 pr-3 text-left font-medium">模型</th>
-                <th className="border-l py-2 px-3 text-right font-medium">调用</th>
-                <th className="py-2 px-3 text-right font-medium">token</th>
-                <th className="border-l py-2 px-3 text-right font-medium">调用</th>
-                <th className="py-2 px-3 text-right font-medium">token</th>
-                <th className="border-l py-2 pl-3 text-right font-medium">RPM</th>
+              <tr className="text-xs text-muted-foreground">
+                <th className="sticky top-[22px] z-10 border-b bg-card py-1 pr-3 text-left font-medium">模型</th>
+                <th className="sticky top-[22px] z-10 border-b border-l bg-card py-1 px-3 text-right font-medium">调用</th>
+                <th className="sticky top-[22px] z-10 border-b bg-card py-1 px-3 text-right font-medium">token</th>
+                <th className="sticky top-[22px] z-10 border-b bg-card py-1 px-3 text-right font-medium">费用</th>
+                <th className="sticky top-[22px] z-10 border-b border-l bg-card py-1 px-3 text-right font-medium">调用</th>
+                <th className="sticky top-[22px] z-10 border-b bg-card py-1 px-3 text-right font-medium">token</th>
+                <th className="sticky top-[22px] z-10 border-b bg-card py-1 px-3 text-right font-medium">费用</th>
+                <th className="sticky top-[22px] z-10 border-b border-l bg-card py-1 pl-3 text-right font-medium">RPM</th>
               </tr>
             </thead>
             <tbody>
               {models.map((m) => (
                 <tr key={m.model} className="border-b last:border-0 hover:bg-muted/40">
-                  <td className="truncate py-2 pr-3 font-medium" title={m.model}>
+                  <td className="truncate py-1 pr-3 font-medium" title={m.model}>
                     {m.model}
                   </td>
                   {/* 今日 */}
-                  <td className="border-l py-2 px-3 text-right tabular-nums">
+                  <td className="border-l py-1 px-3 text-right tabular-nums">
                     {m.todayRequests > 0 ? (
                       m.todayRequests.toLocaleString()
                     ) : (
@@ -324,7 +332,7 @@ function ModelStatsTable({ models }: { models: ModelStat[] }) {
                     )}
                   </td>
                   <td
-                    className="py-2 px-3 text-right tabular-nums"
+                    className="py-1 px-3 text-right tabular-nums"
                     title={m.todayTotalTokens.toLocaleString()}
                   >
                     {m.todayTotalTokens > 0 ? (
@@ -333,18 +341,38 @@ function ModelStatsTable({ models }: { models: ModelStat[] }) {
                       <span className="text-muted-foreground/50">0</span>
                     )}
                   </td>
+                  <td
+                    className="py-1 px-3 text-right tabular-nums"
+                    title={`${m.todayCredits} credits`}
+                  >
+                    {m.todayCredits > 0 ? (
+                      <span className="font-medium text-[#a855f7]">
+                        {formatCredits(m.todayCredits)}
+                      </span>
+                    ) : (
+                      <span className="text-muted-foreground/50">0</span>
+                    )}
+                  </td>
                   {/* 累计 */}
-                  <td className="border-l py-2 px-3 text-right tabular-nums text-muted-foreground">
+                  <td className="border-l py-1 px-3 text-right tabular-nums text-muted-foreground">
                     {m.requests.toLocaleString()}
                   </td>
                   <td
-                    className="py-2 px-3 text-right tabular-nums text-muted-foreground"
+                    className="py-1 px-3 text-right tabular-nums text-muted-foreground"
                     title={m.totalTokens.toLocaleString()}
                   >
                     {formatTokens(m.totalTokens)}
                   </td>
+                  <td
+                    className="py-1 px-3 text-right tabular-nums text-muted-foreground"
+                    title={`${m.credits} credits`}
+                  >
+                    {m.credits > 0 ? formatCredits(m.credits) : (
+                      <span className="text-muted-foreground/50">0</span>
+                    )}
+                  </td>
                   {/* 实时 RPM */}
-                  <td className="border-l py-2 pl-3 text-right tabular-nums">
+                  <td className="border-l py-1 pl-3 text-right tabular-nums">
                     {m.rpm > 0 ? (
                       <span className="font-medium text-success">{m.rpm}</span>
                     ) : (

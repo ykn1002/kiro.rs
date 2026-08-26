@@ -13,6 +13,7 @@ import {
   getAppConfig,
   updateAppConfig,
   getMetrics,
+  getTimeseries,
 } from '@/api/credentials'
 import type { AddCredentialRequest } from '@/types/api'
 
@@ -31,6 +32,15 @@ export function useMetrics() {
     queryKey: ['metrics'],
     queryFn: getMetrics,
     refetchInterval: 4000, // 每 4 秒刷新一次
+  })
+}
+
+// 查询监控时间序列（趋势 + 按模型/凭据分布）
+export function useTimeseries(from: number, to: number, bucket: 'hour' | 'day') {
+  return useQuery({
+    queryKey: ['timeseries', from, to, bucket],
+    queryFn: () => getTimeseries(from, to, bucket),
+    refetchInterval: 30000, // 每 30 秒刷新一次（历史聚合数据无需高频）
   })
 }
 

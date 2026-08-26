@@ -231,12 +231,13 @@ async fn handle_stream_request(
     include_usage: bool,
     passthrough_retry_after: bool,
 ) -> Response {
-    let response = match provider.call_api_stream(request_body, Some(model)).await {
-        Ok(r) => r,
+    let (response, cred_id) = match provider.call_api_stream(request_body, Some(model)).await {
+        Ok(pair) => pair,
         Err(e) => return map_provider_error(e, passthrough_retry_after),
     };
 
-    let ctx = OpenAiStreamContext::new(model, input_tokens, thinking_enabled, tool_name_map);
+    let mut ctx = OpenAiStreamContext::new(model, input_tokens, thinking_enabled, tool_name_map);
+    ctx.set_credential_id(cred_id);
     let stream = create_openai_sse_stream(response, ctx, include_usage);
 
     Response::builder()
@@ -378,8 +379,8 @@ async fn handle_non_stream_request(
     tool_name_map: std::collections::HashMap<String, String>,
     passthrough_retry_after: bool,
 ) -> Response {
-    let response = match provider.call_api(request_body, Some(model)).await {
-        Ok(r) => r,
+    let (response, credential_id) = match provider.call_api(request_body, Some(model)).await {
+        Ok(pair) => pair,
         Err(e) => return map_provider_error(e, passthrough_retry_after),
     };
 
@@ -405,12 +406,18 @@ async fn handle_non_stream_request(
         std::collections::HashMap::new();
     let mut finish_reason = "stop".to_string();
     let mut prompt_tokens = input_tokens;
+    let mut credits_used: f64 = 0.0;
 
     for result in decoder.decode_iter() {
         if let Ok(frame) = result {
             if let Ok(event) = Event::from_frame(frame) {
                 match event {
                     Event::AssistantResponse(resp) => text_content.push_str(&resp.content),
+                    Event::Metering(metering) => {
+                        if metering.usage > 0.0 {
+                            credits_used += metering.usage;
+                        }
+                    }
                     Event::ToolUse(tool_use) => {
                         let entry = tool_json_buffers
                             .entry(tool_use.tool_use_id.clone())
@@ -538,7 +545,21 @@ async fn handle_non_stream_request(
     };
 
     // 记录模型累计用量（openai 非流式，每请求一次）
-    crate::model_stats::record(model, prompt_tokens as i64, completion_tokens.max(1) as i64);
+    crate::model_stats::record(
+        model,
+        prompt_tokens as i64,
+        completion_tokens.max(1) as i64,
+        credits_used,
+    );
+    crate::stats_db::record(
+        model,
+        credential_id as i64,
+        prompt_tokens as i64,
+        completion_tokens.max(1) as i64,
+        0,
+        0,
+        credits_used,
+    );
 
     (StatusCode::OK, Json(resp)).into_response()
 }

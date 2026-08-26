@@ -33,6 +33,7 @@ tower-http = { version = "0.6", features = ["cors"] }
 clap = { version = "4.5", features = ["derive"] }
 urlencoding = "2"
 parking_lot = "0.12"  # 高性能同步原语
+rusqlite = { version = "0.32", features = ["bundled"] }  # 监控时间序列存储（静态编译）
 subtle = "2.6"        # 常量时间比较（防止时序攻击）
 rust-embed = "8"      # 嵌入静态文件
 mime_guess = "2"      # MIME 类型推断

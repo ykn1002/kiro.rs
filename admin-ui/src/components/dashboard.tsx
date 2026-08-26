@@ -8,7 +8,8 @@ import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
 import { CredentialCard } from '@/components/credential-card'
 import { MonitorPanel } from '@/components/monitor-panel'
-import { TabNav, type TabItem } from '@/components/ui/tabs'
+import { UsageTrendsPanel } from '@/components/usage-trends-panel'
+import { type TabItem } from '@/components/ui/tabs'
 import { BalanceDialog } from '@/components/balance-dialog'
 import { AddCredentialDialog } from '@/components/add-credential-dialog'
 import { BatchImportDialog } from '@/components/batch-import-dialog'
@@ -571,11 +572,35 @@ export function Dashboard({ onLogout }: DashboardProps) {
       {/* 顶部导航 */}
       <header className="sticky top-0 z-50 w-full border-b bg-background/95 backdrop-blur supports-[backdrop-filter]:bg-background/60">
         <div className="container flex h-14 items-center justify-between gap-3 px-4 md:px-8">
-          <div className="flex items-center gap-2">
-            <div className="flex h-8 w-8 items-center justify-center rounded-md bg-primary text-primary-foreground">
-              <Server className="h-4 w-4" />
+          <div className="flex items-center gap-3">
+            <div className="flex items-center gap-2">
+              <div className="flex h-8 w-8 items-center justify-center rounded-md bg-primary text-primary-foreground">
+                <Server className="h-4 w-4" />
+              </div>
+              <span className="hidden font-semibold sm:inline">Kiro Admin</span>
             </div>
-            <span className="font-semibold">Kiro Admin</span>
+            {/* 主视图切换：实时监控 / 凭据管理 */}
+            <div className="flex items-center rounded-md border bg-muted/40 p-0.5">
+              {MAIN_TABS.map((t) => {
+                const active = mainTab === t.value
+                const Icon = t.icon
+                return (
+                  <button
+                    key={t.value}
+                    type="button"
+                    onClick={() => setMainTab(t.value as 'monitor' | 'credentials')}
+                    className={`flex items-center gap-1.5 rounded px-2.5 py-1 text-xs font-medium transition-colors ${
+                      active
+                        ? 'bg-background text-foreground shadow-sm'
+                        : 'text-muted-foreground hover:text-foreground'
+                    }`}
+                  >
+                    {Icon && <Icon className="h-3.5 w-3.5" />}
+                    <span className="hidden sm:inline">{t.label}</span>
+                  </button>
+                )
+              })}
+            </div>
           </div>
           <div className="flex items-center gap-2">
             {/* 负载均衡模式分段选择器 */}
@@ -618,16 +643,13 @@ export function Dashboard({ onLogout }: DashboardProps) {
 
       {/* 主内容 */}
       <main className="container mx-auto px-4 md:px-8 py-6 space-y-6">
-        {/* 主视图 Tab 切换 */}
-        <TabNav
-          items={MAIN_TABS}
-          value={mainTab}
-          onChange={(v) => setMainTab(v as 'monitor' | 'credentials')}
-          orientation="horizontal"
-        />
-
         {/* 实时监控 */}
-        {mainTab === 'monitor' && <MonitorPanel />}
+        {mainTab === 'monitor' && (
+          <div className="space-y-3">
+            <MonitorPanel />
+            <UsageTrendsPanel />
+          </div>
+        )}
 
         {/* 凭据列表 */}
         <div className={`space-y-4 ${mainTab === 'credentials' ? '' : 'hidden'}`}>

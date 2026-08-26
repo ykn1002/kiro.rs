@@ -370,18 +370,24 @@ struct StreamRestarter {
     delay_message_start: bool,
     /// 剩余可用的重连次数
     remaining: usize,
+    /// 最近一次成功建流的上游凭据 id（-1 = 未知），供监控按凭据统计
+    current_credential_id: i64,
 }
 
 impl StreamRestarter {
     /// 构建一个全新的流上下文（重连后旧上下文的 SSE 状态必须丢弃）
     fn build_ctx(&self) -> StreamContext {
-        StreamContext::new_with_thinking(
+        let mut ctx = StreamContext::new_with_thinking(
             self.model.as_str(),
             self.input_tokens,
             self.thinking_enabled,
             self.tool_name_map.clone(),
             self.delay_message_start,
-        )
+        );
+        if self.current_credential_id >= 0 {
+            ctx.set_credential_id(self.current_credential_id as u64);
+        }
+        ctx
     }
 
     /// 重放上游请求；次数用尽或重放失败返回 None
@@ -395,7 +401,8 @@ impl StreamRestarter {
             .call_api_stream(&self.request_body, Some(&self.model))
             .await
         {
-            Ok(resp) => {
+            Ok((resp, cred_id)) => {
+                self.current_credential_id = cred_id as i64;
                 crate::metrics::inc_stream_restarted();
                 Some(resp)
             }
@@ -418,7 +425,7 @@ async fn handle_stream_request(
     delay_message_start: bool,
     passthrough_retry_after: bool,
 ) -> Response {
-    let restarter = StreamRestarter {
+    let mut restarter = StreamRestarter {
         provider: provider.clone(),
         request_body,
         model: model.to_string(),
@@ -427,15 +434,17 @@ async fn handle_stream_request(
         tool_name_map,
         delay_message_start,
         remaining: MAX_STREAM_RESTARTS,
+        current_credential_id: -1,
     };
 
-    let response = match provider
+    let (response, cred_id) = match provider
         .call_api_stream(&restarter.request_body, Some(model))
         .await
     {
-        Ok(resp) => resp,
+        Ok(pair) => pair,
         Err(e) => return map_provider_error(e, passthrough_retry_after),
     };
+    restarter.current_credential_id = cred_id as i64;
 
     let ctx = restarter.build_ctx();
 
@@ -682,8 +691,8 @@ async fn handle_non_stream_request(
     passthrough_retry_after: bool,
 ) -> Response {
     // 调用 Kiro API（支持多凭据故障转移）
-    let response = match provider.call_api(request_body, Some(model)).await {
-        Ok(resp) => resp,
+    let (response, credential_id) = match provider.call_api(request_body, Some(model)).await {
+        Ok(pair) => pair,
         Err(e) => return map_provider_error(e, passthrough_retry_after),
     };
 
@@ -716,6 +725,8 @@ async fn handle_non_stream_request(
     // 从 contextUsageEvent 计算的实际输入 tokens
     let mut context_input_tokens: Option<i32> = None;
     let mut token_usage: Option<crate::kiro::model::events::TokenUsage> = None;
+    // 本次请求上游计费的 credits 消耗（meteringEvent 累加）
+    let mut credits_used: f64 = 0.0;
 
     // 收集工具调用的增量 JSON
     let mut tool_json_buffers: std::collections::HashMap<String, String> =
@@ -794,6 +805,12 @@ async fn handle_non_stream_request(
                                     "收到 metadataEvent，使用上游精确 token 用量"
                                 );
                                 token_usage = Some(usage.clone());
+                            }
+                        }
+                        Event::Metering(metering) => {
+                            // 上游计费事件：累加本次请求消耗的 credits
+                            if metering.usage > 0.0 {
+                                credits_used += metering.usage;
                             }
                         }
                         Event::InvalidState(invalid) => {
@@ -926,7 +943,30 @@ async fn handle_non_stream_request(
         .unwrap_or_else(|| token::estimate_output_tokens(&content));
 
     // 记录模型累计用量（非流式路径，每请求一次）
-    crate::model_stats::record(model, final_input_tokens as i64, final_output_tokens as i64);
+    crate::model_stats::record(
+        model,
+        final_input_tokens as i64,
+        final_output_tokens as i64,
+        credits_used,
+    );
+    let (cache_read, cache_write) = token_usage
+        .as_ref()
+        .map(|u| {
+            (
+                u.cache_read_input_tokens.unwrap_or(0).max(0),
+                u.cache_write_input_tokens.unwrap_or(0).max(0),
+            )
+        })
+        .unwrap_or((0, 0));
+    crate::stats_db::record(
+        model,
+        credential_id as i64,
+        final_input_tokens as i64,
+        final_output_tokens as i64,
+        cache_read,
+        cache_write,
+        credits_used,
+    );
 
     // 构建 Anthropic 响应
     let response_body = json!({

@@ -74,6 +74,8 @@ struct ResponsesStreamRestarter {
     tool_name_map: std::collections::HashMap<String, String>,
     code_mode: bool,
     remaining: usize,
+    /// 最近一次成功建流的上游凭据 id（-1 = 未知），供监控按凭据统计
+    current_credential_id: i64,
 }
 
 impl ResponsesStreamRestarter {
@@ -85,6 +87,9 @@ impl ResponsesStreamRestarter {
             self.tool_name_map.clone(),
         );
         ctx.set_code_mode(self.code_mode);
+        if self.current_credential_id >= 0 {
+            ctx.set_credential_id(self.current_credential_id as u64);
+        }
         ctx
     }
 
@@ -98,7 +103,8 @@ impl ResponsesStreamRestarter {
             .call_api_stream(&self.request_body, Some(&self.model))
             .await
         {
-            Ok(response) => {
+            Ok((response, cred_id)) => {
+                self.current_credential_id = cred_id as i64;
                 crate::metrics::inc_stream_restarted();
                 Some(response)
             }
@@ -311,7 +317,7 @@ async fn handle_responses_stream(
     passthrough_retry_after: bool,
     code_mode: bool,
 ) -> Response {
-    let restarter = ResponsesStreamRestarter {
+    let mut restarter = ResponsesStreamRestarter {
         provider: provider.clone(),
         request_body: request_body.to_string(),
         model: model.to_string(),
@@ -320,14 +326,16 @@ async fn handle_responses_stream(
         tool_name_map,
         code_mode,
         remaining: MAX_RESPONSES_STREAM_RESTARTS,
+        current_credential_id: -1,
     };
-    let response = match provider
+    let (response, cred_id) = match provider
         .call_api_stream(&restarter.request_body, Some(model))
         .await
     {
-        Ok(r) => r,
+        Ok(pair) => pair,
         Err(e) => return map_provider_error(e, passthrough_retry_after),
     };
+    restarter.current_credential_id = cred_id as i64;
 
     let ctx = restarter.build_ctx();
     let stream = create_responses_sse_stream(response, ctx, restarter);
@@ -557,8 +565,8 @@ async fn handle_responses_non_stream(
     passthrough_retry_after: bool,
     code_mode: bool,
 ) -> Response {
-    let response = match provider.call_api(request_body, Some(model)).await {
-        Ok(r) => r,
+    let (response, credential_id) = match provider.call_api(request_body, Some(model)).await {
+        Ok(pair) => pair,
         Err(e) => return map_provider_error(e, passthrough_retry_after),
     };
 
@@ -585,12 +593,18 @@ async fn handle_responses_non_stream(
         std::collections::HashMap::new();
     let mut status = "completed".to_string();
     let mut prompt_tokens = input_tokens;
+    let mut credits_used: f64 = 0.0;
 
     for result in decoder.decode_iter() {
         if let Ok(frame) = result {
             if let Ok(event) = Event::from_frame(frame) {
                 match event {
                     Event::AssistantResponse(resp) => text_content.push_str(&resp.content),
+                    Event::Metering(metering) => {
+                        if metering.usage > 0.0 {
+                            credits_used += metering.usage;
+                        }
+                    }
                     Event::ToolUse(tool_use) => {
                         let entry = tool_buffers
                             .entry(tool_use.tool_use_id.clone())
@@ -722,7 +736,21 @@ async fn handle_responses_non_stream(
     })]);
 
     // 记录模型累计用量（codex 非流式，每请求一次）
-    crate::model_stats::record(model, prompt_tokens as i64, completion_tokens.max(1) as i64);
+    crate::model_stats::record(
+        model,
+        prompt_tokens as i64,
+        completion_tokens.max(1) as i64,
+        credits_used,
+    );
+    crate::stats_db::record(
+        model,
+        credential_id as i64,
+        prompt_tokens as i64,
+        completion_tokens.max(1) as i64,
+        0,
+        0,
+        credits_used,
+    );
 
     let resp = json!({
         "id": format!("resp_{}", Uuid::new_v4().simple()),

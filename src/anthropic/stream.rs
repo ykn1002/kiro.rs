@@ -615,6 +615,11 @@ pub struct StreamContext {
     completed_tool_ids: std::collections::HashSet<String>,
     /// 模型用量是否已上报（防止多个 finalize 出口重复计数）
     usage_reported: bool,
+    /// 本次流实际使用的上游凭据 id（-1 = 未知），供监控按凭据统计。
+    /// 重连换凭据时更新为最新值，上报时取收尾那次的凭据。
+    credential_id: i64,
+    /// 本次请求上游计费的 credits 消耗（来自 meteringEvent，累加）。
+    credits_used: f64,
 }
 
 impl StreamContext {
@@ -652,7 +657,14 @@ impl StreamContext {
             buffered_tool_events: Vec::new(),
             completed_tool_ids: std::collections::HashSet::new(),
             usage_reported: false,
+            credential_id: -1,
+            credits_used: 0.0,
         }
+    }
+
+    /// 设置本次流使用的上游凭据 id（供监控按凭据统计）
+    pub fn set_credential_id(&mut self, id: u64) {
+        self.credential_id = id as i64;
     }
 
     /// 客户端是否已收到过正文事件（`message_start` 及其后续）
@@ -709,10 +721,28 @@ impl StreamContext {
             return;
         }
         self.usage_reported = true;
-        crate::model_stats::record(
+        let input = self.effective_input_tokens() as i64;
+        let output = self.effective_output_tokens() as i64;
+        crate::model_stats::record(&self.model, input, output, self.credits_used);
+        // 缓存读写取自 metadataEvent 精确值（无则 0）
+        let (cache_read, cache_write) = self
+            .token_usage
+            .as_ref()
+            .map(|u| {
+                (
+                    u.cache_read_input_tokens.unwrap_or(0).max(0),
+                    u.cache_write_input_tokens.unwrap_or(0).max(0),
+                )
+            })
+            .unwrap_or((0, 0));
+        crate::stats_db::record(
             &self.model,
-            self.effective_input_tokens() as i64,
-            self.effective_output_tokens() as i64,
+            self.credential_id,
+            input,
+            output,
+            cache_read,
+            cache_write,
+            self.credits_used,
         );
     }
 
@@ -947,6 +977,18 @@ impl StreamContext {
                         "收到 metadataEvent，使用上游精确 token 用量"
                     );
                     self.token_usage = Some(usage.clone());
+                }
+                Vec::new()
+            }
+            Event::Metering(metering) => {
+                // 上游计费事件：累加本次请求消耗的 credits（Kiro 实际计费单位）
+                if metering.usage > 0.0 {
+                    self.credits_used += metering.usage;
+                    tracing::debug!(
+                        usage = metering.usage,
+                        unit = %metering.unit,
+                        "收到 meteringEvent，累加 credits 消耗"
+                    );
                 }
                 Vec::new()
             }

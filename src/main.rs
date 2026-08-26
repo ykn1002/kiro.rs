@@ -8,6 +8,7 @@ mod metrics;
 mod model;
 mod model_stats;
 mod openai;
+mod stats_db;
 pub mod token;
 
 use std::collections::HashMap;
@@ -189,6 +190,13 @@ async fn main() {
         token_manager
             .cache_dir()
             .map(|d| d.join("kiro_model_stats.json")),
+    );
+
+    // 初始化监控时间序列数据库（与 kiro_stats.json 同目录）
+    stats_db::init(
+        token_manager
+            .cache_dir()
+            .map(|d| d.join("kiro_usage_stats.db")),
     );
 
     let kiro_provider = KiroProvider::with_proxy(

@@ -11,6 +11,7 @@ import type {
   AppConfig,
   UpdateAppConfigRequest,
   MetricsResponse,
+  TimeseriesResponse,
 } from '@/types/api'
 
 // 创建 axios 实例
@@ -39,6 +40,18 @@ export async function getCredentials(): Promise<CredentialsStatusResponse> {
 // 获取监控指标
 export async function getMetrics(): Promise<MetricsResponse> {
   const { data } = await api.get<MetricsResponse>('/metrics')
+  return data
+}
+
+// 获取监控时间序列（趋势 + 按模型/凭据分布）
+export async function getTimeseries(
+  from: number,
+  to: number,
+  bucket: 'hour' | 'day'
+): Promise<TimeseriesResponse> {
+  const { data } = await api.get<TimeseriesResponse>('/metrics/timeseries', {
+    params: { from, to, bucket },
+  })
   return data
 }
 

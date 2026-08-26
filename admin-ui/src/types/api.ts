@@ -56,10 +56,12 @@ export interface ModelStat {
   inputTokens: number
   outputTokens: number
   totalTokens: number
+  credits: number
   todayRequests: number
   todayInputTokens: number
   todayOutputTokens: number
   todayTotalTokens: number
+  todayCredits: number
   rpm: number
 }
 
@@ -77,6 +79,38 @@ export interface MetricsResponse {
   credentialsTotal: number
   currentId: number
   models: ModelStat[]
+}
+
+// 监控时间序列：单个时间桶
+export interface TimeBucket {
+  bucket: number
+  requests: number
+  inputTokens: number
+  outputTokens: number
+  cacheReadTokens: number
+  cacheWriteTokens: number
+  credits: number
+}
+
+// 监控时间序列：某维度（模型 / 凭据）区间聚合
+export interface DimBucket {
+  key: string
+  requests: number
+  inputTokens: number
+  outputTokens: number
+  cacheReadTokens: number
+  cacheWriteTokens: number
+  credits: number
+}
+
+// 监控时间序列响应
+export interface TimeseriesResponse {
+  from: number
+  to: number
+  bucket: 'hour' | 'day'
+  series: TimeBucket[]
+  byModel: DimBucket[]
+  byCredential: DimBucket[]
 }
 
 // 余额响应

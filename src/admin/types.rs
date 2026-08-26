@@ -310,6 +310,8 @@ pub struct ModelStat {
     pub output_tokens: u64,
     /// 累计总 token
     pub total_tokens: u64,
+    /// 累计费用（credits）
+    pub credits: f64,
     /// 今日调用次数
     pub today_requests: u64,
     /// 今日输入 token
@@ -318,6 +320,8 @@ pub struct ModelStat {
     pub today_output_tokens: u64,
     /// 今日总 token
     pub today_total_tokens: u64,
+    /// 今日费用（credits）
+    pub today_credits: f64,
     /// 最近 60 秒调用数（实时 RPM，跨凭据聚合）
     pub rpm: u32,
 }
@@ -350,6 +354,62 @@ pub struct MetricsResponse {
     pub current_id: u64,
     /// 各模型统计（按调用次数降序）
     pub models: Vec<ModelStat>,
+}
+
+// ============ 监控时间序列 ============
+
+/// 时间序列查询参数（GET /api/admin/metrics/timeseries）
+#[derive(Debug, Deserialize)]
+pub struct TimeseriesQuery {
+    /// 起始时间（Unix 秒，含）；缺省为 24 小时前
+    pub from: Option<i64>,
+    /// 结束时间（Unix 秒，不含）；缺省为当前时刻
+    pub to: Option<i64>,
+    /// 聚合粒度：`hour`（默认）或 `day`
+    pub bucket: Option<String>,
+}
+
+/// 单个时间桶
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TimeBucketDto {
+    /// 桶起始 Unix 秒
+    pub bucket: i64,
+    pub requests: i64,
+    pub input_tokens: i64,
+    pub output_tokens: i64,
+    pub cache_read_tokens: i64,
+    pub cache_write_tokens: i64,
+    /// 计费 credits 消耗合计
+    pub credits: f64,
+}
+
+/// 某维度（模型 / 凭据）区间聚合
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DimBucketDto {
+    /// 模型展示名，或凭据 id 字符串
+    pub key: String,
+    pub requests: i64,
+    pub input_tokens: i64,
+    pub output_tokens: i64,
+    pub cache_read_tokens: i64,
+    pub cache_write_tokens: i64,
+    /// 计费 credits 消耗合计
+    pub credits: f64,
+}
+
+/// 时间序列响应
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TimeseriesResponse {
+    /// 实际生效的起止与粒度（回显，便于前端对齐）
+    pub from: i64,
+    pub to: i64,
+    pub bucket: String,
+    pub series: Vec<TimeBucketDto>,
+    pub by_model: Vec<DimBucketDto>,
+    pub by_credential: Vec<DimBucketDto>,
 }
 
 // ============ 通用响应 ============

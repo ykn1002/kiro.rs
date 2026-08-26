@@ -31,6 +31,9 @@ struct ModelStatEntry {
     input_tokens: u64,
     /// 累计输出 token
     output_tokens: u64,
+    /// 累计费用（credits，上游 meteringEvent）
+    #[serde(default)]
+    credits: f64,
     /// 今日计数所属日期（本地时区 YYYY-MM-DD）；跨天则重置今日字段
     #[serde(default)]
     day: String,
@@ -43,6 +46,9 @@ struct ModelStatEntry {
     /// 今日输出 token
     #[serde(default)]
     today_output_tokens: u64,
+    /// 今日费用（credits）
+    #[serde(default)]
+    today_credits: f64,
 }
 
 impl ModelStatEntry {
@@ -53,6 +59,7 @@ impl ModelStatEntry {
             self.today_requests = 0;
             self.today_input_tokens = 0;
             self.today_output_tokens = 0;
+            self.today_credits = 0.0;
         }
     }
 }
@@ -67,6 +74,8 @@ pub struct ModelStatSnapshot {
     pub input_tokens: u64,
     pub output_tokens: u64,
     pub total_tokens: u64,
+    /// 累计费用（credits）
+    pub credits: f64,
     /// 今日调用次数
     pub today_requests: u64,
     /// 今日输入 token
@@ -75,6 +84,8 @@ pub struct ModelStatSnapshot {
     pub today_output_tokens: u64,
     /// 今日总 token
     pub today_total_tokens: u64,
+    /// 今日费用（credits）
+    pub today_credits: f64,
 }
 
 /// 全局模型统计存储
@@ -95,9 +106,9 @@ impl ModelStats {
         }
     }
 
-    /// 记录一次调用（累加次数与 token），随后去抖落盘。
-    /// 负值 token 归 0，避免估算路径偶发负数污染累计。
-    pub fn record(&self, model: &str, input_tokens: i64, output_tokens: i64) {
+    /// 记录一次调用（累加次数、token 与费用），随后去抖落盘。
+    /// 负值 token/credits 归 0，避免估算路径偶发负数污染累计。
+    pub fn record(&self, model: &str, input_tokens: i64, output_tokens: i64, credits: f64) {
         let model = model.trim();
         if model.is_empty() {
             return;
@@ -105,6 +116,7 @@ impl ModelStats {
         let today = today_str();
         let inp = input_tokens.max(0) as u64;
         let out = output_tokens.max(0) as u64;
+        let cred = if credits > 0.0 { credits } else { 0.0 };
         {
             let mut map = self.inner.lock();
             let entry = map.entry(model.to_string()).or_default();
@@ -112,9 +124,11 @@ impl ModelStats {
             entry.requests += 1;
             entry.input_tokens += inp;
             entry.output_tokens += out;
+            entry.credits += cred;
             entry.today_requests += 1;
             entry.today_input_tokens += inp;
             entry.today_output_tokens += out;
+            entry.today_credits += cred;
         }
         self.save_debounced();
     }
@@ -128,10 +142,15 @@ impl ModelStats {
             .iter()
             .map(|(model, e)| {
                 let is_today = e.day == today;
-                let (tr, ti, to) = if is_today {
-                    (e.today_requests, e.today_input_tokens, e.today_output_tokens)
+                let (tr, ti, to, tc) = if is_today {
+                    (
+                        e.today_requests,
+                        e.today_input_tokens,
+                        e.today_output_tokens,
+                        e.today_credits,
+                    )
                 } else {
-                    (0, 0, 0)
+                    (0, 0, 0, 0.0)
                 };
                 ModelStatSnapshot {
                     model: model.clone(),
@@ -139,10 +158,12 @@ impl ModelStats {
                     input_tokens: e.input_tokens,
                     output_tokens: e.output_tokens,
                     total_tokens: e.input_tokens + e.output_tokens,
+                    credits: e.credits,
                     today_requests: tr,
                     today_input_tokens: ti,
                     today_output_tokens: to,
                     today_total_tokens: ti + to,
+                    today_credits: tc,
                 }
             })
             .collect();
@@ -214,8 +235,8 @@ pub fn global() -> &'static ModelStats {
 }
 
 /// 便捷记录入口
-pub fn record(model: &str, input_tokens: i64, output_tokens: i64) {
-    global().record(model, input_tokens, output_tokens);
+pub fn record(model: &str, input_tokens: i64, output_tokens: i64, credits: f64) {
+    global().record(model, input_tokens, output_tokens, credits);
 }
 
 #[cfg(test)]
@@ -225,9 +246,9 @@ mod tests {
     #[test]
     fn test_record_and_snapshot() {
         let stats = ModelStats::new();
-        stats.record("claude-opus-4-8", 100, 50);
-        stats.record("claude-opus-4-8", 200, 30);
-        stats.record("claude-sonnet-4-6", 10, 5);
+        stats.record("claude-opus-4-8", 100, 50, 0.25);
+        stats.record("claude-opus-4-8", 200, 30, 0.75);
+        stats.record("claude-sonnet-4-6", 10, 5, 0.1);
 
         let snap = stats.snapshot();
         // opus 调用 2 次应排在前
@@ -236,9 +257,11 @@ mod tests {
         assert_eq!(snap[0].input_tokens, 300);
         assert_eq!(snap[0].output_tokens, 80);
         assert_eq!(snap[0].total_tokens, 380);
+        assert!((snap[0].credits - 1.0).abs() < 1e-9);
         // 刚记录的都算今日
         assert_eq!(snap[0].today_requests, 2);
         assert_eq!(snap[0].today_total_tokens, 380);
+        assert!((snap[0].today_credits - 1.0).abs() < 1e-9);
         assert_eq!(snap[1].model, "claude-sonnet-4-6");
         assert_eq!(snap[1].requests, 1);
         assert_eq!(snap[1].today_requests, 1);
@@ -247,7 +270,7 @@ mod tests {
     #[test]
     fn test_stale_day_zeroes_today() {
         let stats = ModelStats::new();
-        stats.record("m", 100, 50);
+        stats.record("m", 100, 50, 1.0);
         // 手动把记录日期改成昨天，模拟跨天
         {
             let mut map = stats.inner.lock();
@@ -257,24 +280,27 @@ mod tests {
         // 累计保留，今日归零
         assert_eq!(snap[0].requests, 1);
         assert_eq!(snap[0].total_tokens, 150);
+        assert!((snap[0].credits - 1.0).abs() < 1e-9, "累计费用应保留");
         assert_eq!(snap[0].today_requests, 0);
         assert_eq!(snap[0].today_total_tokens, 0);
+        assert_eq!(snap[0].today_credits, 0.0, "今日费用跨天应归零");
     }
 
     #[test]
     fn test_negative_tokens_clamped() {
         let stats = ModelStats::new();
-        stats.record("m", -5, -3);
+        stats.record("m", -5, -3, -2.0);
         let snap = stats.snapshot();
         assert_eq!(snap[0].input_tokens, 0);
         assert_eq!(snap[0].output_tokens, 0);
         assert_eq!(snap[0].requests, 1);
+        assert_eq!(snap[0].credits, 0.0, "负费用应归零");
     }
 
     #[test]
     fn test_empty_model_ignored() {
         let stats = ModelStats::new();
-        stats.record("  ", 10, 10);
+        stats.record("  ", 10, 10, 1.0);
         assert!(stats.snapshot().is_empty());
     }
 }
