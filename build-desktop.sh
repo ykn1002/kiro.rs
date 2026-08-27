@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# kiro-rs 桌面版（Tauri）打包脚本
+# kiro-rs 桌面版（Tauri）打包脚本 —— macOS
+# Windows 请使用 build-desktop.ps1（PowerShell）。
 #
 # 用法:
 #   ./build-desktop.sh                    # 打当前架构（Apple Silicon 上即 arm64）

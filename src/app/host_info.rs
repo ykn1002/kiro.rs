@@ -108,13 +108,17 @@ fn macos_kiro_version() -> Option<String> {
 // ---- Kiro 版本：Windows ----
 #[cfg(target_os = "windows")]
 fn windows_kiro_version() -> Option<String> {
-    // Kiro 为 VSCode fork，版本号在安装目录的 resources/app/product.json 的 "version" 字段。
-    // 常见安装位置：用户级 LocalAppData 与系统级 Program Files。
+    // Kiro 为 Code OSS fork，版本号在安装目录 resources/app/product.json 的 "version" 字段。
+    // 官方用户级安装路径为 %LOCALAPPDATA%\Programs\kiro\resources\app\product.json（小写 kiro）；
+    // 另尝试系统级 Program Files 作为回退。
     let mut roots: Vec<String> = Vec::new();
     if let Ok(local) = std::env::var("LOCALAPPDATA") {
+        roots.push(format!("{local}\\Programs\\kiro\\resources\\app\\product.json"));
+        // 大小写回退（安装器版本差异）
         roots.push(format!("{local}\\Programs\\Kiro\\resources\\app\\product.json"));
     }
     if let Ok(pf) = std::env::var("ProgramFiles") {
+        roots.push(format!("{pf}\\kiro\\resources\\app\\product.json"));
         roots.push(format!("{pf}\\Kiro\\resources\\app\\product.json"));
     }
     for path in roots.iter().filter(|p| std::path::Path::new(p).exists()) {

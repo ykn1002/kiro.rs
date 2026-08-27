@@ -74,6 +74,13 @@ function parseTokenJson(raw: string): AuthToken {
   }
 }
 
+// 按当前平台返回 SSO 缓存目录的展示路径（仅用于提示文案）
+function ssoCacheDisplayPath(): string {
+  const ua = navigator.userAgent
+  if (/Windows/i.test(ua)) return 'C:\\Users\\{user}\\.aws\\sso\\cache'
+  return '~/.aws/sso/cache'
+}
+
 export function AwsSsoImportDialog({ open, onOpenChange }: AwsSsoImportDialogProps) {
   const [clientJson, setClientJson] = useState('')
   const [tokenJson, setTokenJson] = useState('')
@@ -217,7 +224,7 @@ export function AwsSsoImportDialog({ open, onOpenChange }: AwsSsoImportDialogPro
     try {
       const candidates = await scanSsoCredentials()
       if (candidates.length === 0) {
-        setScanMsg('未在本机 ~/.aws/sso/cache 找到可导入的凭证')
+        setScanMsg(`未在本机 ${ssoCacheDisplayPath()} 找到可导入的凭证`)
         toast.info('未扫描到可导入的凭证')
         return
       }
@@ -276,7 +283,7 @@ export function AwsSsoImportDialog({ open, onOpenChange }: AwsSsoImportDialogPro
                 <div>
                   <div className="text-sm font-medium">一键导入（自动扫描）</div>
                   <div className="text-xs text-muted-foreground">
-                    自动读取本机 <code className="font-mono">~/.aws/sso/cache</code>{' '}
+                    自动读取本机 <code className="font-mono">{ssoCacheDisplayPath()}</code>{' '}
                     并导入验活，无需手动粘贴
                   </div>
                 </div>
