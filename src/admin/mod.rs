@@ -11,8 +11,11 @@
 //!
 //! # 使用
 //! ```ignore
-//! let admin_service = AdminService::new(token_manager.clone(), endpoint_names);
-//! let admin_state = AdminState::new(admin_api_key, admin_service);
+//! // shared_admin_api_key 由 AdminState 认证与 AdminService 修改共用，实现 adminApiKey 热替换
+//! let admin_service = AdminService::new(
+//!     token_manager.clone(), endpoint_names, shared_api_key.clone(), shared_admin_api_key.clone(),
+//! );
+//! let admin_state = AdminState::new(shared_admin_api_key, admin_service);
 //! let admin_router = create_admin_router(admin_state);
 //! ```
 

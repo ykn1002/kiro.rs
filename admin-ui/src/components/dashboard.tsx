@@ -1,5 +1,5 @@
 import { useState, useEffect, useRef } from 'react'
-import { RefreshCw, LogOut, Moon, Sun, Server, Plus, Upload, FileUp, Trash2, RotateCcw, CheckCircle2, Settings, Activity, KeyRound } from 'lucide-react'
+import { RefreshCw, LogOut, Moon, Sun, Server, Plus, Upload, FileUp, Trash2, RotateCcw, CheckCircle2, Settings, Activity, KeyRound, FileText } from 'lucide-react'
 import { useQueryClient } from '@tanstack/react-query'
 import { toast } from 'sonner'
 import { storage } from '@/lib/storage'
@@ -17,6 +17,8 @@ import { KamImportDialog } from '@/components/kam-import-dialog'
 import { AwsSsoImportDialog } from '@/components/aws-sso-import-dialog'
 import { BatchVerifyDialog, type VerifyResult } from '@/components/batch-verify-dialog'
 import { SettingsDialog } from '@/components/settings-dialog'
+import { LogPanel } from '@/components/log-panel'
+import { isDesktop } from '@/lib/desktop'
 import { useCredentials, useDeleteCredential, useResetFailure, useLoadBalancingMode, useSetLoadBalancingMode } from '@/hooks/use-credentials'
 import { getCredentialBalance, forceRefreshToken } from '@/api/credentials'
 import type { LoadBalancingMode } from '@/api/credentials'
@@ -28,9 +30,15 @@ interface DashboardProps {
 }
 
 // 主视图分组：实时监控 / 凭据管理
+// 「日志」Tab 仅在桌面壳（Tauri）中出现
+const DESKTOP = isDesktop()
+
+type MainTab = 'monitor' | 'credentials' | 'logs'
+
 const MAIN_TABS: TabItem[] = [
   { value: 'monitor', label: '实时监控', icon: Activity },
   { value: 'credentials', label: '凭据管理', icon: KeyRound },
+  ...(DESKTOP ? [{ value: 'logs', label: '日志', icon: FileText } as TabItem] : []),
 ]
 
 export function Dashboard({ onLogout }: DashboardProps) {
@@ -53,7 +61,7 @@ export function Dashboard({ onLogout }: DashboardProps) {
   const [batchRefreshing, setBatchRefreshing] = useState(false)
   const [batchRefreshProgress, setBatchRefreshProgress] = useState({ current: 0, total: 0 })
   const cancelVerifyRef = useRef(false)
-  const [mainTab, setMainTab] = useState<'monitor' | 'credentials'>('monitor')
+  const [mainTab, setMainTab] = useState<MainTab>('monitor')
   const [currentPage, setCurrentPage] = useState(1)
   const itemsPerPage = 12
   const [darkMode, setDarkMode] = useState(() => {
@@ -588,7 +596,7 @@ export function Dashboard({ onLogout }: DashboardProps) {
                   <button
                     key={t.value}
                     type="button"
-                    onClick={() => setMainTab(t.value as 'monitor' | 'credentials')}
+                    onClick={() => setMainTab(t.value as MainTab)}
                     className={`flex items-center gap-1.5 rounded px-2.5 py-1 text-xs font-medium transition-colors ${
                       active
                         ? 'bg-background text-foreground shadow-sm'
@@ -650,6 +658,9 @@ export function Dashboard({ onLogout }: DashboardProps) {
             <UsageTrendsPanel />
           </div>
         )}
+
+        {/* 运行日志（仅桌面版） */}
+        {DESKTOP && mainTab === 'logs' && <LogPanel />}
 
         {/* 凭据列表 */}
         <div className={`space-y-4 ${mainTab === 'credentials' ? '' : 'hidden'}`}>

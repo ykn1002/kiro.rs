@@ -56,6 +56,8 @@ pub struct AdminService {
     known_endpoints: HashSet<String>,
     /// 客户端 API Key 共享句柄（与 AppState 共享，用于热替换 apiKey）
     shared_api_key: SharedApiKey,
+    /// Admin API Key 共享句柄（与 AdminState 认证中间件共享，用于热替换 adminApiKey）
+    shared_admin_api_key: SharedApiKey,
 }
 
 impl AdminService {
@@ -63,6 +65,7 @@ impl AdminService {
         token_manager: Arc<MultiTokenManager>,
         known_endpoints: impl IntoIterator<Item = String>,
         shared_api_key: SharedApiKey,
+        shared_admin_api_key: SharedApiKey,
     ) -> Self {
         let cache_path = token_manager
             .cache_dir()
@@ -76,6 +79,7 @@ impl AdminService {
             cache_path,
             known_endpoints: known_endpoints.into_iter().collect(),
             shared_api_key,
+            shared_admin_api_key,
         }
     }
 
@@ -501,6 +505,7 @@ impl AdminService {
         let config = self.token_manager.config();
         AppConfigResponse {
             api_key: self.shared_api_key.read().clone(),
+            admin_api_key: self.shared_admin_api_key.read().clone(),
             credential_rpm: config.credential_rpm,
             credential_rpm_opus: config.credential_rpm_opus,
             credential_rpm_sonnet: config.credential_rpm_sonnet,
@@ -536,6 +541,19 @@ impl AdminService {
                 "apiKey 不能为空".to_string(),
             ));
         }
+        // adminApiKey：提供时不能为空（缺省表示不修改）
+        let admin_api_key: Option<String> = match &req.admin_api_key {
+            Some(k) => {
+                let trimmed = k.trim();
+                if trimmed.is_empty() {
+                    return Err(AdminServiceError::InvalidCredential(
+                        "adminApiKey 不能为空".to_string(),
+                    ));
+                }
+                Some(trimmed.to_string())
+            }
+            None => None,
+        };
         if req.kiro_version.trim().is_empty()
             || req.system_version.trim().is_empty()
             || req.node_version.trim().is_empty()
@@ -629,6 +647,9 @@ impl AdminService {
         };
 
         new_config.api_key = Some(api_key.to_string());
+        if let Some(ref k) = admin_api_key {
+            new_config.admin_api_key = Some(k.clone());
+        }
         new_config.credential_rpm = req.credential_rpm;
         new_config.credential_rpm_opus = req.credential_rpm_opus;
         new_config.credential_rpm_sonnet = req.credential_rpm_sonnet;
@@ -676,6 +697,10 @@ impl AdminService {
 
         // ---- 热应用 ----
         *self.shared_api_key.write() = api_key.to_string();
+        if let Some(k) = admin_api_key {
+            // 热替换 adminApiKey：认证中间件与本服务共享该句柄，立即生效
+            *self.shared_admin_api_key.write() = k;
+        }
         crate::anthropic::init_model_mapping(req.models, normalized_aliases, default_model);
         crate::anthropic::set_chunked_write_policy(new_config.chunked_write_policy.clone());
         crate::openai::set_codex_truncation_correction(new_config.codex_truncation_correction);

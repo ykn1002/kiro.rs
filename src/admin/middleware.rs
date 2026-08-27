@@ -12,21 +12,24 @@ use axum::{
 
 use super::service::AdminService;
 use super::types::AdminErrorResponse;
+use crate::anthropic::SharedApiKey;
 use crate::common::auth;
 
 /// Admin API 共享状态
 #[derive(Clone)]
 pub struct AdminState {
-    /// Admin API 密钥
-    pub admin_api_key: String,
+    /// Admin API 密钥共享句柄（可被 update_app_config 热替换）
+    pub admin_api_key: SharedApiKey,
     /// Admin 服务
     pub service: Arc<AdminService>,
 }
 
 impl AdminState {
-    pub fn new(admin_api_key: impl Into<String>, service: AdminService) -> Self {
+    /// 用共享句柄构造。该句柄与 [`AdminService`] 内持有的是同一个，
+    /// 因此 `update_app_config` 写入后认证中间件立即读到新值（热生效）。
+    pub fn new(admin_api_key: SharedApiKey, service: AdminService) -> Self {
         Self {
-            admin_api_key: admin_api_key.into(),
+            admin_api_key,
             service: Arc::new(service),
         }
     }
@@ -39,9 +42,10 @@ pub async fn admin_auth_middleware(
     next: Next,
 ) -> Response {
     let api_key = auth::extract_api_key(&request);
+    let expected = state.admin_api_key.read().clone();
 
     match api_key {
-        Some(key) if auth::constant_time_eq(&key, &state.admin_api_key) => next.run(request).await,
+        Some(key) if auth::constant_time_eq(&key, &expected) => next.run(request).await,
         _ => {
             let error = AdminErrorResponse::authentication_error();
             (StatusCode::UNAUTHORIZED, Json(error)).into_response()

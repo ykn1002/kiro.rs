@@ -26,10 +26,24 @@ import { Switch } from '@/components/ui/switch'
 import { TabNav, type TabItem } from '@/components/ui/tabs'
 import { useAppConfig, useUpdateAppConfig } from '@/hooks/use-credentials'
 import { extractErrorMessage } from '@/lib/utils'
+import {
+  isDesktop,
+  getDesktopSettings,
+  setDesktopSettings,
+  getPortStatus,
+  setConfiguredPort,
+  importConfig,
+  type PortStatus,
+} from '@/lib/desktop'
+import { storage } from '@/lib/storage'
+import { Monitor, FileUp } from 'lucide-react'
 import type { ModelDef } from '@/types/api'
 
 // 设置分组 Tab
-type SettingsTab = 'general' | 'rpm' | 'write' | 'fingerprint' | 'models'
+type SettingsTab = 'general' | 'rpm' | 'write' | 'fingerprint' | 'models' | 'desktop'
+
+// 「桌面」Tab 仅在 Tauri 桌面壳中出现
+const DESKTOP = isDesktop()
 
 const SETTINGS_TABS: TabItem[] = [
   { value: 'general', label: '常规', icon: KeyRound },
@@ -37,6 +51,7 @@ const SETTINGS_TABS: TabItem[] = [
   { value: 'write', label: '写入与截断', icon: FileText },
   { value: 'fingerprint', label: '版本指纹', icon: Fingerprint },
   { value: 'models', label: '模型与别名', icon: Boxes },
+  ...(DESKTOP ? [{ value: 'desktop', label: '桌面', icon: Monitor } as TabItem] : []),
 ]
 
 interface SettingsDialogProps {
@@ -100,6 +115,14 @@ export function SettingsDialog({ open, onOpenChange }: SettingsDialogProps) {
   const [chunkedTriggerLines, setChunkedTriggerLines] = useState('150')
   const [chunkedChunkLines, setChunkedChunkLines] = useState('50')
   const [codexTruncationCorrection, setCodexTruncationCorrection] = useState(true)
+  // 桌面壳设置（仅桌面版）
+  const [silentStart, setSilentStart] = useState(false)
+  const [autostart, setAutostart] = useState(false)
+  const [portStatus, setPortStatus] = useState<PortStatus | null>(null)
+  const [portInput, setPortInput] = useState('')
+  const [portSaving, setPortSaving] = useState(false)
+  const [adminApiKey, setAdminApiKeyState] = useState('')
+  const [showAdminKey, setShowAdminKey] = useState(false)
 
   // 打开对话框（或拉到数据）时用服务端值回填表单
   useEffect(() => {
@@ -107,6 +130,7 @@ export function SettingsDialog({ open, onOpenChange }: SettingsDialogProps) {
     setActiveTab('general')
     setModelsExpanded(false)
     setApiKey(config.apiKey)
+    setAdminApiKeyState(config.adminApiKey ?? '')
     setCredentialRpm(String(config.credentialRpm ?? 0))
     setRpmOpus(config.credentialRpmOpus == null ? '' : String(config.credentialRpmOpus))
     setRpmSonnet(config.credentialRpmSonnet == null ? '' : String(config.credentialRpmSonnet))
@@ -125,6 +149,84 @@ export function SettingsDialog({ open, onOpenChange }: SettingsDialogProps) {
     setChunkedChunkLines(String(config.chunkedWritePolicy?.chunkLines ?? 50))
     setCodexTruncationCorrection(config.codexTruncationCorrection ?? true)
   }, [open, config])
+
+  // 桌面设置独立加载（不依赖服务端 config）
+  useEffect(() => {
+    if (!open || !DESKTOP) return
+    getDesktopSettings()
+      .then((s) => {
+        if (s) {
+          setSilentStart(s.silentStart)
+          setAutostart(s.autostart)
+        }
+      })
+      .catch((e) => {
+        toast.error(`读取桌面设置失败: ${extractErrorMessage(e)}`)
+      })
+    getPortStatus()
+      .then((p) => {
+        if (p) {
+          setPortStatus(p)
+          setPortInput(String(p.configured))
+        }
+      })
+      .catch((e) => {
+        toast.error(`读取端口状态失败: ${extractErrorMessage(e)}`)
+      })
+  }, [open])
+
+  // 桌面开关即时生效（OS 级设置，不随「保存并生效」按钮走）
+  const applyDesktop = (next: { silentStart?: boolean; autostart?: boolean }) => {
+    const merged = {
+      silentStart: next.silentStart ?? silentStart,
+      autostart: next.autostart ?? autostart,
+    }
+    setSilentStart(merged.silentStart)
+    setAutostart(merged.autostart)
+    setDesktopSettings(merged).catch((e) => {
+      toast.error(`保存桌面设置失败: ${extractErrorMessage(e)}`)
+    })
+  }
+
+  // 保存端口：前端先校验范围，后端写回前会再探测可用性
+  const handleSavePort = async () => {
+    const port = parseInt(portInput, 10)
+    if (!Number.isFinite(port) || port < 1 || port > 65535) {
+      toast.error('端口需在 1–65535 之间')
+      return
+    }
+    if (portStatus && port === portStatus.configured) {
+      toast.info('端口未变化')
+      return
+    }
+    setPortSaving(true)
+    try {
+      await setConfiguredPort(port)
+      toast.success(`端口已改为 ${port}，重启应用后生效`)
+      const p = await getPortStatus()
+      if (p) setPortStatus(p)
+    } catch (e) {
+      toast.error(`保存端口失败: ${extractErrorMessage(e)}`)
+    } finally {
+      setPortSaving(false)
+    }
+  }
+
+  const [importing, setImporting] = useState(false)
+  // 导入完整 config.json（整体覆盖，重启生效）
+  const handleImportConfig = async () => {
+    setImporting(true)
+    try {
+      const res = await importConfig()
+      if (res && !res.cancelled) {
+        toast.success(`配置已导入（端口 ${res.port}），重启应用后生效`)
+      }
+    } catch (e) {
+      toast.error(`导入配置失败: ${extractErrorMessage(e)}`)
+    } finally {
+      setImporting(false)
+    }
+  }
 
   const updateModel = (index: number, patch: Partial<ModelDef>) => {
     setModels((prev) => prev.map((m, i) => (i === index ? { ...m, ...patch } : m)))
@@ -168,6 +270,11 @@ export function SettingsDialog({ open, onOpenChange }: SettingsDialogProps) {
     if (!apiKey.trim()) {
       setActiveTab('general')
       toast.error('apiKey 不能为空')
+      return
+    }
+    if (!adminApiKey.trim()) {
+      setActiveTab('general')
+      toast.error('Admin API Key 不能为空')
       return
     }
     if (
@@ -238,9 +345,11 @@ export function SettingsDialog({ open, onOpenChange }: SettingsDialogProps) {
       contextWindow: m.contextWindow,
     }))
 
+    const trimmedAdminKey = adminApiKey.trim()
     updateConfig(
       {
         apiKey: apiKey.trim(),
+        adminApiKey: trimmedAdminKey,
         credentialRpm: parseInt(credentialRpm, 10) || 0,
         credentialRpmOpus: parseOptionalRpm(rpmOpus),
         credentialRpmSonnet: parseOptionalRpm(rpmSonnet),
@@ -264,6 +373,8 @@ export function SettingsDialog({ open, onOpenChange }: SettingsDialogProps) {
       },
       {
         onSuccess: () => {
+          // adminApiKey 热生效后，本地存的旧登录 key 会立刻失效；同步更新以免当前会话被登出
+          storage.setApiKey(trimmedAdminKey)
           toast.success('配置已保存并热生效')
           onOpenChange(false)
         },
@@ -323,6 +434,30 @@ export function SettingsDialog({ open, onOpenChange }: SettingsDialogProps) {
                 </div>
                 <p className="text-xs text-muted-foreground">
                   修改后立即对后续客户端请求生效。注意：保存后旧密钥失效，请同步更新调用方
+                </p>
+
+                <h3 className="text-sm font-semibold pt-2">Admin API Key（管理密钥）</h3>
+                <div className="relative">
+                  <Input
+                    type={showAdminKey ? 'text' : 'password'}
+                    value={adminApiKey}
+                    onChange={(e) => setAdminApiKeyState(e.target.value)}
+                    disabled={isPending}
+                    placeholder="管理面板访问密钥"
+                    className="pr-10"
+                  />
+                  <button
+                    type="button"
+                    onClick={() => setShowAdminKey((v) => !v)}
+                    className="absolute right-2 top-1/2 -translate-y-1/2 text-muted-foreground hover:text-foreground"
+                    tabIndex={-1}
+                  >
+                    {showAdminKey ? <EyeOff className="h-4 w-4" /> : <Eye className="h-4 w-4" />}
+                  </button>
+                </div>
+                <p className="text-xs text-muted-foreground">
+                  访问本管理面板的密钥，保存后立即热生效。桌面版用它自动登录；当前页面会同步更新，不会被登出。
+                  注意：其它已登录的客户端需用新密钥重新登录。
                 </p>
               </section>
 
@@ -643,6 +778,98 @@ export function SettingsDialog({ open, onOpenChange }: SettingsDialogProps) {
                   </>
                 )}
               </section>
+
+              {/* 桌面版设置（仅 Tauri 壳） */}
+              {DESKTOP && (
+                <section className={`space-y-4 ${activeTab === 'desktop' ? '' : 'hidden'}`}>
+                  {/* 监听端口 */}
+                  <div className="space-y-2">
+                    <h3 className="text-sm font-semibold">监听端口</h3>
+                    {portStatus?.conflicted && (
+                      <div className="rounded-md border border-amber-500/50 bg-amber-500/10 px-3 py-2 text-xs text-amber-700 dark:text-amber-400">
+                        端口冲突：期望端口 {portStatus.configured} 被占用，当前临时监听在{' '}
+                        <span className="font-mono font-semibold">{portStatus.actual}</span>。
+                        改用其他空闲端口并重启应用即可恢复固定端口。
+                      </div>
+                    )}
+                    <div className="flex items-end gap-2">
+                      <div className="space-y-1">
+                        <label className="text-xs text-muted-foreground">期望端口 (1–65535)</label>
+                        <Input
+                          type="number"
+                          min="1"
+                          max="65535"
+                          value={portInput}
+                          onChange={(e) => setPortInput(e.target.value)}
+                          disabled={portSaving}
+                          className="w-40"
+                        />
+                      </div>
+                      <Button type="button" onClick={handleSavePort} disabled={portSaving}>
+                        {portSaving ? '保存中...' : '保存端口'}
+                      </Button>
+                    </div>
+                    <p className="text-xs text-muted-foreground">
+                      当前实际监听：
+                      <span className="font-mono">{portStatus?.actual ?? '—'}</span>
+                      {portStatus && !portStatus.conflicted && '（与期望一致）'}
+                      。修改端口需重启应用后生效；保存时会先检测端口是否空闲。
+                    </p>
+                  </div>
+
+                  {/* 导入配置 */}
+                  <div className="space-y-2 border-t pt-4">
+                    <h3 className="text-sm font-semibold">导入配置</h3>
+                    <Button
+                      type="button"
+                      variant="outline"
+                      onClick={handleImportConfig}
+                      disabled={importing}
+                    >
+                      <FileUp className="mr-1 h-4 w-4" />
+                      {importing ? '导入中...' : '从文件导入 config.json'}
+                    </Button>
+                    <p className="text-xs text-muted-foreground">
+                      选择一个完整的 config.json 整体覆盖当前配置（含 apiKey / adminApiKey / 端口 /
+                      版本指纹 / 模型等全部字段）。导入前会校验格式与必填项，
+                      <span className="text-amber-600 dark:text-amber-500">
+                        {' '}
+                        导入后需重启应用才生效
+                      </span>
+                      。
+                    </p>
+                  </div>
+
+                  <div className="flex items-center justify-between">
+                    <div>
+                      <h3 className="text-sm font-semibold">开机启动</h3>
+                      <p className="text-xs text-muted-foreground">
+                        登录系统后自动启动 kiro-rs
+                      </p>
+                    </div>
+                    <Switch
+                      checked={autostart}
+                      onCheckedChange={(v) => applyDesktop({ autostart: v })}
+                    />
+                  </div>
+                  <div className="flex items-center justify-between">
+                    <div>
+                      <h3 className="text-sm font-semibold">静默启动</h3>
+                      <p className="text-xs text-muted-foreground">
+                        开机自启时不弹出窗口，仅驻留菜单栏托盘；手动打开始终显示窗口
+                      </p>
+                    </div>
+                    <Switch
+                      checked={silentStart}
+                      onCheckedChange={(v) => applyDesktop({ silentStart: v })}
+                    />
+                  </div>
+                  <p className="text-xs text-muted-foreground">
+                    以上为本机桌面设置，切换后立即生效，不受下方「保存并生效」影响。
+                    窗口关闭后会隐藏到菜单栏托盘，点击 Dock 图标或托盘图标可重新唤出。
+                  </p>
+                </section>
+              )}
               </div>
             </div>
 

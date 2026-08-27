@@ -213,6 +213,8 @@ pub struct SetLoadBalancingModeRequest {
 pub struct AppConfigResponse {
     /// 客户端 API Key
     pub api_key: String,
+    /// Admin API Key（管理密钥）
+    pub admin_api_key: String,
     /// 单凭据兜底 RPM
     pub credential_rpm: u32,
     /// Opus 专用 RPM
@@ -253,6 +255,9 @@ pub struct AppConfigResponse {
 pub struct UpdateAppConfigRequest {
     /// 客户端 API Key（不能为空）
     pub api_key: String,
+    /// Admin API Key（管理密钥）；缺省时不更新（兼容旧 UI），提供时不能为空
+    #[serde(default)]
+    pub admin_api_key: Option<String>,
     /// 单凭据兜底 RPM
     #[serde(default)]
     pub credential_rpm: u32,

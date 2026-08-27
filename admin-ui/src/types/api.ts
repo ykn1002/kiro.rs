@@ -195,6 +195,7 @@ export interface ChunkedWritePolicy {
 // 应用配置（页面可编辑子集）当前值
 export interface AppConfig {
   apiKey: string
+  adminApiKey: string
   credentialRpm: number
   credentialRpmOpus?: number | null
   credentialRpmSonnet?: number | null
@@ -215,6 +216,7 @@ export interface AppConfig {
 // 更新应用配置请求（全量替换可编辑子集）
 export interface UpdateAppConfigRequest {
   apiKey: string
+  adminApiKey?: string
   credentialRpm: number
   credentialRpmOpus?: number | null
   credentialRpmSonnet?: number | null

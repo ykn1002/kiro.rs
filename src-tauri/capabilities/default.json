@@ -1,0 +1,28 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "kiro-rs 桌面版默认权限：核心窗口与托盘操作",
+  "windows": ["main"],
+  "remote": {
+    "urls": ["http://127.0.0.1:*/*", "http://localhost:*/*"]
+  },
+  "permissions": [
+    "core:default",
+    "core:window:allow-show",
+    "core:window:allow-hide",
+    "core:window:allow-set-focus",
+    "core:window:allow-close",
+    "autostart:allow-enable",
+    "autostart:allow-disable",
+    "autostart:allow-is-enabled",
+    "allow-get-desktop-settings",
+    "allow-set-desktop-settings",
+    "allow-get-port-status",
+    "allow-check-port-available",
+    "allow-set-configured-port",
+    "allow-get-logs",
+    "allow-set-log-capture",
+    "allow-clear-logs",
+    "allow-import-config"
+  ]
+}

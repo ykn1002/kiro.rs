@@ -29,7 +29,7 @@ function App() {
       ) : (
         <LoginPage onLogin={handleLogin} />
       )}
-      <Toaster position="top-right" />
+      <Toaster position="top-center" offset={72} />
     </>
   )
 }
