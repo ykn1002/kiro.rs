@@ -107,10 +107,10 @@ export function SettingsDialog({ open, onOpenChange }: SettingsDialogProps) {
   const [nodeVersion, setNodeVersion] = useState('')
   const [streamingSdkVersion, setStreamingSdkVersion] = useState('')
   const [models, setModels] = useState<ModelDef[]>([])
-  const [modelsExpanded, setModelsExpanded] = useState(false)
+  const [modelsExpanded, setModelsExpanded] = useState(true)
   const [defaultModel, setDefaultModel] = useState('')
   const [modelAliases, setModelAliases] = useState<ModelAliasRow[]>([])
-  const [aliasesExpanded, setAliasesExpanded] = useState(true)
+  const [aliasesExpanded, setAliasesExpanded] = useState(false)
   const [chunkedEnabled, setChunkedEnabled] = useState(false)
   const [chunkedTriggerLines, setChunkedTriggerLines] = useState('150')
   const [chunkedChunkLines, setChunkedChunkLines] = useState('50')
@@ -128,7 +128,9 @@ export function SettingsDialog({ open, onOpenChange }: SettingsDialogProps) {
   useEffect(() => {
     if (!open || !config) return
     setActiveTab('general')
-    setModelsExpanded(false)
+    // 打开时默认：模型列表展开、别名折叠
+    setModelsExpanded(true)
+    setAliasesExpanded(false)
     setApiKey(config.apiKey)
     setAdminApiKeyState(config.adminApiKey ?? '')
     setCredentialRpm(String(config.credentialRpm ?? 0))

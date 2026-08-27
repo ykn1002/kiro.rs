@@ -1,27 +1,104 @@
 {
   "host": "127.0.0.1",
   "port": 8990,
-  "apiKey": "sk-kiro-rs-qazWSXedcRFV123456",
+  "apiKey": "sk-123456",
   "tlsBackend": "native-tls",
   "region": "us-east-1",
   "kiroVersion": "0.12.318",
-  "machineId": "387db4c4-4138-42cf-ba0f-83d851f7148a",
   "systemVersion": "darwin#25.4.0",
   "nodeVersion": "22.22.0",
   "streamingSdkVersion": "1.0.39",
   "ssoOidcSdkVersion": "3.980.0",
   "runtimeSdkVersion": "1.0.0",
-  "adminApiKey": "sk-admin-your-secret-key",
+  "adminApiKey": "admin",
   "defaultEndpoint": "ide",
-  "defaultModel": "claude-opus-4-6",
+  "models": [
+    {
+      "family": "opus",
+      "version": "4.8",
+      "kiroId": "claude-opus-4.8",
+      "displayId": "claude-opus-4-8",
+      "displayName": "Claude Opus 4.8",
+      "created": 1779897600,
+      "maxTokens": 128000,
+      "contextWindow": 1000000
+    },
+    {
+      "family": "opus",
+      "version": "5",
+      "kiroId": "claude-opus-5",
+      "displayId": "claude-opus-5",
+      "displayName": "Claude Opus 5",
+      "created": 1776276000,
+      "maxTokens": 64000,
+      "contextWindow": 1000000
+    },
+    {
+      "family": "sonnet",
+      "version": "5",
+      "kiroId": "claude-sonnet-5",
+      "displayId": "claude-sonnet-5",
+      "displayName": "Claude Sonnet 5",
+      "created": 1771286400,
+      "maxTokens": 64000,
+      "contextWindow": 1000000
+    },
+    {
+      "family": "haiku",
+      "kiroId": "claude-haiku-4.5",
+      "displayId": "claude-haiku-4-5-20251001",
+      "displayName": "Claude Haiku 4.5",
+      "created": 1760486400,
+      "maxTokens": 64000,
+      "contextWindow": 200000
+    },
+    {
+      "family": "gpt-5.6-sol",
+      "kiroId": "gpt-5.6-sol",
+      "displayId": "gpt-5.6-sol",
+      "displayName": "GPT 5.6 Sol",
+      "created": 1784000381,
+      "maxTokens": 64000,
+      "contextWindow": 272000
+    },
+    {
+      "family": "gpt-5.6-terra",
+      "kiroId": "gpt-5.6-terra",
+      "displayId": "gpt-5.6-terra",
+      "displayName": "GPT 5.6 Terra",
+      "created": 1784000462,
+      "maxTokens": 64000,
+      "contextWindow": 272000
+    },
+    {
+      "family": "gpt-5.6-luna",
+      "kiroId": "gpt-5.6-luna",
+      "displayId": "gpt-5.6-luna",
+      "displayName": "GPT 5.6 Luna",
+      "created": 1784000499,
+      "maxTokens": 64000,
+      "contextWindow": 200050
+    },
+    {
+      "family": "sonnet",
+      "version": "4.6",
+      "kiroId": "claude-sonnet-4.6",
+      "displayId": "claude-sonnet-4-6",
+      "displayName": "Claude Sonnet 4.6",
+      "created": 1784249340,
+      "maxTokens": 64000,
+      "contextWindow": 1000000
+    }
+  ],
   "modelAliases": {
-    "gpt-5.5": "claude-opus-4-6",
-    "gpt-5.4": "claude-opus-4-6",
-    "gpt-5": "claude-sonnet-4-6"
+    "gpt-5.5": "gpt-5.6-terra",
+    "gpt-5.4": "gpt-5.6-terra",
+    "gpt-5.4-mini": "gpt-5.6-luna"
   },
-  "credentialRpm": 5,
-  "credentialRpmOpus": 5,
-  "credentialRpmSonnet": 15,
-  "credentialRpmHaiku": 30,
-  "credentialRpmMaxWaitMs": 5000
+  "defaultModel": "gpt-5.6-luna",
+  "credentialRpm": 0,
+  "credentialRpmOpus": 0,
+  "credentialRpmSonnet": 0,
+  "credentialRpmHaiku": 0,
+  "credentialRpmMaxWaitMs": 0
 }

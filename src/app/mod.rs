@@ -9,6 +9,7 @@
 //! - [`RuntimeMode::Desktop`]：配置/凭证/统计落到系统数据目录，监听 `127.0.0.1`，
 //!   端口被占用时自动选空闲端口，失败不 panic。
 
+mod host_info;
 mod paths;
 
 use std::collections::HashMap;

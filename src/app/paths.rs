@@ -85,12 +85,12 @@ fn bootstrap_desktop_files(dir: &PathBuf, config_path: &PathBuf, credentials_pat
     }
 
     if !config_path.exists() {
-        let api_key = random_token();
-        let admin_api_key = random_token();
-        let template = default_config_json(&api_key, &admin_api_key);
-        match std::fs::write(config_path, template) {
-            Ok(_) => tracing::info!("已写入默认配置: {}", config_path.display()),
-            Err(e) => tracing::warn!("写入默认配置失败: {} ({})", e, config_path.display()),
+        match build_default_config() {
+            Ok(json) => match std::fs::write(config_path, json) {
+                Ok(_) => tracing::info!("已写入默认配置: {}", config_path.display()),
+                Err(e) => tracing::warn!("写入默认配置失败: {} ({})", e, config_path.display()),
+            },
+            Err(e) => tracing::warn!("生成默认配置失败: {}", e),
         }
     }
 
@@ -102,7 +102,11 @@ fn bootstrap_desktop_files(dir: &PathBuf, config_path: &PathBuf, credentials_pat
     }
 }
 
-/// 生成随机 token（32 hex 字符），用于桌面模式默认 apiKey/adminApiKey。
+/// 编译时嵌入的配置基底（仓库根的 config.example.json）。
+/// 桌面版首次启动以它为默认配置，仅覆盖两个密钥与自动探测的版本。
+const CONFIG_TEMPLATE: &str = include_str!("../../config.example.json");
+
+/// 生成随机 hex token（32 位），用于桌面模式默认密钥。
 fn random_token() -> String {
     let mut s = String::with_capacity(32);
     for _ in 0..32 {
@@ -111,9 +115,35 @@ fn random_token() -> String {
     s
 }
 
-/// 桌面模式默认配置模板。仅设置必需字段，其余走 serde 默认值。
-fn default_config_json(api_key: &str, admin_api_key: &str) -> String {
-    format!(
-        "{{\n  \"apiKey\": \"{api_key}\",\n  \"adminApiKey\": \"{admin_api_key}\",\n  \"host\": \"127.0.0.1\",\n  \"port\": 8080\n}}\n"
-    )
+/// 构建桌面模式首次默认配置：以 config.example.json 为基底，
+/// 覆盖 `apiKey`（sk- 前缀随机）、`adminApiKey`（随机），
+/// 并用本机探测到的 `systemVersion` / `kiroVersion` 覆盖（探测不到则保留模板值）。
+fn build_default_config() -> Result<String, String> {
+    let mut value: serde_json::Value =
+        serde_json::from_str(CONFIG_TEMPLATE).map_err(|e| format!("解析内置配置模板失败: {e}"))?;
+    let obj = value
+        .as_object_mut()
+        .ok_or_else(|| "内置配置模板根节点不是对象".to_string())?;
+
+    // 密钥每次首启随机生成
+    obj.insert(
+        "apiKey".to_string(),
+        serde_json::json!(format!("sk-{}", random_token())),
+    );
+    obj.insert("adminApiKey".to_string(), serde_json::json!(random_token()));
+
+    // 版本自动探测，成功则覆盖模板里的值
+    if let Some(v) = super::host_info::system_version() {
+        tracing::info!("自动获取 systemVersion: {}", v);
+        obj.insert("systemVersion".to_string(), serde_json::json!(v));
+    }
+    if let Some(v) = super::host_info::kiro_version() {
+        tracing::info!("自动获取 kiroVersion: {}", v);
+        obj.insert("kiroVersion".to_string(), serde_json::json!(v));
+    }
+
+    let mut out =
+        serde_json::to_string_pretty(&value).map_err(|e| format!("序列化配置失败: {e}"))?;
+    out.push('\n');
+    Ok(out)
 }
