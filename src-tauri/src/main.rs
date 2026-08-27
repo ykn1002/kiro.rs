@@ -353,12 +353,18 @@ fn main() {
         })
         .build(tauri::generate_context!())
         .expect("构建 Tauri 应用失败")
-        .run(|app, event| {
-            // 点击 Dock 图标（macOS Reopen）时唤出窗口，
-            // 解决静默启动/关窗隐藏后窗口找不回来的问题
-            if let RunEvent::Reopen { .. } = event {
-                show_main_window(app);
+        .run(|app, event| match event {
+            // 点击 Dock 图标（macOS Reopen）时唤出窗口
+            RunEvent::Reopen { .. } => show_main_window(app),
+            // 关闭最后一个窗口不退出进程：托盘常驻，靠托盘/Dock 再唤出窗口
+            RunEvent::ExitRequested { api, code, .. } => {
+                // code 为 None 表示是「窗口全关」触发的退出请求 → 阻止；
+                // 有 code（如托盘「退出」调用 app.exit(0)）则放行
+                if code.is_none() {
+                    api.prevent_exit();
+                }
             }
+            _ => {}
         });
 }
 
