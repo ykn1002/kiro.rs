@@ -13,11 +13,13 @@
 //! 静默启动（默认开）：仅当本次由开机自启拉起（argv 含 `--autostart`）且开关开启时，
 //! 窗口初始隐藏、只驻留托盘；手动双击打开始终显示窗口。
 
+mod lightweight;
 mod log_buffer;
 mod settings;
 
 use std::sync::atomic::{AtomicU16, Ordering};
 
+use parking_lot::RwLock;
 use serde::Serialize;
 use tauri::{
     Manager, RunEvent, State, WebviewUrl, WebviewWindowBuilder,
@@ -31,9 +33,11 @@ use settings::DesktopSettings;
 
 /// 运行时端口状态，作为 Tauri managed state 供 IPC 读取。
 /// `actual` 在 axum 绑定成功后由 setup 写入（0 表示尚未绑定）。
+/// `admin_key` 供轻量模式唤出时重建窗口注入免登录脚本。
 #[derive(Default)]
 struct PortState {
     actual: AtomicU16,
+    admin_key: RwLock<Option<String>>,
 }
 
 /// 暴露给前端的桌面设置快照。
@@ -44,9 +48,13 @@ struct DesktopSettingsDto {
     silent_start: bool,
     /// 开机启动是否已在系统注册
     autostart: bool,
+    /// 自动轻量模式（关窗后延迟销毁 WebView 释放内存）
+    auto_lightweight: bool,
+    /// 进入轻量模式的延迟（分钟，0 表示立即）
+    lightweight_minutes: u64,
 }
 
-/// IPC：读取桌面设置（静默启动 + 开机启动状态）。
+/// IPC：读取桌面设置（静默启动 + 开机启动状态 + 轻量模式）。
 #[tauri::command]
 fn get_desktop_settings(app: tauri::AppHandle) -> DesktopSettingsDto {
     let s = DesktopSettings::load();
@@ -54,18 +62,24 @@ fn get_desktop_settings(app: tauri::AppHandle) -> DesktopSettingsDto {
     DesktopSettingsDto {
         silent_start: s.silent_start,
         autostart,
+        auto_lightweight: s.auto_lightweight,
+        lightweight_minutes: s.lightweight_minutes,
     }
 }
 
-/// IPC：写入桌面设置。静默启动落本地文件；开机启动调用系统注册/注销。
+/// IPC：写入桌面设置。静默启动/轻量模式落本地文件；开机启动调用系统注册/注销。
 #[tauri::command]
 fn set_desktop_settings(
     app: tauri::AppHandle,
     silent_start: bool,
     autostart: bool,
+    auto_lightweight: bool,
+    lightweight_minutes: u64,
 ) -> Result<(), String> {
     let mut s = DesktopSettings::load();
     s.silent_start = silent_start;
+    s.auto_lightweight = auto_lightweight;
+    s.lightweight_minutes = lightweight_minutes;
     s.save();
 
     let launcher = app.autolaunch();
@@ -210,15 +224,13 @@ fn clear_logs() {
     log_buffer::clear();
 }
 
-/// 显示并聚焦主窗口（关窗只是隐藏，窗口对象始终存在）。
+/// 显示并聚焦主窗口。若处于轻量模式（窗口已销毁）则重建，否则直接显示。
+/// 统一走 lightweight::exit_and_show，确保激活策略与定时器状态正确复位。
 fn show_main_window(app: &tauri::AppHandle) {
-    if let Some(win) = app.get_webview_window(MAIN_WINDOW_LABEL) {
-        let _ = win.show();
-        let _ = win.set_focus();
-    }
+    lightweight::exit_and_show(app);
 }
 
-const MAIN_WINDOW_LABEL: &str = "main";
+pub(crate) const MAIN_WINDOW_LABEL: &str = "main";
 
 /// 传给开机自启项的标志。进程 argv 含此值即表示本次由开机自启拉起，
 /// 手动双击打开时不带，据此区分是否应静默驻留托盘。
@@ -267,9 +279,20 @@ fn main() {
             // 是否应静默启动：仅当「本次由开机自启拉起」且「静默开关开启」时不弹窗
             let launched_by_autostart =
                 std::env::args().any(|a| a == AUTOSTART_FLAG);
-            let silent = launched_by_autostart && DesktopSettings::load().silent_start;
+            let desktop_cfg = DesktopSettings::load();
+            let silent = launched_by_autostart && desktop_cfg.silent_start;
+            // 静默启动 + 自动轻量模式：直接不建窗口，进纯托盘后台（省下整个 WebView 内存），
+            // 待托盘/Dock 唤出时再重建。否则静默仅建隐藏窗口（窗口对象仍占内存）。
+            let silent_lightweight = silent && desktop_cfg.auto_lightweight;
             if silent {
-                tracing::info!("开机自启且静默启动已开启，窗口驻留托盘");
+                tracing::info!(
+                    "开机自启静默启动：{}",
+                    if silent_lightweight {
+                        "轻量模式，仅驻留托盘（不建窗口）"
+                    } else {
+                        "窗口隐藏驻留托盘"
+                    }
+                );
             }
 
             // 后台启动 axum，绑定成功后在主线程创建窗口
@@ -288,11 +311,11 @@ fn main() {
                         let conflicted = server.port_conflicted();
                         let admin_key = server.admin_api_key().map(|s| s.to_string());
 
-                        // 记录实际端口到共享状态，供 IPC 读取
-                        handle
-                            .state::<PortState>()
-                            .actual
-                            .store(port, Ordering::Relaxed);
+                        // 记录实际端口与 admin key 到共享状态，
+                        // 供 IPC 读取 / 轻量模式唤出重建窗口
+                        let port_state = handle.state::<PortState>();
+                        port_state.actual.store(port, Ordering::Relaxed);
+                        *port_state.admin_key.write() = admin_key.clone();
 
                         if conflicted {
                             tracing::warn!(
@@ -302,10 +325,16 @@ fn main() {
                             );
                         }
 
-                        // 创建窗口。静默启动时初始隐藏（仅驻留托盘），否则正常显示。
-                        if let Err(e) =
+                        if silent_lightweight {
+                            // 直接进轻量态：不建窗口，切后台激活策略，唤出时才重建
+                            let _ = handle.run_on_main_thread({
+                                let handle = handle.clone();
+                                move || lightweight::enter(&handle)
+                            });
+                        } else if let Err(e) =
                             create_main_window(&handle, port, admin_key.as_deref(), silent)
                         {
+                            // 静默（非轻量）建隐藏窗口；否则正常显示
                             tracing::error!("创建窗口失败: {}", e);
                         }
                         if let Err(e) = server.serve().await {
@@ -323,12 +352,20 @@ fn main() {
             Ok(())
         })
         .on_window_event(|window, event| {
-            // 关闭主窗口时隐藏到托盘而非退出（macOS 上 destroy 不真正释放 WebView 内存，
-            // 且重建有开销，故用 hide/show）。
+            // 关闭主窗口：阻止真正关闭，先隐藏（保持可秒开），
+            // 再按「自动轻量模式」设置安排延迟销毁 WebView 以释放内存。
             if let tauri::WindowEvent::CloseRequested { api, .. } = event {
                 if window.label() == MAIN_WINDOW_LABEL {
                     api.prevent_close();
                     let _ = window.hide();
+
+                    let cfg = DesktopSettings::load();
+                    if cfg.auto_lightweight {
+                        lightweight::schedule_after_close(
+                            window.app_handle(),
+                            cfg.lightweight_minutes,
+                        );
+                    }
                 }
             }
         })
@@ -463,6 +500,19 @@ fn create_main_window(
 
     builder.build()?;
     Ok(())
+}
+
+/// 轻量模式唤出时重建主窗口：从 managed state 读取端口与 admin key，
+/// 始终可见（唤出即显示）。端口尚未绑定（actual=0）时静默失败。
+pub(crate) fn create_main_window_for_reopen(app: &tauri::AppHandle) -> tauri::Result<()> {
+    let state = app.state::<PortState>();
+    let port = state.actual.load(Ordering::Relaxed);
+    if port == 0 {
+        tracing::warn!("端口尚未绑定，无法重建窗口");
+        return Ok(());
+    }
+    let admin_key = state.admin_key.read().clone();
+    create_main_window(app, port, admin_key.as_deref(), false)
 }
 
 /// 装配失败时的兜底错误窗口。

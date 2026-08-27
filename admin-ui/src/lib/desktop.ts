@@ -25,6 +25,10 @@ export interface DesktopSettings {
   silentStart: boolean
   /** 开机启动是否已在系统注册 */
   autostart: boolean
+  /** 自动轻量模式：关窗后延迟销毁 WebView 释放内存 */
+  autoLightweight: boolean
+  /** 进入轻量模式的延迟（分钟，0 表示关窗立即销毁） */
+  lightweightMinutes: number
 }
 
 // Tauri invoke 失败时 reject 的通常是字符串（命令返回的 Err(String)）或错误对象，
@@ -58,6 +62,8 @@ export async function setDesktopSettings(settings: DesktopSettings): Promise<voi
     await t.core.invoke('set_desktop_settings', {
       silentStart: settings.silentStart,
       autostart: settings.autostart,
+      autoLightweight: settings.autoLightweight,
+      lightweightMinutes: settings.lightweightMinutes,
     })
   } catch (e) {
     throw toError(e, 'set_desktop_settings')
