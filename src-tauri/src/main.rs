@@ -415,8 +415,20 @@ fn setup_tray(app: &tauri::AppHandle) -> tauri::Result<()> {
     let quit = MenuItem::with_id(app, "quit", "退出", true, None::<&str>)?;
     let menu = Menu::with_items(app, &[&show, &autostart, &silent_start, &quit])?;
 
-    let _tray = TrayIconBuilder::new()
-        .icon(app.default_window_icon().unwrap().clone())
+    // macOS 菜单栏惯例用单色模板图标（跟随深/浅色自动反色）；
+    // Windows/Linux 托盘用彩色 App 图标。
+    #[cfg(target_os = "macos")]
+    let builder = {
+        // 44x44 RGBA 原始像素（纯黑 + alpha 遮罩），配合 icon_as_template 由系统自动反色。
+        // 用原始字节 + Image::new，免去 image-png 解码 feature。
+        const TRAY_RGBA: &[u8] = include_bytes!("../icons/tray-template.rgba");
+        let icon = tauri::image::Image::new(TRAY_RGBA, 44, 44);
+        TrayIconBuilder::new().icon(icon).icon_as_template(true)
+    };
+    #[cfg(not(target_os = "macos"))]
+    let builder = TrayIconBuilder::new().icon(app.default_window_icon().unwrap().clone());
+
+    let _tray = builder
         .menu(&menu)
         .show_menu_on_left_click(true)
         .on_menu_event(move |app, event| match event.id.as_ref() {
