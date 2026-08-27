@@ -23,6 +23,7 @@
     "allow-get-logs",
     "allow-set-log-capture",
     "allow-clear-logs",
-    "allow-import-config"
+    "allow-import-config",
+    "allow-scan-sso-credentials"
   ]
 }

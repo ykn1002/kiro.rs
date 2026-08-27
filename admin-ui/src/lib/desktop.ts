@@ -170,3 +170,22 @@ export async function importConfig(): Promise<ImportConfigResult | null> {
   }
 }
 
+
+export interface SsoCredentialCandidate {
+  refreshToken: string
+  clientId: string
+  clientSecret: string
+  region: string | null
+  sourceFile: string
+}
+
+/** 扫描本机 AWS SSO 缓存，返回可导入的凭证候选；非桌面环境返回 []。 */
+export async function scanSsoCredentials(): Promise<SsoCredentialCandidate[]> {
+  const t = tauri()
+  if (!t) return []
+  try {
+    return await t.core.invoke<SsoCredentialCandidate[]>('scan_sso_credentials')
+  } catch (e) {
+    throw toError(e, 'scan_sso_credentials')
+  }
+}

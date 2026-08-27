@@ -12,6 +12,7 @@ import { Button } from '@/components/ui/button'
 import { useCredentials, useAddCredential, useDeleteCredential } from '@/hooks/use-credentials'
 import { getCredentialBalance, setCredentialDisabled } from '@/api/credentials'
 import { extractErrorMessage, sha256Hex } from '@/lib/utils'
+import { isDesktop, scanSsoCredentials } from '@/lib/desktop'
 
 interface AwsSsoImportDialogProps {
   open: boolean
@@ -78,6 +79,8 @@ export function AwsSsoImportDialog({ open, onOpenChange }: AwsSsoImportDialogPro
   const [tokenJson, setTokenJson] = useState('')
   const [importing, setImporting] = useState(false)
   const [result, setResult] = useState<ImportResult | null>(null)
+  const [scanning, setScanning] = useState(false)
+  const [scanMsg, setScanMsg] = useState('')
 
   const clientFileRef = useRef<HTMLInputElement>(null)
   const tokenFileRef = useRef<HTMLInputElement>(null)
@@ -131,6 +134,50 @@ export function AwsSsoImportDialog({ open, onOpenChange }: AwsSsoImportDialogPro
     }
   }
 
+  // 导入并验活单条 IdC 凭据。返回结果类别，不直接改 UI（供手动/自动扫描共用）。
+  type ImportOneResult =
+    | { kind: 'duplicate'; email?: string }
+    | { kind: 'verified'; email?: string; usage?: string }
+    | { kind: 'failed'; error: string }
+  const importOne = async (params: {
+    clientId: string
+    clientSecret: string
+    refreshToken: string
+    region?: string
+  }): Promise<ImportOneResult> => {
+    // 去重
+    const tokenHash = await sha256Hex(params.refreshToken)
+    const existing = existingCredentials?.credentials.find(c => c.refreshTokenHash === tokenHash)
+    if (existing) {
+      return { kind: 'duplicate', email: existing.email }
+    }
+    let addedCredId: number | null = null
+    try {
+      const addedCred = await addCredential({
+        refreshToken: params.refreshToken,
+        authMethod: 'idc',
+        clientId: params.clientId,
+        clientSecret: params.clientSecret,
+        authRegion: params.region || undefined,
+      })
+      addedCredId = addedCred.credentialId
+      let usage: string | undefined
+      try {
+        await new Promise(resolve => setTimeout(resolve, 1000))
+        const balance = await getCredentialBalance(addedCred.credentialId)
+        usage = `${balance.currentUsage}/${balance.usageLimit}`
+      } catch {
+        // IdC 不支持用量查询，忽略
+      }
+      return { kind: 'verified', email: addedCred.email, usage }
+    } catch (error) {
+      if (addedCredId) {
+        await rollbackCredential(addedCredId)
+      }
+      return { kind: 'failed', error: extractErrorMessage(error) }
+    }
+  }
+
   const handleImport = async () => {
     let parsedClient: ClientRegistration
     let parsedToken: AuthToken
@@ -142,52 +189,64 @@ export function AwsSsoImportDialog({ open, onOpenChange }: AwsSsoImportDialogPro
       return
     }
 
-    // 客户端去重
-    const tokenHash = await sha256Hex(parsedToken.refreshToken)
-    const existing = existingCredentials?.credentials.find(c => c.refreshTokenHash === tokenHash)
-    if (existing) {
-      setResult({ status: 'duplicate', error: '该凭据已存在', email: existing.email })
-      toast.info('该凭据已存在')
-      return
-    }
-
     setImporting(true)
     setResult({ status: 'verifying' })
-
-    let addedCredId: number | null = null
-    try {
-      // 添加 idc 凭据：后端会执行 OIDC 刷新并获取 Profile ARN，即完成验活
-      const addedCred = await addCredential({
-        refreshToken: parsedToken.refreshToken,
-        authMethod: 'idc',
-        clientId: parsedClient.clientId,
-        clientSecret: parsedClient.clientSecret,
-        authRegion: parsedToken.region || undefined,
-      })
-      addedCredId = addedCred.credentialId
-
-      // IdC 账号不支持 getUsageLimits（返回 Invalid profileArn），
-      // 因此余额查询仅作为附加信息，失败不影响验活结果
-      let usage: string | undefined
-      try {
-        await new Promise(resolve => setTimeout(resolve, 1000))
-        const balance = await getCredentialBalance(addedCred.credentialId)
-        usage = `${balance.currentUsage}/${balance.usageLimit}`
-      } catch {
-        // IdC 不支持用量查询，忽略
-      }
-
-      setResult({ status: 'verified', email: addedCred.email, usage })
+    const r = await importOne({
+      clientId: parsedClient.clientId,
+      clientSecret: parsedClient.clientSecret,
+      refreshToken: parsedToken.refreshToken,
+      region: parsedToken.region,
+    })
+    if (r.kind === 'duplicate') {
+      setResult({ status: 'duplicate', error: '该凭据已存在', email: r.email })
+      toast.info('该凭据已存在')
+    } else if (r.kind === 'verified') {
+      setResult({ status: 'verified', email: r.email, usage: r.usage })
       toast.success('AWS SSO 凭据导入并验活成功')
-    } catch (error) {
-      if (addedCredId) {
-        await rollbackCredential(addedCredId)
+    } else {
+      setResult({ status: 'failed', error: r.error })
+      toast.error('导入失败: ' + r.error)
+    }
+    setImporting(false)
+  }
+
+  // 一键导入：扫描本机 AWS SSO 缓存并逐条导入验活（仅桌面版）
+  const handleScanImport = async () => {
+    setScanning(true)
+    setScanMsg('正在扫描本机 AWS SSO 缓存…')
+    try {
+      const candidates = await scanSsoCredentials()
+      if (candidates.length === 0) {
+        setScanMsg('未在本机 ~/.aws/sso/cache 找到可导入的凭证')
+        toast.info('未扫描到可导入的凭证')
+        return
       }
-      const message = extractErrorMessage(error)
-      setResult({ status: 'failed', error: message })
-      toast.error('导入失败: ' + message)
+      let ok = 0
+      let dup = 0
+      let fail = 0
+      for (let i = 0; i < candidates.length; i++) {
+        const c = candidates[i]
+        setScanMsg(`导入中 ${i + 1}/${candidates.length}（${c.sourceFile}）…`)
+        const r = await importOne({
+          clientId: c.clientId,
+          clientSecret: c.clientSecret,
+          refreshToken: c.refreshToken,
+          region: c.region ?? undefined,
+        })
+        if (r.kind === 'verified') ok++
+        else if (r.kind === 'duplicate') dup++
+        else fail++
+      }
+      setScanMsg(`完成：新增 ${ok}，已存在 ${dup}，失败 ${fail}`)
+      if (ok > 0) toast.success(`一键导入完成：新增 ${ok} 个凭证`)
+      else if (dup > 0 && fail === 0) toast.info('扫描到的凭证均已存在')
+      else if (fail > 0) toast.error(`有 ${fail} 个凭证导入失败`)
+    } catch (e) {
+      const msg = extractErrorMessage(e)
+      setScanMsg(`扫描失败：${msg}`)
+      toast.error('扫描失败: ' + msg)
     } finally {
-      setImporting(false)
+      setScanning(false)
     }
   }
 
@@ -210,6 +269,32 @@ export function AwsSsoImportDialog({ open, onOpenChange }: AwsSsoImportDialogPro
         </DialogHeader>
 
         <div className="flex-1 overflow-y-auto space-y-4 py-4">
+          {/* 一键导入（仅桌面版：自动扫描本机 AWS SSO 缓存）*/}
+          {isDesktop() && (
+            <div className="rounded-md border bg-muted/30 px-3 py-3 space-y-2">
+              <div className="flex items-center justify-between gap-3">
+                <div>
+                  <div className="text-sm font-medium">一键导入（自动扫描）</div>
+                  <div className="text-xs text-muted-foreground">
+                    自动读取本机 <code className="font-mono">~/.aws/sso/cache</code>{' '}
+                    并导入验活，无需手动粘贴
+                  </div>
+                </div>
+                <Button onClick={handleScanImport} disabled={scanning || importing}>
+                  {scanning ? (
+                    <>
+                      <Loader2 className="mr-1 h-4 w-4 animate-spin" />
+                      扫描导入中
+                    </>
+                  ) : (
+                    '一键导入'
+                  )}
+                </Button>
+              </div>
+              {scanMsg && <div className="text-xs text-muted-foreground">{scanMsg}</div>}
+            </div>
+          )}
+
           <p className="text-sm text-muted-foreground">
             AWS IAM Identity Center（IdC/SSO）凭据由两个 JSON 文件组成：客户端注册文件
             （含 clientId / clientSecret）与鉴权 Token 文件（含 refreshToken / region）。

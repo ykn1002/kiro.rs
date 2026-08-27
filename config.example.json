@@ -2,6 +2,7 @@
   "host": "127.0.0.1",
   "port": 8990,
   "apiKey": "sk-123456",
+  "adminApiKey": "admin",
   "tlsBackend": "native-tls",
   "region": "us-east-1",
   "kiroVersion": "0.12.318",
@@ -10,7 +11,6 @@
   "streamingSdkVersion": "1.0.39",
   "ssoOidcSdkVersion": "3.980.0",
   "runtimeSdkVersion": "1.0.0",
-  "adminApiKey": "admin",
   "defaultEndpoint": "ide",
   "models": [
     {

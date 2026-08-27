@@ -11,6 +11,7 @@
 
 mod host_info;
 mod paths;
+mod sso_scan;
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -35,6 +36,7 @@ use crate::stats_db;
 use crate::token;
 
 pub use paths::{RuntimeMode, desktop_data_dir, resolved_paths};
+pub use sso_scan::{SsoCredentialCandidate, scan_sso_credentials};
 
 /// 服务启动错误。桌面模式据此向用户展示错误而非直接退出进程。
 #[derive(Debug)]

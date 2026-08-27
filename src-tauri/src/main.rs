@@ -29,11 +29,13 @@ use tauri_plugin_autostart::{ManagerExt, MacosLauncher};
 use kiro_rs::app::{self, RunOptions, RuntimeMode};
 use settings::DesktopSettings;
 
-/// 运行时端口状态，作为 Tauri managed state 供 IPC 读取。
+/// 运行时状态，作为 Tauri managed state。
 /// `actual` 在 axum 绑定成功后由 setup 写入（0 表示尚未绑定）。
+/// `admin_key` 缓存注入用的 Admin API Key，供关窗销毁后重建窗口时复用。
 #[derive(Default)]
 struct PortState {
     actual: AtomicU16,
+    admin_key: parking_lot::Mutex<Option<String>>,
 }
 
 /// 暴露给前端的桌面设置快照。
@@ -172,6 +174,13 @@ async fn import_config(app: tauri::AppHandle) -> Result<ImportConfigDto, String>
     })
 }
 
+/// IPC：扫描本机 AWS SSO 缓存，返回可导入的 Kiro IdC 凭证候选（不验活）。
+/// 前端拿到后逐条调 add_credential（走 HTTP）完成导入与验活。
+#[tauri::command]
+fn scan_sso_credentials() -> Vec<app::SsoCredentialCandidate> {
+    app::scan_sso_credentials()
+}
+
 /// 前端拉取日志的返回体。
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -203,11 +212,23 @@ fn clear_logs() {
     log_buffer::clear();
 }
 
-/// 显示并聚焦主窗口（若存在）。
+/// 显示并聚焦主窗口；若窗口已被销毁（关窗释放 WebView），则用缓存的端口/密钥重建。
 fn show_main_window(app: &tauri::AppHandle) {
     if let Some(win) = app.get_webview_window(MAIN_WINDOW_LABEL) {
         let _ = win.show();
         let _ = win.set_focus();
+        return;
+    }
+    // 窗口不存在（已销毁或 axum 尚未就绪）→ 尝试用共享状态重建
+    let st = app.state::<PortState>();
+    let port = st.actual.load(Ordering::Relaxed);
+    if port == 0 {
+        // axum 还没绑定端口，窗口会在 setup 里首次创建，这里无需处理
+        return;
+    }
+    let admin_key = st.admin_key.lock().clone();
+    if let Err(e) = create_main_window(app, port, admin_key.as_deref()) {
+        tracing::error!("重建窗口失败: {}", e);
     }
 }
 
@@ -251,7 +272,8 @@ fn main() {
             get_logs,
             set_log_capture,
             clear_logs,
-            import_config
+            import_config,
+            scan_sso_credentials
         ])
         .setup(|app| {
             setup_tray(app.handle())?;
@@ -280,11 +302,12 @@ fn main() {
                         let conflicted = server.port_conflicted();
                         let admin_key = server.admin_api_key().map(|s| s.to_string());
 
-                        // 记录实际端口到共享状态，供 IPC 读取
-                        handle
-                            .state::<PortState>()
-                            .actual
-                            .store(port, Ordering::Relaxed);
+                        // 记录实际端口与 admin_key 到共享状态（供 IPC 读取 + 关窗后重建窗口）
+                        {
+                            let st = handle.state::<PortState>();
+                            st.actual.store(port, Ordering::Relaxed);
+                            *st.admin_key.lock() = admin_key.clone();
+                        }
 
                         if conflicted {
                             tracing::warn!(
@@ -294,9 +317,13 @@ fn main() {
                             );
                         }
 
-                        // 先创建窗口（需要 port 与 key），再进入 serve 循环
-                        if let Err(e) =
-                            create_main_window(&handle, port, admin_key.as_deref(), silent)
+                        // 静默启动：不创建窗口，仅驻留托盘（省去 WebView 内存），
+                        // 用户从托盘/Dock 唤出时再由 show_main_window 按需创建。
+                        // 非静默：立即创建并显示窗口。
+                        if silent {
+                            tracing::info!("静默启动：跳过窗口创建，仅驻留托盘");
+                        } else if let Err(e) =
+                            create_main_window(&handle, port, admin_key.as_deref())
                         {
                             tracing::error!("创建窗口失败: {}", e);
                         }
@@ -315,11 +342,12 @@ fn main() {
             Ok(())
         })
         .on_window_event(|window, event| {
-            // 关闭主窗口时隐藏到托盘而非退出
+            // 关闭主窗口时销毁窗口（释放 WebView 内存，后台仅保留 Rust 服务），
+            // 不退出进程；下次从托盘/Dock 唤出时 show_main_window 会重建窗口。
             if let tauri::WindowEvent::CloseRequested { api, .. } = event {
                 if window.label() == MAIN_WINDOW_LABEL {
                     api.prevent_close();
-                    let _ = window.hide();
+                    let _ = window.destroy();
                 }
             }
         })
@@ -421,7 +449,6 @@ fn create_main_window(
     app: &tauri::AppHandle,
     port: u16,
     admin_key: Option<&str>,
-    silent: bool,
 ) -> tauri::Result<()> {
     // 注意：axum nest 下 `/admin`（无尾斜杠）命中首页；`/admin/` 会 404。
     // vite base 为绝对路径 `/admin/`，故文档 URL 无尾斜杠不影响资源解析。
@@ -433,9 +460,7 @@ fn create_main_window(
     let mut builder = WebviewWindowBuilder::new(app, MAIN_WINDOW_LABEL, WebviewUrl::External(parsed))
         .title("kiro-rs")
         .inner_size(1200.0, 800.0)
-        .min_inner_size(900.0, 600.0)
-        // 静默启动时窗口初始隐藏，仅驻留托盘；否则正常显示
-        .visible(!silent);
+        .min_inner_size(900.0, 600.0);
 
     if let Some(key) = admin_key {
         // 仅注入 JSON 转义后的 key，避免脚本注入
