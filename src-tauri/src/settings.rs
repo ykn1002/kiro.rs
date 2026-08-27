@@ -14,7 +14,7 @@ fn default_true() -> bool {
 }
 
 fn default_lightweight_minutes() -> u64 {
-    10
+    0
 }
 
 /// 桌面偏好。字段用 serde 默认值，缺失字段向后兼容。
@@ -30,8 +30,8 @@ pub struct DesktopSettings {
     #[serde(default = "default_true")]
     pub auto_lightweight: bool,
 
-    /// 进入轻量模式的延迟（分钟）。0 表示关窗立即销毁。默认 10。
-    /// 期间窗口仅隐藏、仍可秒开；超时后才真正销毁 WebView。
+    /// 进入轻量模式的延迟（分钟）。0 表示关窗立即销毁。默认 0。
+    /// 大于 0 时窗口先隐藏、仍可秒开；超时后才真正销毁 WebView。
     #[serde(default = "default_lightweight_minutes")]
     pub lightweight_minutes: u64,
 }
@@ -41,7 +41,7 @@ impl Default for DesktopSettings {
         Self {
             silent_start: false,
             auto_lightweight: true,
-            lightweight_minutes: 10,
+            lightweight_minutes: 0,
         }
     }
 }

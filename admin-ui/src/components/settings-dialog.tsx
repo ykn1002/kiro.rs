@@ -119,7 +119,7 @@ export function SettingsDialog({ open, onOpenChange }: SettingsDialogProps) {
   const [silentStart, setSilentStart] = useState(false)
   const [autostart, setAutostart] = useState(false)
   const [autoLightweight, setAutoLightweight] = useState(true)
-  const [lightweightMinutes, setLightweightMinutes] = useState(10)
+  const [lightweightMinutes, setLightweightMinutes] = useState(0)
   const [portStatus, setPortStatus] = useState<PortStatus | null>(null)
   const [portInput, setPortInput] = useState('')
   const [portSaving, setPortSaving] = useState(false)
