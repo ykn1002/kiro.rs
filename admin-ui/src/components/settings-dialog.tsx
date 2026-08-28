@@ -125,6 +125,12 @@ export function SettingsDialog({ open, onOpenChange }: SettingsDialogProps) {
   const [portSaving, setPortSaving] = useState(false)
   const [adminApiKey, setAdminApiKeyState] = useState('')
   const [showAdminKey, setShowAdminKey] = useState(false)
+  // 全局代理（config 级，需重启生效）
+  const [proxyUrl, setProxyUrl] = useState('')
+  const [proxyUsername, setProxyUsername] = useState('')
+  const [proxyPassword, setProxyPassword] = useState('')
+  // 后端仅回传「是否已设置密码」，不回明文；据此显示 placeholder，空提交则不改密码
+  const [proxyPasswordSet, setProxyPasswordSet] = useState(false)
 
   // 打开对话框（或拉到数据）时用服务端值回填表单
   useEffect(() => {
@@ -152,6 +158,10 @@ export function SettingsDialog({ open, onOpenChange }: SettingsDialogProps) {
     setChunkedTriggerLines(String(config.chunkedWritePolicy?.triggerLines ?? 150))
     setChunkedChunkLines(String(config.chunkedWritePolicy?.chunkLines ?? 50))
     setCodexTruncationCorrection(config.codexTruncationCorrection ?? true)
+    setProxyUrl(config.proxyUrl ?? '')
+    setProxyUsername(config.proxyUsername ?? '')
+    setProxyPassword('') // 明文不回传，留空表示不修改
+    setProxyPasswordSet(config.proxyPasswordSet ?? false)
   }, [open, config])
 
   // 桌面设置独立加载（不依赖服务端 config）
@@ -385,6 +395,10 @@ export function SettingsDialog({ open, onOpenChange }: SettingsDialogProps) {
           chunkLines: chunkLines || 50,
         },
         codexTruncationCorrection,
+        proxyUrl: proxyUrl.trim(),
+        proxyUsername: proxyUsername.trim(),
+        // 密码框留空 = 不修改（字段缺省则后端保留原值）；输入了才提交
+        ...(proxyPassword ? { proxyPassword } : {}),
       },
       {
         onSuccess: () => {
@@ -473,6 +487,36 @@ export function SettingsDialog({ open, onOpenChange }: SettingsDialogProps) {
                 <p className="text-xs text-muted-foreground">
                   访问本管理面板的密钥，保存后立即热生效。桌面版用它自动登录；当前页面会同步更新，不会被登出。
                   注意：其它已登录的客户端需用新密钥重新登录。
+                </p>
+
+                <h3 className="text-sm font-semibold pt-2">全局代理</h3>
+                <Input
+                  value={proxyUrl}
+                  onChange={(e) => setProxyUrl(e.target.value)}
+                  disabled={isPending}
+                  placeholder="代理 URL，如 http://host:port 或 socks5://host:port（留空不使用）"
+                />
+                <div className="grid grid-cols-2 gap-3">
+                  <Input
+                    value={proxyUsername}
+                    onChange={(e) => setProxyUsername(e.target.value)}
+                    disabled={isPending}
+                    placeholder="代理用户名（可选）"
+                    autoComplete="off"
+                  />
+                  <Input
+                    type="password"
+                    value={proxyPassword}
+                    onChange={(e) => setProxyPassword(e.target.value)}
+                    disabled={isPending}
+                    placeholder={proxyPasswordSet ? '已设置（留空不修改）' : '代理密码（可选）'}
+                    autoComplete="new-password"
+                  />
+                </div>
+                <p className="text-xs text-muted-foreground">
+                  所有凭据默认走此代理，凭据可在自身配置里单独覆盖（填 <code>direct</code> 表示不走代理）。
+                  <span className="text-amber-600 dark:text-amber-500">修改后需重启应用才生效</span>
+                  （代理连接在启动时建立并缓存）。
                 </p>
               </section>
 

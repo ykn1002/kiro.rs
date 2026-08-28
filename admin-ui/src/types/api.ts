@@ -211,6 +211,12 @@ export interface AppConfig {
   modelAliases: Record<string, string>
   chunkedWritePolicy: ChunkedWritePolicy
   codexTruncationCorrection: boolean
+  /** 全局代理 URL（所有凭据默认走它） */
+  proxyUrl?: string | null
+  /** 全局代理认证用户名 */
+  proxyUsername?: string | null
+  /** 全局代理是否已设置密码（不回传明文） */
+  proxyPasswordSet: boolean
 }
 
 // 更新应用配置请求（全量替换可编辑子集）
@@ -232,4 +238,10 @@ export interface UpdateAppConfigRequest {
   modelAliases: Record<string, string>
   chunkedWritePolicy: ChunkedWritePolicy
   codexTruncationCorrection?: boolean
+  /** 全局代理 URL；空串清除、缺省不改。需重启生效 */
+  proxyUrl?: string
+  /** 全局代理认证用户名；空串清除、缺省不改 */
+  proxyUsername?: string
+  /** 全局代理认证密码；空串清除、缺省保留原值 */
+  proxyPassword?: string
 }

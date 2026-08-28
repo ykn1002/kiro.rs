@@ -521,6 +521,12 @@ impl AdminService {
             model_aliases: config.model_aliases.clone(),
             chunked_write_policy: config.chunked_write_policy.clone(),
             codex_truncation_correction: config.codex_truncation_correction,
+            proxy_url: config.proxy_url.clone(),
+            proxy_username: config.proxy_username.clone(),
+            proxy_password_set: config
+                .proxy_password
+                .as_ref()
+                .is_some_and(|p| !p.is_empty()),
         }
     }
 
@@ -685,6 +691,32 @@ impl AdminService {
         }
         if let Some(enabled) = req.codex_truncation_correction {
             new_config.codex_truncation_correction = enabled;
+        }
+        // 全局代理：URL/用户名空串清除、缺省不改；密码空串清除、缺省保留原值。
+        // 注意：provider 的 client 按代理缓存且构造时固定，改代理需重启进程才生效。
+        if let Some(ref url) = req.proxy_url {
+            let trimmed = url.trim();
+            new_config.proxy_url = if trimmed.is_empty() {
+                None
+            } else {
+                Some(trimmed.to_string())
+            };
+        }
+        if let Some(ref user) = req.proxy_username {
+            let trimmed = user.trim();
+            new_config.proxy_username = if trimmed.is_empty() {
+                None
+            } else {
+                Some(trimmed.to_string())
+            };
+        }
+        if let Some(ref pass) = req.proxy_password {
+            // 空串显式清除；非空则更新。字段缺失（None）时保留 new_config 原值。
+            new_config.proxy_password = if pass.is_empty() {
+                None
+            } else {
+                Some(pass.clone())
+            };
         }
 
         if config_path.is_some() {

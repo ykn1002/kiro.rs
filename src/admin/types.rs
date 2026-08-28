@@ -247,6 +247,14 @@ pub struct AppConfigResponse {
     pub chunked_write_policy: ChunkedWritePolicy,
     /// codex（/v1/responses）工具参数截断纠正开关
     pub codex_truncation_correction: bool,
+    /// 全局代理 URL（config.json 的 proxyUrl）。所有凭据默认走它，凭据可单独覆盖。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub proxy_url: Option<String>,
+    /// 全局代理认证用户名
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub proxy_username: Option<String>,
+    /// 全局代理是否已配置密码（不回传明文，仅告知前端已设置）
+    pub proxy_password_set: bool,
 }
 
 /// 更新应用配置请求（全量替换可编辑子集）
@@ -297,6 +305,15 @@ pub struct UpdateAppConfigRequest {
     /// codex 工具参数截断纠正开关；缺省时不更新（兼容旧 Admin UI）
     #[serde(default)]
     pub codex_truncation_correction: Option<bool>,
+    /// 全局代理 URL；空字符串表示清除，字段缺失则不更新（兼容旧 UI）。需重启生效。
+    #[serde(default)]
+    pub proxy_url: Option<String>,
+    /// 全局代理认证用户名；空字符串表示清除，字段缺失则不更新。
+    #[serde(default)]
+    pub proxy_username: Option<String>,
+    /// 全局代理认证密码；空字符串表示清除，字段缺失则保留原值（避免明文往返丢失）。
+    #[serde(default)]
+    pub proxy_password: Option<String>,
 }
 
 // ============ 监控指标 ============
