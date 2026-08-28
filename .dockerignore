@@ -30,7 +30,6 @@ AGENTS.md
 # Documentation and examples
 *.md
 README.md
-config.example.json
 credentials.example.*.json
 
 # Development and test files

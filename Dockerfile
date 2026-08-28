@@ -15,7 +15,7 @@ ARG ENABLE_NATIVE_TLS=true
 RUN apk add --no-cache musl-dev perl make
 
 WORKDIR /app
-COPY Cargo.toml Cargo.lock* ./
+COPY Cargo.toml Cargo.lock* config.example.json ./
 COPY src ./src
 COPY --from=frontend-builder /app/admin-ui/dist /app/admin-ui/dist
 
