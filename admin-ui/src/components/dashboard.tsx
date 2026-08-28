@@ -1,5 +1,5 @@
 import { useState, useEffect, useRef } from 'react'
-import { RefreshCw, LogOut, Moon, Sun, Server, Plus, Upload, FileUp, Trash2, RotateCcw, CheckCircle2, Settings, Activity, KeyRound, FileText } from 'lucide-react'
+import { RefreshCw, LogOut, Moon, Sun, Server, Plus, Upload, FileUp, Trash2, RotateCcw, CheckCircle2, Settings, Activity, KeyRound, FileText, Github, DownloadCloud } from 'lucide-react'
 import { useQueryClient } from '@tanstack/react-query'
 import { toast } from 'sonner'
 import { storage } from '@/lib/storage'
@@ -18,7 +18,7 @@ import { AwsSsoImportDialog } from '@/components/aws-sso-import-dialog'
 import { BatchVerifyDialog, type VerifyResult } from '@/components/batch-verify-dialog'
 import { SettingsDialog } from '@/components/settings-dialog'
 import { LogPanel } from '@/components/log-panel'
-import { isDesktop } from '@/lib/desktop'
+import { isDesktop, checkUpdate, openUrl, type UpdateInfo } from '@/lib/desktop'
 import { useCredentials, useDeleteCredential, useResetFailure, useLoadBalancingMode, useSetLoadBalancingMode } from '@/hooks/use-credentials'
 import { getCredentialBalance, forceRefreshToken } from '@/api/credentials'
 import type { LoadBalancingMode } from '@/api/credentials'
@@ -49,6 +49,8 @@ export function Dashboard({ onLogout }: DashboardProps) {
   const [kamImportDialogOpen, setKamImportDialogOpen] = useState(false)
   const [awsSsoImportDialogOpen, setAwsSsoImportDialogOpen] = useState(false)
   const [settingsDialogOpen, setSettingsDialogOpen] = useState(false)
+  const [checkingUpdate, setCheckingUpdate] = useState(false)
+  const [updateInfo, setUpdateInfo] = useState<UpdateInfo | null>(null)
   const [selectedIds, setSelectedIds] = useState<Set<number>>(new Set())
   const [verifyDialogOpen, setVerifyDialogOpen] = useState(false)
   const [verifying, setVerifying] = useState(false)
@@ -157,6 +159,46 @@ export function Dashboard({ onLogout }: DashboardProps) {
     queryClient.clear()
     onLogout()
   }
+
+  // 打开新版下载页
+  const openReleasePage = (info: UpdateInfo) => {
+    openUrl(info.releaseUrl).catch((e) => toast.error(`打开失败: ${extractErrorMessage(e)}`))
+  }
+
+  // 检查更新：请求 GitHub 最新 release，结果存入 updateInfo（驱动按钮变绿）。
+  // silent=true 为启动时自动检查：仅在有新版时弹提示，无更新/失败都不打扰。
+  const handleCheckUpdate = async (silent = false) => {
+    if (checkingUpdate) return
+    setCheckingUpdate(true)
+    try {
+      const info = await checkUpdate()
+      if (!info) return
+      setUpdateInfo(info)
+      // 静默检查（启动时）不弹任何 toast，只靠按钮变绿提示；手动点击才弹
+      if (silent) return
+      if (info.hasUpdate) {
+        toast.success(`发现新版本 ${info.latestVersion}（当前 ${info.currentVersion}）`, {
+          description: '点击前往下载页',
+          action: { label: '去下载', onClick: () => openReleasePage(info) },
+          duration: 10000,
+        })
+      } else {
+        toast.success(`已是最新版本（${info.currentVersion}）`)
+      }
+    } catch (e) {
+      if (!silent) toast.error(`检查更新失败: ${extractErrorMessage(e)}`)
+    } finally {
+      setCheckingUpdate(false)
+    }
+  }
+
+  // 启动后自动静默检查一次更新（仅桌面版）
+  useEffect(() => {
+    if (!DESKTOP) return
+    handleCheckUpdate(true)
+    // 仅首次挂载时执行
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
 
   // 选择管理
   const toggleSelect = (id: number) => {
@@ -633,6 +675,37 @@ export function Dashboard({ onLogout }: DashboardProps) {
               })}
             </div>
             <div className="mx-1 hidden h-6 w-px bg-border sm:block" />
+            {DESKTOP && (
+              <Button
+                variant="ghost"
+                size="icon"
+                onClick={() => (updateInfo?.hasUpdate ? openReleasePage(updateInfo) : handleCheckUpdate(false))}
+                disabled={checkingUpdate}
+                title={
+                  updateInfo?.hasUpdate
+                    ? `有新版本 ${updateInfo.latestVersion}，点击下载`
+                    : '检查更新'
+                }
+              >
+                <DownloadCloud
+                  className={`h-5 w-5 ${checkingUpdate ? 'animate-pulse' : ''} ${
+                    updateInfo?.hasUpdate ? 'text-green-500' : ''
+                  }`}
+                />
+              </Button>
+            )}
+            <Button
+              variant="ghost"
+              size="icon"
+              title="GitHub 仓库"
+              onClick={() => {
+                openUrl('https://github.com/ykn1002/kiro.rs').catch((e) =>
+                  toast.error(`打开失败: ${extractErrorMessage(e)}`)
+                )
+              }}
+            >
+              <Github className="h-5 w-5" />
+            </Button>
             <Button variant="ghost" size="icon" onClick={() => setSettingsDialogOpen(true)} title="系统设置">
               <Settings className="h-5 w-5" />
             </Button>

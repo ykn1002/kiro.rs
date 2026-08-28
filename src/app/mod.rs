@@ -478,6 +478,105 @@ pub fn desktop_import_config(source_path: &str) -> Result<u16, String> {
     Ok(port)
 }
 
+/// 更新检查结果。
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UpdateInfo {
+    /// 是否有比当前更新的版本
+    pub has_update: bool,
+    /// 当前版本（编译时嵌入）
+    pub current_version: String,
+    /// 最新版本（GitHub release 的 tag，去掉前导 v）
+    pub latest_version: String,
+    /// release 页面 URL（供跳转下载）
+    pub release_url: String,
+    /// release 说明（正文，可空）
+    pub notes: String,
+}
+
+/// GitHub 仓库（用于检查更新）。指向本项目 fork。
+const UPDATE_REPO: &str = "ykn1002/kiro.rs";
+
+/// 请求 GitHub `releases/latest` 比对版本。
+///
+/// `current_version` 由桌面壳传入（其 Cargo 包版本）。网络失败、无 release 等
+/// 均返回 Err(String) 供前端 toast 展示。不走代理、用默认 TLS（更新检查不涉密）。
+pub async fn check_update(current_version: &str) -> Result<UpdateInfo, String> {
+    let url = format!("https://api.github.com/repos/{UPDATE_REPO}/releases/latest");
+    // 更新检查用 rustls（内置 webpki 根证书），不依赖系统证书，直连 GitHub 更稳。
+    let client = http_client::build_client(None, 15, crate::model::config::TlsBackend::Rustls)
+        .map_err(|e| format!("创建 HTTP 客户端失败: {e}"))?;
+
+    let resp = client
+        .get(&url)
+        // GitHub API 要求 UA；不带会 403
+        .header("User-Agent", "kiro-rs-desktop")
+        .header("Accept", "application/vnd.github+json")
+        .send()
+        .await
+        .map_err(|e| format!("请求 GitHub 失败: {e}"))?;
+
+    if !resp.status().is_success() {
+        return Err(format!("GitHub 返回 {}", resp.status()));
+    }
+
+    let json: serde_json::Value = resp
+        .json()
+        .await
+        .map_err(|e| format!("解析响应失败: {e}"))?;
+
+    let tag = json
+        .get("tag_name")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| "响应缺少 tag_name".to_string())?;
+    let latest = tag.trim_start_matches('v').trim();
+    let release_url = json
+        .get("html_url")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| format!("https://github.com/{UPDATE_REPO}/releases"));
+    let notes = json
+        .get("body")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+
+    let has_update = version_gt(latest, current_version);
+
+    Ok(UpdateInfo {
+        has_update,
+        current_version: current_version.to_string(),
+        latest_version: latest.to_string(),
+        release_url,
+        notes,
+    })
+}
+
+/// 语义化版本比较：`a` 是否严格大于 `b`。按点分段做数值比较，
+/// 非数值段回退到字符串比较；段数不足按 0 补齐（如 2026.3 < 2026.3.1）。
+fn version_gt(a: &str, b: &str) -> bool {
+    let pa: Vec<&str> = a.split('.').collect();
+    let pb: Vec<&str> = b.split('.').collect();
+    let n = pa.len().max(pb.len());
+    for i in 0..n {
+        let sa = pa.get(i).copied().unwrap_or("0");
+        let sb = pb.get(i).copied().unwrap_or("0");
+        match (sa.parse::<u64>(), sb.parse::<u64>()) {
+            (Ok(na), Ok(nb)) => {
+                if na != nb {
+                    return na > nb;
+                }
+            }
+            _ => {
+                if sa != sb {
+                    return sa > sb;
+                }
+            }
+        }
+    }
+    false
+}
+
 /// 根据运行模式绑定监听地址。
 ///
 /// - Server：`config.host:config.port`，与重构前一致（端口占用即报错）。

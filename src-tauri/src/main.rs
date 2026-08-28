@@ -193,6 +193,32 @@ fn scan_sso_credentials() -> Vec<app::SsoCredentialCandidate> {
     app::scan_sso_credentials()
 }
 
+/// IPC：检查 GitHub 最新 release 是否有新版本。
+/// 当前版本取本桌面壳的 Cargo 包版本（编译时嵌入）。
+#[tauri::command]
+async fn check_update() -> Result<app::UpdateInfo, String> {
+    app::check_update(env!("CARGO_PKG_VERSION")).await
+}
+
+/// IPC：用系统默认浏览器打开外部 URL（更新下载页等）。
+/// 仅允许 http(s)，避免被诱导打开本地程序/协议。
+#[tauri::command]
+fn open_url(url: String) -> Result<(), String> {
+    if !(url.starts_with("http://") || url.starts_with("https://")) {
+        return Err("仅支持 http(s) 链接".to_string());
+    }
+    #[cfg(target_os = "macos")]
+    let result = std::process::Command::new("open").arg(&url).spawn();
+    #[cfg(target_os = "windows")]
+    let result = std::process::Command::new("cmd")
+        .args(["/C", "start", "", &url])
+        .spawn();
+    #[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
+    let result = std::process::Command::new("xdg-open").arg(&url).spawn();
+
+    result.map(|_| ()).map_err(|e| format!("打开链接失败: {e}"))
+}
+
 /// 前端拉取日志的返回体。
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -271,7 +297,9 @@ fn main() {
             set_log_capture,
             clear_logs,
             import_config,
-            scan_sso_credentials
+            scan_sso_credentials,
+            check_update,
+            open_url
         ])
         .setup(|app| {
             setup_tray(app.handle())?;

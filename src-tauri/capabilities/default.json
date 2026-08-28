@@ -24,6 +24,8 @@
     "allow-set-log-capture",
     "allow-clear-logs",
     "allow-import-config",
-    "allow-scan-sso-credentials"
+    "allow-scan-sso-credentials",
+    "allow-check-update",
+    "allow-open-url"
   ]
 }

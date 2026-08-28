@@ -13,6 +13,8 @@ fn main() {
         "clear_logs",
         "import_config",
         "scan_sso_credentials",
+        "check_update",
+        "open_url",
     ]);
     tauri_build::try_build(tauri_build::Attributes::new().app_manifest(app_manifest))
         .expect("tauri_build 失败");

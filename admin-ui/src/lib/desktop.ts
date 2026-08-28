@@ -195,3 +195,41 @@ export async function scanSsoCredentials(): Promise<SsoCredentialCandidate[]> {
     throw toError(e, 'scan_sso_credentials')
   }
 }
+
+export interface UpdateInfo {
+  /** 是否有新版本 */
+  hasUpdate: boolean
+  /** 当前版本 */
+  currentVersion: string
+  /** 最新版本 */
+  latestVersion: string
+  /** release 页面 URL */
+  releaseUrl: string
+  /** release 说明 */
+  notes: string
+}
+
+/** 检查 GitHub 是否有新版本；非桌面环境返回 null。 */
+export async function checkUpdate(): Promise<UpdateInfo | null> {
+  const t = tauri()
+  if (!t) return null
+  try {
+    return await t.core.invoke<UpdateInfo>('check_update')
+  } catch (e) {
+    throw toError(e, 'check_update')
+  }
+}
+
+/** 用系统浏览器打开外部链接；非桌面环境回退到 window.open。 */
+export async function openUrl(url: string): Promise<void> {
+  const t = tauri()
+  if (!t) {
+    window.open(url, '_blank', 'noopener,noreferrer')
+    return
+  }
+  try {
+    await t.core.invoke('open_url', { url })
+  } catch (e) {
+    throw toError(e, 'open_url')
+  }
+}
