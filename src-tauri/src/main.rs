@@ -10,7 +10,7 @@
 //!    并在页面脚本执行前注入 `localStorage['adminApiKey']` 实现 Admin UI 免登录。
 //! 4. 托盘常驻：显示窗口 / 开机启动 / 静默启动 / 退出。
 //!
-//! 静默启动（默认开）：仅当本次由开机自启拉起（argv 含 `--autostart`）且开关开启时，
+//! 静默启动（默认关）：仅当本次由开机自启拉起（argv 含 `--autostart`）且开关开启时，
 //! 窗口初始隐藏、只驻留托盘；手动双击打开始终显示窗口。
 
 mod lightweight;
@@ -400,7 +400,9 @@ fn main() {
         .build(tauri::generate_context!())
         .expect("构建 Tauri 应用失败")
         .run(|app, event| match event {
-            // 点击 Dock 图标（macOS Reopen）时唤出窗口
+            // 点击 Dock 图标（macOS Reopen）时唤出窗口。
+            // Reopen 是 macOS 专属变体，Windows/Linux 的 RunEvent 无此成员，故按平台 cfg。
+            #[cfg(target_os = "macos")]
             RunEvent::Reopen { .. } => show_main_window(app),
             // 关闭最后一个窗口不退出进程：托盘常驻，靠托盘/Dock 再唤出窗口
             RunEvent::ExitRequested { api, code, .. } => {
@@ -443,22 +445,37 @@ fn setup_tray(app: &tauri::AppHandle) -> tauri::Result<()> {
     let quit = MenuItem::with_id(app, "quit", "退出", true, None::<&str>)?;
     let menu = Menu::with_items(app, &[&show, &autostart, &silent_start, &quit])?;
 
-    // macOS 菜单栏惯例用单色模板图标（跟随深/浅色自动反色）；
-    // Windows/Linux 托盘用彩色 App 图标。
+    // macOS 菜单栏惯例：单色模板图标（跟随深/浅色自动反色）、左键单击即弹菜单。
     #[cfg(target_os = "macos")]
     let builder = {
         // 44x44 RGBA 原始像素（纯黑 + alpha 遮罩），配合 icon_as_template 由系统自动反色。
         // 用原始字节 + Image::new，免去 image-png 解码 feature。
         const TRAY_RGBA: &[u8] = include_bytes!("../icons/tray-template.rgba");
         let icon = tauri::image::Image::new(TRAY_RGBA, 44, 44);
-        TrayIconBuilder::new().icon(icon).icon_as_template(true)
+        TrayIconBuilder::new()
+            .icon(icon)
+            .icon_as_template(true)
+            .show_menu_on_left_click(true)
     };
+    // Windows/Linux 惯例：彩色 App 图标、左键单击打开窗口、右键弹菜单。
     #[cfg(not(target_os = "macos"))]
-    let builder = TrayIconBuilder::new().icon(app.default_window_icon().unwrap().clone());
+    let builder = TrayIconBuilder::new()
+        .icon(app.default_window_icon().unwrap().clone())
+        .show_menu_on_left_click(false)
+        .on_tray_icon_event(|tray, event| {
+            // 左键单击（按下后抬起）→ 唤出窗口
+            if let tauri::tray::TrayIconEvent::Click {
+                button: tauri::tray::MouseButton::Left,
+                button_state: tauri::tray::MouseButtonState::Up,
+                ..
+            } = event
+            {
+                show_main_window(tray.app_handle());
+            }
+        });
 
     let _tray = builder
         .menu(&menu)
-        .show_menu_on_left_click(true)
         .on_menu_event(move |app, event| match event.id.as_ref() {
             "show" => show_main_window(app),
             "autostart" => {
