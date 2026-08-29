@@ -29,7 +29,9 @@ jobs:
           - platform: windows-latest
             target: x86_64-pc-windows-msvc
             name: Windows-x64
-            bundles: nsis,msi
+            # 仅 NSIS：MSI(WiX)要求版本号 major<=255，与日期版本号 2026.x.x 冲突；
+            # NSIS 无此限制，双击安装向导，内部分发够用。
+            bundles: nsis
             rust-targets: x86_64-pc-windows-msvc
 
     runs-on: ${{ matrix.platform }}
@@ -96,4 +98,3 @@ jobs:
           path: |
             src-tauri/target/${{ matrix.target }}/release/bundle/dmg/*.dmg
             src-tauri/target/${{ matrix.target }}/release/bundle/nsis/*.exe
-            src-tauri/target/${{ matrix.target }}/release/bundle/msi/*.msi
