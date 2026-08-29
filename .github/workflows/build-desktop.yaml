@@ -21,17 +21,16 @@ jobs:
       matrix:
         include:
           - platform: macos-latest
-            target: aarch64-apple-darwin
-            name: macOS-arm64
+            target: universal-apple-darwin
+            name: macOS-universal
             bundles: app,dmg
-          - platform: macos-latest
-            target: x86_64-apple-darwin
-            name: macOS-x64
-            bundles: app,dmg
+            # 通用包需同时具备两个架构的 std
+            rust-targets: aarch64-apple-darwin,x86_64-apple-darwin
           - platform: windows-latest
             target: x86_64-pc-windows-msvc
             name: Windows-x64
             bundles: nsis,msi
+            rust-targets: x86_64-pc-windows-msvc
 
     runs-on: ${{ matrix.platform }}
 
@@ -73,7 +72,7 @@ jobs:
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
         with:
-          targets: ${{ matrix.target }}
+          targets: ${{ matrix.rust-targets }}
 
       - name: Setup Rust cache
         uses: Swatinem/rust-cache@v2
