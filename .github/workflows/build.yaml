@@ -2,8 +2,6 @@ name: Build Artifacts
 
 on:
   push:
-    branches:
-      - master
     tags:
       - 'v*'
   workflow_dispatch:
