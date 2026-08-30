@@ -10,7 +10,6 @@ pub mod app;
 pub mod common;
 pub mod http_client;
 pub mod kiro;
-pub mod log_buffer;
 pub mod metrics;
 pub mod model;
 pub mod model_stats;

@@ -10,10 +10,6 @@ interface TauriGlobal {
   }
 }
 
-// 日志接口已从 Tauri IPC 迁移到 Admin HTTP：UI 与后端拆进程后，日志缓冲只在
-// 跑 axum 的常驻主进程里，UI 子进程经 /api/admin/logs 读取（复用共享 axios 实例）。
-import { api } from '@/api/credentials'
-
 function tauri(): TauriGlobal | null {
   const g = window as unknown as { __TAURI__?: TauriGlobal }
   return g.__TAURI__ ?? null
@@ -29,6 +25,10 @@ export interface DesktopSettings {
   silentStart: boolean
   /** 开机启动是否已在系统注册 */
   autostart: boolean
+  /** 自动轻量模式：关窗后延迟销毁 WebView 释放内存 */
+  autoLightweight: boolean
+  /** 进入轻量模式的延迟（分钟，0 表示关窗立即销毁） */
+  lightweightMinutes: number
 }
 
 // Tauri invoke 失败时 reject 的通常是字符串（命令返回的 Err(String)）或错误对象，
@@ -62,6 +62,8 @@ export async function setDesktopSettings(settings: DesktopSettings): Promise<voi
     await t.core.invoke('set_desktop_settings', {
       silentStart: settings.silentStart,
       autostart: settings.autostart,
+      autoLightweight: settings.autoLightweight,
+      lightweightMinutes: settings.lightweightMinutes,
     })
   } catch (e) {
     throw toError(e, 'set_desktop_settings')
@@ -123,12 +125,12 @@ export interface LogPull {
   lines: LogLine[]
 }
 
-/** 拉取序号 > after 的新日志行；非桌面环境返回 null。走 Admin HTTP（主进程 axum）。 */
+/** 拉取序号 > after 的新日志行；非桌面环境返回 null。 */
 export async function getLogs(after: number): Promise<LogPull | null> {
-  if (!isDesktop()) return null
+  const t = tauri()
+  if (!t) return null
   try {
-    const { data } = await api.get<LogPull>('/logs', { params: { after } })
-    return data
+    return await t.core.invoke<LogPull>('get_logs', { after })
   } catch (e) {
     throw toError(e, 'get_logs')
   }
@@ -136,9 +138,10 @@ export async function getLogs(after: number): Promise<LogPull | null> {
 
 /** 开启/关闭日志捕获；非桌面环境为 no-op。 */
 export async function setLogCapture(enabled: boolean): Promise<void> {
-  if (!isDesktop()) return
+  const t = tauri()
+  if (!t) return
   try {
-    await api.post('/logs/capture', { enabled })
+    await t.core.invoke('set_log_capture', { enabled })
   } catch (e) {
     throw toError(e, 'set_log_capture')
   }
@@ -146,9 +149,10 @@ export async function setLogCapture(enabled: boolean): Promise<void> {
 
 /** 清空日志缓冲；非桌面环境为 no-op。 */
 export async function clearLogs(): Promise<void> {
-  if (!isDesktop()) return
+  const t = tauri()
+  if (!t) return
   try {
-    await api.post('/logs/clear')
+    await t.core.invoke('clear_logs')
   } catch (e) {
     throw toError(e, 'clear_logs')
   }

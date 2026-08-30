@@ -1,11 +1,8 @@
 //! 内存日志缓冲 + tracing Layer。
 //!
 //! 桌面版日志原本只写 stdout（GUI 下无人可见）。这里加一个 tracing Layer，
-//! 把格式化后的日志行存入一个有上限的环形缓冲，供前端「日志」Tab 通过 Admin API 拉取。
+//! 把格式化后的日志行存入一个有上限的环形缓冲，供前端「日志」Tab 通过 IPC 拉取。
 //! 每行带全局递增序号，前端按“上次序号之后”拉增量，避免重复。
-//!
-//! 缓冲为进程级全局：由跑 axum 的常驻主进程装配 [`BufferLayer`] 填充，
-//! 经 `/api/admin/logs` 暴露给 UI 子进程读取（UI 与后端已拆进程）。
 //!
 //! 捕获开关（[`set_enabled`]）默认开启；关闭后 Layer 不再写入缓冲（stdout 输出不受影响）。
 
@@ -77,9 +74,7 @@ pub fn since(after: u64) -> Vec<LogLine> {
 
 fn push(level: &str, target: &str, message: String) {
     let seq = NEXT_SEQ.fetch_add(1, Ordering::Relaxed);
-    let ts = chrono::Local::now()
-        .format("%Y-%m-%d %H:%M:%S%.3f")
-        .to_string();
+    let ts = chrono::Local::now().format("%Y-%m-%d %H:%M:%S%.3f").to_string();
     let line = LogLine {
         seq,
         ts,
