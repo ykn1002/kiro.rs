@@ -1,6 +1,6 @@
 services:
   kiro-rs:
-    image: ${IMAGE_OWNER:-ykn1002}/kiro-rs:${IMAGE_TAG:-latest}
+    image: ${IMAGE_OWNER:-ghcr.io/ykn1002}/kiro-rs:${IMAGE_TAG:-latest}
     container_name: kiro-rs
     extra_hosts:
       - "host.docker.internal:host-gateway"
