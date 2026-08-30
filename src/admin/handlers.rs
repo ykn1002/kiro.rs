@@ -5,6 +5,9 @@ use axum::{
     extract::{Path, Query, State},
     response::IntoResponse,
 };
+use serde::{Deserialize, Serialize};
+
+use crate::log_buffer::{self, LogLine};
 
 use super::{
     middleware::AdminState,
@@ -13,6 +16,60 @@ use super::{
         SuccessResponse, TimeseriesQuery, UpdateAppConfigRequest,
     },
 };
+
+/// GET /api/admin/logs 的查询参数：拉取序号 > `after` 的日志行。
+#[derive(Deserialize)]
+pub struct LogsQuery {
+    #[serde(default)]
+    pub after: u64,
+}
+
+/// GET /api/admin/logs 的返回体。
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LogsResponse {
+    /// 捕获是否开启
+    pub enabled: bool,
+    /// 序号 > after 的新日志行
+    pub lines: Vec<LogLine>,
+}
+
+/// POST /api/admin/logs/capture 的请求体。
+#[derive(Deserialize)]
+pub struct SetLogCaptureRequest {
+    pub enabled: bool,
+}
+
+/// GET /api/admin/logs
+/// 拉取序号 > `after` 的内存日志行（桌面版「日志」Tab 增量轮询）。
+/// 缓冲由常驻主进程的 tracing Layer 填充；非桌面部署缓冲为空。
+pub async fn get_logs(Query(query): Query<LogsQuery>) -> impl IntoResponse {
+    Json(LogsResponse {
+        enabled: log_buffer::is_enabled(),
+        lines: log_buffer::since(query.after),
+    })
+}
+
+/// POST /api/admin/logs/capture
+/// 开启/关闭日志捕获。
+pub async fn set_log_capture(Json(payload): Json<SetLogCaptureRequest>) -> impl IntoResponse {
+    log_buffer::set_enabled(payload.enabled);
+    Json(SuccessResponse::new(
+        if payload.enabled {
+            "日志捕获已开启"
+        } else {
+            "日志捕获已关闭"
+        }
+        .to_string(),
+    ))
+}
+
+/// POST /api/admin/logs/clear
+/// 清空日志缓冲。
+pub async fn clear_logs() -> impl IntoResponse {
+    log_buffer::clear();
+    Json(SuccessResponse::new("日志缓冲已清空".to_string()))
+}
 
 /// GET /api/admin/credentials
 /// 获取所有凭据状态

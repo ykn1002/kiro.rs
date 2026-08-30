@@ -14,8 +14,8 @@ import type {
   TimeseriesResponse,
 } from '@/types/api'
 
-// 创建 axios 实例
-const api = axios.create({
+// 创建 axios 实例（同时供 desktop.ts 的日志接口复用，共享 x-api-key 拦截器）
+export const api = axios.create({
   baseURL: '/api/admin',
   headers: {
     'Content-Type': 'application/json',

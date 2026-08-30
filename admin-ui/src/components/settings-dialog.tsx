@@ -118,8 +118,6 @@ export function SettingsDialog({ open, onOpenChange }: SettingsDialogProps) {
   // 桌面壳设置（仅桌面版）
   const [silentStart, setSilentStart] = useState(false)
   const [autostart, setAutostart] = useState(false)
-  const [autoLightweight, setAutoLightweight] = useState(true)
-  const [lightweightMinutes, setLightweightMinutes] = useState(0)
   const [portStatus, setPortStatus] = useState<PortStatus | null>(null)
   const [portInput, setPortInput] = useState('')
   const [portSaving, setPortSaving] = useState(false)
@@ -172,8 +170,6 @@ export function SettingsDialog({ open, onOpenChange }: SettingsDialogProps) {
         if (s) {
           setSilentStart(s.silentStart)
           setAutostart(s.autostart)
-          setAutoLightweight(s.autoLightweight)
-          setLightweightMinutes(s.lightweightMinutes)
         }
       })
       .catch((e) => {
@@ -195,19 +191,13 @@ export function SettingsDialog({ open, onOpenChange }: SettingsDialogProps) {
   const applyDesktop = (next: {
     silentStart?: boolean
     autostart?: boolean
-    autoLightweight?: boolean
-    lightweightMinutes?: number
   }) => {
     const merged = {
       silentStart: next.silentStart ?? silentStart,
       autostart: next.autostart ?? autostart,
-      autoLightweight: next.autoLightweight ?? autoLightweight,
-      lightweightMinutes: next.lightweightMinutes ?? lightweightMinutes,
     }
     setSilentStart(merged.silentStart)
     setAutostart(merged.autostart)
-    setAutoLightweight(merged.autoLightweight)
-    setLightweightMinutes(merged.lightweightMinutes)
     setDesktopSettings(merged).catch((e) => {
       toast.error(`保存桌面设置失败: ${extractErrorMessage(e)}`)
     })
@@ -923,44 +913,10 @@ export function SettingsDialog({ open, onOpenChange }: SettingsDialogProps) {
                       onCheckedChange={(v) => applyDesktop({ silentStart: v })}
                     />
                   </div>
-                  <div className="flex items-center justify-between">
-                    <div>
-                      <h3 className="text-sm font-semibold">自动轻量模式</h3>
-                      <p className="text-xs text-muted-foreground">
-                        关窗一段时间后销毁界面进程释放内存（约降至几十 MB）；
-                        再次唤出时重新加载页面，约 1 秒延迟。关闭则窗口常驻内存、唤出零延迟。
-                      </p>
-                    </div>
-                    <Switch
-                      checked={autoLightweight}
-                      onCheckedChange={(v) => applyDesktop({ autoLightweight: v })}
-                    />
-                  </div>
-                  {autoLightweight && (
-                    <div className="flex items-center justify-between pl-1">
-                      <div>
-                        <h3 className="text-sm font-semibold">进入延迟</h3>
-                        <p className="text-xs text-muted-foreground">
-                          关窗后多久进入轻量模式（分钟）；0 表示关窗立即释放
-                        </p>
-                      </div>
-                      <Input
-                        type="number"
-                        min={0}
-                        max={1440}
-                        className="w-24"
-                        value={String(lightweightMinutes)}
-                        onChange={(e) => {
-                          const n = parseInt(e.target.value, 10)
-                          const v = Number.isFinite(n) && n >= 0 ? Math.min(n, 1440) : 0
-                          applyDesktop({ lightweightMinutes: v })
-                        }}
-                      />
-                    </div>
-                  )}
                   <p className="text-xs text-muted-foreground">
                     以上为本机桌面设置，切换后立即生效，不受下方「保存并生效」影响。
-                    窗口关闭后会隐藏到菜单栏托盘，点击 Dock 图标或托盘图标可重新唤出。
+                    关闭窗口即退出界面进程释放内存（代理后端在后台常驻不中断）；
+                    点击菜单栏托盘「显示窗口」可重新唤出。
                   </p>
                 </section>
               )}

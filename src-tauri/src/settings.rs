@@ -9,39 +9,20 @@ use serde::{Deserialize, Serialize};
 
 const SETTINGS_FILE: &str = "desktop-settings.json";
 
-fn default_true() -> bool {
-    true
-}
-
-fn default_lightweight_minutes() -> u64 {
-    0
-}
-
-/// 桌面偏好。字段用 serde 默认值，缺失字段向后兼容。
+/// 桌面偏好。字段用 serde 默认值，缺失字段向后兼容；旧文件里已废弃的
+/// `auto_lightweight`/`lightweight_minutes` 字段会被 serde 自动忽略。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DesktopSettings {
     /// 静默启动：开机自启拉起时不弹窗，仅驻留托盘。默认关闭。
-    /// 仅影响开机自启路径；手动打开始终显示窗口。
+    /// 仅影响开机自启路径；手动打开始终唤出 UI。
     #[serde(default)]
     pub silent_start: bool,
-
-    /// 自动轻量模式：关窗（或静默启动）后延迟销毁 WebView 释放内存。默认开启。
-    /// 关闭则保持传统「关窗隐藏」，窗口对象常驻内存但唤出零延迟。
-    #[serde(default = "default_true")]
-    pub auto_lightweight: bool,
-
-    /// 进入轻量模式的延迟（分钟）。0 表示关窗立即销毁。默认 0。
-    /// 大于 0 时窗口先隐藏、仍可秒开；超时后才真正销毁 WebView。
-    #[serde(default = "default_lightweight_minutes")]
-    pub lightweight_minutes: u64,
 }
 
 impl Default for DesktopSettings {
     fn default() -> Self {
         Self {
             silent_start: false,
-            auto_lightweight: true,
-            lightweight_minutes: 0,
         }
     }
 }
