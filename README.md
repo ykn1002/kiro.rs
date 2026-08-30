@@ -1,8 +1,8 @@
 <div align="center">
 
-# kiro-rs
+# kiro-rs 加强版
 
-**用 Rust 编写的 Kiro API 代理 — 兼容 Anthropic 与 OpenAI / Codex，内置 Web 管理面板，附带开箱即用的桌面版**
+**Rust 编写的 Kiro API 代理加强版 — 兼容 Anthropic 与 OpenAI / Codex，多凭据调度、断流处理，内置 Web 管理面板，并新增开箱即用的桌面版**
 
 [![Build](https://github.com/ykn1002/kiro.rs/actions/workflows/build.yaml/badge.svg)](https://github.com/ykn1002/kiro.rs/actions/workflows/build.yaml) [![Release](https://img.shields.io/github/v/release/ykn1002/kiro.rs?display_name=tag&sort=semver)](https://github.com/ykn1002/kiro.rs/releases) [![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE) [![Rust](https://img.shields.io/badge/Rust-stable-orange.svg?logo=rust&logoColor=white)](https://www.rust-lang.org) ![Platforms](https://img.shields.io/badge/desktop-macOS%20%7C%20Windows%20%7C%20Linux-lightgrey)
 
@@ -30,7 +30,7 @@
 基于 Tauri 2 的桌面壳（macOS / Windows / Linux），把代理服务与 Web 管理面板打包成一个托盘应用，开箱即用，无需手写配置或使用命令行。
 
 <div align="center">
-  <img src="docs/onboarding/img/04-monitor.png" alt="桌面版实时监控看板：可用凭据数与调用统计" width="760">
+  <img src="https://cdn.jsdelivr.net/gh/ykn1002/kiro.rs@master/docs/onboarding/img/04-monitor.png" alt="桌面版实时监控看板：可用凭据数与调用统计" width="760">
 </div>
 
 - **托盘常驻**: 关窗不退出进程，托盘菜单提供「显示窗口 / 开机启动 / 静默启动 / 退出」
@@ -138,8 +138,7 @@ docker-compose up
 
 ## 注意事项
 
-- **TLS 后端 `tlsBackend` 默认 `native-tls`**（对代理 / token 刷新更稳）。原生构建（`cargo build --release`）与默认 Docker 镜像（`ENABLE_NATIVE_TLS=true`）均是它；`rustls` 为可选项：`config.json` 里设 `tlsBackend: "rustls"`，或用 `ENABLE_NATIVE_TLS=false` 构建更小的镜像。rustls 走 HTTP 代理需要系统证书，缺失时可能无法刷新 token 或直接返回 error request——遇到这类报错，用回默认的 `native-tls` 一般即可解决。（rustls-only 的构建里把 `tlsBackend` 设成 `native-tls` 会因缺少该 feature 自动回退到 rustls，并打出告警。）
-- **Write Failed / 会话卡死**：若持续出现 Write File / Write Failed 并导致会话不可用，参考 Issue [#22](https://github.com/hank9999/kiro.rs/issues/22) 和 [#49](https://github.com/hank9999/kiro.rs/issues/49) 的说明与临时解决方案（通常与输出过长被截断有关，可尝试调低输出相关 token 上限）。
+- **TLS 后端**：默认 `native-tls`（对代理 / token 刷新更稳）。若改用 rustls 后遇到无法刷新 token、`error request` 等报错，切回 `native-tls` 通常即可解决（详见 [配置说明](docs/CONFIGURATION.md#configjson)）。
 
 ## 文档
 
