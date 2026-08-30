@@ -5,11 +5,11 @@
 #   .\build-desktop.ps1 -Bundles nsis      # 只出 nsis 安装包
 #   .\build-desktop.ps1 -Bundles msi       # 只出 msi
 #   .\build-desktop.ps1 -SkipFrontend      # admin-ui\dist 已最新时跳过前端构建
-#   .\build-desktop.ps1 -NativeTls         # 改用 native-tls（默认 rustls）
+#   .\build-desktop.ps1 -Rustls            # 改用 rustls（默认 native-tls）
 #
 # 说明:
 #   - 前端 admin-ui 会先构建（rust-embed 需要 admin-ui\dist），除非 -SkipFrontend。
-#   - 默认 rustls；native-tls 需本机有 OpenSSL 构建环境（Perl + NASM）或改用 vendored。
+#   - 默认 native-tls（Windows 走 SChannel，用系统证书栈，代理/证书更稳；vendored 静态链接无需 OpenSSL 环境）。
 #   - 需要已安装 Rust、Node/pnpm、以及 tauri CLI：
 #       cargo install tauri-cli --version "^2" --locked
 #   - 产物位于 src-tauri\target\release\bundle\{nsis,msi}\
@@ -17,7 +17,7 @@
 param(
     [string]$Bundles = "nsis,msi",
     [switch]$SkipFrontend,
-    [switch]$NativeTls
+    [switch]$Rustls
 )
 
 $ErrorActionPreference = "Stop"
@@ -53,12 +53,12 @@ if ($SkipFrontend) {
 }
 
 # ---- TLS feature ----
-if ($NativeTls) {
-    Write-Host "==> TLS: native-tls"
-    $featureArgs = @("--no-default-features", "--features", "native-tls")
-} else {
-    Write-Host "==> TLS: rustls（默认）"
+if ($Rustls) {
+    Write-Host "==> TLS: rustls"
     $featureArgs = @("--no-default-features", "--features", "rustls")
+} else {
+    Write-Host "==> TLS: native-tls（默认）"
+    $featureArgs = @("--no-default-features", "--features", "native-tls")
 }
 
 # ---- 打包 ----

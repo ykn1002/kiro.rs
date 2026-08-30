@@ -8,11 +8,11 @@
 #   ./build-desktop.sh --universal        # 打通用二进制（arm64+x86_64 合一）
 #   ./build-desktop.sh --bundles app      # 只出 .app，不打 dmg（更快）
 #   ./build-desktop.sh --skip-frontend    # 跳过前端构建（admin-ui/dist 已是最新时）
-#   ./build-desktop.sh --universal --native-tls       # 改用 native-tls（默认 rustls）
+#   ./build-desktop.sh --universal --rustls           # 改用 rustls（默认 native-tls）
 #
 # 说明:
 #   - 前端 admin-ui 会先构建（rust-embed 需要 admin-ui/dist），除非 --skip-frontend。
-#   - 桌面版默认用 rustls，避免 native-tls 在打包环境的动态链接问题。
+#   - 桌面版默认用 native-tls（走系统证书栈，代理/证书更稳；vendored 静态链接无动态链接风险）。
 #   - Intel / universal 为交叉编译，需要 x86_64 target；脚本会自动尝试安装。
 #   - 产物路径:
 #       arm64:     src-tauri/target/release/bundle/{macos,dmg}/
@@ -27,7 +27,7 @@ cd "$SCRIPT_DIR"
 ARCH="host"           # host | intel | universal
 BUNDLES="app,dmg"
 SKIP_FRONTEND=false
-RUSTLS=true
+RUSTLS=false
 
 usage() {
     sed -n '2,18p' "$0" | sed 's/^# \?//'
@@ -37,7 +37,7 @@ usage() {
     echo "      --universal       打通用二进制（arm64+x86_64）"
     echo "      --bundles LIST    bundle 类型（默认 app,dmg；可 app 或 dmg）"
     echo "      --skip-frontend   跳过 admin-ui 前端构建"
-    echo "      --native-tls      改用 native-tls（默认 rustls）"
+    echo "      --rustls          改用 rustls（默认 native-tls）"
     echo "  -h, --help            显示此帮助"
 }
 
@@ -60,11 +60,11 @@ while [[ $# -gt 0 ]]; do
             shift
             ;;
         --native-tls)
+            # 兼容显式指定，默认已是 native-tls
             RUSTLS=false
             shift
             ;;
         --rustls)
-            # 兼容显式指定，默认已是 rustls
             RUSTLS=true
             shift
             ;;
@@ -151,12 +151,12 @@ if [[ "$BUNDLES" == *dmg* ]]; then
 fi
 
 # ---- TLS feature ----
-FEATURE_ARGS=(--no-default-features --features rustls)
+FEATURE_ARGS=(--no-default-features --features native-tls)
 if [[ "$RUSTLS" == true ]]; then
-    echo "==> TLS: rustls（默认）"
+    FEATURE_ARGS=(--no-default-features --features rustls)
+    echo "==> TLS: rustls"
 else
-    FEATURE_ARGS=(--no-default-features --features native-tls)
-    echo "==> TLS: native-tls"
+    echo "==> TLS: native-tls（默认）"
 fi
 
 # ---- 打包 ----
