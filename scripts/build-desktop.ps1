@@ -1,11 +1,11 @@
 # kiro-rs 桌面版（Tauri）打包脚本 —— Windows / PowerShell
 #
 # 用法（在仓库根目录 PowerShell 中）:
-#   .\build-desktop.ps1                    # 打当前架构（x64），nsis+msi
-#   .\build-desktop.ps1 -Bundles nsis      # 只出 nsis 安装包
-#   .\build-desktop.ps1 -Bundles msi       # 只出 msi
-#   .\build-desktop.ps1 -SkipFrontend      # admin-ui\dist 已最新时跳过前端构建
-#   .\build-desktop.ps1 -Rustls            # 改用 rustls（默认 native-tls）
+#   .\scripts\build-desktop.ps1                    # 打当前架构（x64），nsis+msi
+#   .\scripts\build-desktop.ps1 -Bundles nsis      # 只出 nsis 安装包
+#   .\scripts\build-desktop.ps1 -Bundles msi       # 只出 msi
+#   .\scripts\build-desktop.ps1 -SkipFrontend      # admin-ui\dist 已最新时跳过前端构建
+#   .\scripts\build-desktop.ps1 -Rustls            # 改用 rustls（默认 native-tls）
 #
 # 说明:
 #   - 前端 admin-ui 会先构建（rust-embed 需要 admin-ui\dist），除非 -SkipFrontend。
@@ -21,7 +21,7 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
-Set-Location -Path $PSScriptRoot
+Set-Location -Path (Split-Path -Parent $PSScriptRoot)
 
 # ---- 依赖检查 ----
 function Require-Cmd($name) {

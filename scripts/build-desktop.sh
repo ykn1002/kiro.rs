@@ -3,12 +3,12 @@
 # Windows 请使用 build-desktop.ps1（PowerShell）。
 #
 # 用法:
-#   ./build-desktop.sh                    # 打当前架构（Apple Silicon 上即 arm64）
-#   ./build-desktop.sh --intel            # 打 Intel (x86_64) 版
-#   ./build-desktop.sh --universal        # 打通用二进制（arm64+x86_64 合一）
-#   ./build-desktop.sh --bundles app      # 只出 .app，不打 dmg（更快）
-#   ./build-desktop.sh --skip-frontend    # 跳过前端构建（admin-ui/dist 已是最新时）
-#   ./build-desktop.sh --universal --rustls           # 改用 rustls（默认 native-tls）
+#   ./scripts/build-desktop.sh                    # 打当前架构（Apple Silicon 上即 arm64）
+#   ./scripts/build-desktop.sh --intel            # 打 Intel (x86_64) 版
+#   ./scripts/build-desktop.sh --universal        # 打通用二进制（arm64+x86_64 合一）
+#   ./scripts/build-desktop.sh --bundles app      # 只出 .app，不打 dmg（更快）
+#   ./scripts/build-desktop.sh --skip-frontend    # 跳过前端构建（admin-ui/dist 已是最新时）
+#   ./scripts/build-desktop.sh --universal --rustls           # 改用 rustls（默认 native-tls）
 #
 # 说明:
 #   - 前端 admin-ui 会先构建（rust-embed 需要 admin-ui/dist），除非 --skip-frontend。
@@ -21,7 +21,7 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-cd "$SCRIPT_DIR"
+cd "$SCRIPT_DIR/.."
 
 # 默认参数
 ARCH="host"           # host | intel | universal

@@ -2,21 +2,21 @@
 # kiro-rs Docker 多架构镜像构建脚本
 #
 # 用法:
-#   ./build.sh                            # 构建当前架构并推送到 ykn1002/kiro-rs:latest
-#   ./build.sh --no-push                  # 仅本地构建，不推送
-#   ./build.sh -t 2026.3.1               # 指定版本 tag
-#   ./build.sh --multi-arch              # 构建 amd64+arm64 多架构 manifest（需 buildx）
-#   ./build.sh --platform linux/amd64     # 指定单平台
-#   ./build.sh --no-cache                 # 禁用构建缓存
-#   ./build.sh --rustls                   # 改用 rustls 构建（更小，默认 native-tls）
+#   ./scripts/build.sh                            # 构建当前架构并推送到 ykn1002/kiro-rs:latest
+#   ./scripts/build.sh --no-push                  # 仅本地构建，不推送
+#   ./scripts/build.sh -t 2026.3.1               # 指定版本 tag
+#   ./scripts/build.sh --multi-arch              # 构建 amd64+arm64 多架构 manifest（需 buildx）
+#   ./scripts/build.sh --platform linux/amd64     # 指定单平台
+#   ./scripts/build.sh --no-cache                 # 禁用构建缓存
+#   ./scripts/build.sh --rustls                   # 改用 rustls 构建（更小，默认 native-tls）
 #
 # 多架构工作流（分机器构建 + manifest 合并）:
 #   # ARM 机器
-#   ./build.sh -t 2026.3.1 --arch-only arm64
+#   ./scripts/build.sh -t 2026.3.1 --arch-only arm64
 #   # AMD64 机器
-#   ./build.sh -t 2026.3.1 --arch-only amd64
+#   ./scripts/build.sh -t 2026.3.1 --arch-only amd64
 #   # 任一机器上合并 manifest
-#   ./build.sh -t 2026.3.1 --manifest-only
+#   ./scripts/build.sh -t 2026.3.1 --manifest-only
 #
 # 环境变量:
 #   IMAGE_REPO   完整镜像名，不含 tag（默认 ykn1002/kiro-rs）
@@ -24,7 +24,7 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-cd "$SCRIPT_DIR"
+cd "$SCRIPT_DIR/.."
 
 IMAGE_REPO="${IMAGE_REPO:-ykn1002/kiro-rs}"
 
