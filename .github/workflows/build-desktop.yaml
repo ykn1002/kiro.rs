@@ -87,7 +87,7 @@ jobs:
         run: cargo install tauri-cli --version '^2' --locked
 
       - name: Build desktop bundles
-        run: cargo tauri build --target ${{ matrix.target }} --bundles ${{ matrix.bundles }} -- --no-default-features --features rustls
+        run: cargo tauri build --target ${{ matrix.target }} --bundles ${{ matrix.bundles }} -- --no-default-features --features native-tls
 
       - name: Upload build artifacts
         uses: actions/upload-artifact@v4

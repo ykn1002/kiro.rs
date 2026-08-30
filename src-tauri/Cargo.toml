@@ -22,7 +22,9 @@ serde_json = "1"
 parking_lot = "0.12"
 chrono = { version = "0.4", features = ["clock"] }
 
-# 桌面版默认用 rustls，避免 native-tls 在打包环境的动态链接问题
+# 桌面版打包用 native-tls（native-tls-vendored 静态链接，无动态链接风险）：
+# macOS 走 Secure Transport、Windows 走 SChannel，用系统证书栈，代理/证书更稳。
+# default 保持 rustls 只为本地 `cargo build` 省依赖；CI 显式传 --features native-tls。
 [features]
 default = ["rustls"]
 rustls = []
