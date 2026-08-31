@@ -18,7 +18,7 @@ import { AwsSsoImportDialog } from '@/components/aws-sso-import-dialog'
 import { BatchVerifyDialog, type VerifyResult } from '@/components/batch-verify-dialog'
 import { SettingsDialog } from '@/components/settings-dialog'
 import { LogPanel } from '@/components/log-panel'
-import { isDesktop, checkUpdate, openUrl, type UpdateInfo } from '@/lib/desktop'
+import { isDesktop, checkUpdate, getAppVersion, openUrl, type UpdateInfo } from '@/lib/desktop'
 import { useCredentials, useDeleteCredential, useResetFailure, useLoadBalancingMode, useSetLoadBalancingMode } from '@/hooks/use-credentials'
 import { getCredentialBalance, forceRefreshToken } from '@/api/credentials'
 import type { LoadBalancingMode } from '@/api/credentials'
@@ -51,6 +51,7 @@ export function Dashboard({ onLogout }: DashboardProps) {
   const [settingsDialogOpen, setSettingsDialogOpen] = useState(false)
   const [checkingUpdate, setCheckingUpdate] = useState(false)
   const [updateInfo, setUpdateInfo] = useState<UpdateInfo | null>(null)
+  const [appVersion, setAppVersion] = useState<string | null>(null)
   const [selectedIds, setSelectedIds] = useState<Set<number>>(new Set())
   const [verifyDialogOpen, setVerifyDialogOpen] = useState(false)
   const [verifying, setVerifying] = useState(false)
@@ -192,10 +193,13 @@ export function Dashboard({ onLogout }: DashboardProps) {
     }
   }
 
-  // 启动后自动静默检查一次更新（仅桌面版）
+  // 启动后自动静默检查一次更新 + 读取当前版本（仅桌面版）
   useEffect(() => {
     if (!DESKTOP) return
     handleCheckUpdate(true)
+    getAppVersion()
+      .then(setAppVersion)
+      .catch(() => {})
     // 仅首次挂载时执行
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
@@ -675,6 +679,14 @@ export function Dashboard({ onLogout }: DashboardProps) {
               })}
             </div>
             <div className="mx-1 hidden h-6 w-px bg-border sm:block" />
+            {DESKTOP && appVersion && (
+              <span
+                className="hidden text-xs tabular-nums text-muted-foreground sm:inline"
+                title={`当前版本 ${appVersion}`}
+              >
+                v{appVersion}
+              </span>
+            )}
             {DESKTOP && (
               <Button
                 variant="ghost"

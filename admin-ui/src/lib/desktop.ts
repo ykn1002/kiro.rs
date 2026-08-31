@@ -220,6 +220,17 @@ export async function checkUpdate(): Promise<UpdateInfo | null> {
   }
 }
 
+/** 读取桌面壳版本号（编译时嵌入，不依赖网络）；非桌面环境返回 null。 */
+export async function getAppVersion(): Promise<string | null> {
+  const t = tauri()
+  if (!t) return null
+  try {
+    return await t.core.invoke<string>('get_app_version')
+  } catch (e) {
+    throw toError(e, 'get_app_version')
+  }
+}
+
 /** 用系统浏览器打开外部链接；非桌面环境回退到 window.open。 */
 export async function openUrl(url: string): Promise<void> {
   const t = tauri()

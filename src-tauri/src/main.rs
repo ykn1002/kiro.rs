@@ -200,6 +200,13 @@ async fn check_update() -> Result<app::UpdateInfo, String> {
     app::check_update(env!("CARGO_PKG_VERSION")).await
 }
 
+/// IPC：返回本桌面壳的版本号（编译时嵌入的 Cargo 包版本）。
+/// 供界面展示当前安装版本，不依赖网络。
+#[tauri::command]
+fn get_app_version() -> String {
+    env!("CARGO_PKG_VERSION").to_string()
+}
+
 /// IPC：用系统默认浏览器打开外部 URL（更新下载页等）。
 /// 仅允许 http(s)，避免被诱导打开本地程序/协议。
 #[tauri::command]
@@ -299,6 +306,7 @@ fn main() {
             import_config,
             scan_sso_credentials,
             check_update,
+            get_app_version,
             open_url
         ])
         .setup(|app| {
