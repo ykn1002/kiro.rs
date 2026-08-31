@@ -30,6 +30,7 @@ mod router;
 mod stream;
 pub mod types;
 
+pub(crate) use handlers::passthrough_response;
 pub(crate) use stream::{
     compute_thinking_signature, extract_thinking_from_complete_text, truncated_tool_correction,
 };

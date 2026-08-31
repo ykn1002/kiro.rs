@@ -66,6 +66,12 @@ pub struct CredentialStatusItem {
     pub disabled_reason: Option<String>,
     /// 端点名称（决定该凭据走哪套 Kiro API，已回退到默认端点）
     pub endpoint: String,
+    /// 凭据类型（kiro / anthropic / openai；透传凭据用于前端打标签）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
+    /// 透传上游 base URL（仅透传凭据）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub base_url: Option<String>,
     /// 凭据级 RPM 实时状态（各模型类别当前 60 秒窗口占用 + 生效上限）
     pub rpm: crate::kiro::token_manager::RpmStatus,
     /// 本地缓存的余额（仅未过期时带回，供前端刷新后免手动查询即可展示；无缓存则为 None）
@@ -146,6 +152,18 @@ pub struct AddCredentialRequest {
     /// 端点名称（可选，未配置时使用 config.defaultEndpoint）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub endpoint: Option<String>,
+
+    /// 凭据类型（可选）：`kiro`（默认）/ `anthropic` / `openai`
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
+
+    /// 透传上游 base URL（透传凭据必填）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub base_url: Option<String>,
+
+    /// 透传上游 API Key（透传凭据必填，格式 sk-xxx）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub upstream_api_key: Option<String>,
 }
 
 fn default_auth_method() -> String {

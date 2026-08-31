@@ -90,7 +90,10 @@ fn macos_kiro_version() -> Option<String> {
             std::env::var("HOME").unwrap_or_default()
         ),
     ];
-    for plist in candidates.iter().filter(|p| std::path::Path::new(p).exists()) {
+    for plist in candidates
+        .iter()
+        .filter(|p| std::path::Path::new(p).exists())
+    {
         let out = Command::new("/usr/libexec/PlistBuddy")
             .args(["-c", "Print :CFBundleShortVersionString", plist])
             .output()
@@ -113,9 +116,13 @@ fn windows_kiro_version() -> Option<String> {
     // 另尝试系统级 Program Files 作为回退。
     let mut roots: Vec<String> = Vec::new();
     if let Ok(local) = std::env::var("LOCALAPPDATA") {
-        roots.push(format!("{local}\\Programs\\kiro\\resources\\app\\product.json"));
+        roots.push(format!(
+            "{local}\\Programs\\kiro\\resources\\app\\product.json"
+        ));
         // 大小写回退（安装器版本差异）
-        roots.push(format!("{local}\\Programs\\Kiro\\resources\\app\\product.json"));
+        roots.push(format!(
+            "{local}\\Programs\\Kiro\\resources\\app\\product.json"
+        ));
     }
     if let Ok(pf) = std::env::var("ProgramFiles") {
         roots.push(format!("{pf}\\kiro\\resources\\app\\product.json"));

@@ -44,6 +44,10 @@ export interface CredentialStatusItem {
   refreshFailureCount: number
   disabledReason?: string
   endpoint: string
+  /** 凭据类型：kiro（默认）/ anthropic / openai（透传） */
+  kind?: string
+  /** 透传上游 base URL（仅透传凭据） */
+  baseUrl?: string
   rpm: RpmStatus
   // 后端带回的本地缓存余额（未过期时才有），用于刷新页面后免手动查询即可展示
   cachedBalance?: BalanceResponse
@@ -162,6 +166,12 @@ export interface AddCredentialRequest {
   proxyPassword?: string
   kiroApiKey?: string
   endpoint?: string
+  /** 凭据类型：kiro（默认）/ anthropic / openai（透传） */
+  kind?: 'kiro' | 'anthropic' | 'openai'
+  /** 透传上游 base URL（透传凭据必填） */
+  baseUrl?: string
+  /** 透传上游 API Key（透传凭据必填，格式 sk-xxx） */
+  upstreamApiKey?: string
 }
 
 // 添加凭据响应

@@ -4,6 +4,32 @@
 
 use serde::Deserialize;
 
+/// 透传上游 `/v1/usage` 响应
+///
+/// 单位为 USD，`balance`/`remaining` 可为负（已透支）。
+#[derive(Debug, Clone, Deserialize)]
+pub struct PassthroughUsageResponse {
+    /// 剩余余额（USD，可为负）
+    #[serde(default)]
+    pub balance: Option<f64>,
+    /// 剩余余额别名（部分站用 remaining）
+    #[serde(default)]
+    pub remaining: Option<f64>,
+    /// 计划/套餐名（如「钱包余额」），映射到 subscription_title
+    #[serde(default, rename = "planName")]
+    pub plan_name: Option<String>,
+    /// key 是否有效（注意：余额耗尽后此字段仍可能为 true，不可用于判活）
+    #[serde(default)]
+    pub is_valid: Option<bool>,
+}
+
+impl PassthroughUsageResponse {
+    /// 剩余额度（优先 balance，回退 remaining）
+    pub fn remaining_balance(&self) -> f64 {
+        self.balance.or(self.remaining).unwrap_or(0.0)
+    }
+}
+
 /// 使用额度查询响应
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]

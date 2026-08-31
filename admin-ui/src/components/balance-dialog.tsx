@@ -60,44 +60,67 @@ export function BalanceDialog({ credentialId, open, onOpenChange }: BalanceDialo
           )
         })()}
 
-        {balance && (
-          <div className="space-y-4">
-            {/* 订阅类型 */}
-            <div className="text-center">
-              <span className="text-lg font-semibold">
-                {balance.subscriptionTitle || '未知订阅类型'}
-              </span>
-            </div>
-
-            {/* 使用进度 */}
-            <div className="space-y-2">
-              <div className="flex justify-between text-sm">
-                <span>已使用: ${formatNumber(balance.currentUsage)}</span>
-                <span>限额: ${formatNumber(balance.usageLimit)}</span>
-              </div>
-              <Progress value={balance.usagePercentage} />
-              <div className="text-center text-sm text-muted-foreground">
-                {balance.usagePercentage.toFixed(1)}% 已使用
-              </div>
-            </div>
-
-            {/* 详细信息 */}
-            <div className="grid grid-cols-2 gap-4 pt-4 border-t text-sm">
-              <div>
-                <span className="text-muted-foreground">剩余额度：</span>
-                <span className="font-medium text-green-600">
+        {balance &&
+          // 透传凭据（钱包模式）：无总额/百分比概念，只显示余额
+          (balance.usageLimit <= 0 ? (
+            <div className="space-y-4">
+              {balance.subscriptionTitle && (
+                <div className="text-center">
+                  <span className="text-lg font-semibold">{balance.subscriptionTitle}</span>
+                </div>
+              )}
+              <div className="flex flex-col items-center gap-1 py-2">
+                <span className="text-sm text-muted-foreground">账户余额</span>
+                <span
+                  className={
+                    balance.remaining <= 0
+                      ? 'text-3xl font-bold text-red-500'
+                      : 'text-3xl font-bold text-green-600'
+                  }
+                >
                   ${formatNumber(balance.remaining)}
                 </span>
-              </div>
-              <div>
-                <span className="text-muted-foreground">下次重置：</span>
-                <span className="font-medium">
-                  {formatDate(balance.nextResetAt)}
-                </span>
+                {balance.remaining <= 0 && (
+                  <span className="text-sm text-red-500">余额已耗尽</span>
+                )}
               </div>
             </div>
-          </div>
-        )}
+          ) : (
+            <div className="space-y-4">
+              {/* 订阅类型 */}
+              <div className="text-center">
+                <span className="text-lg font-semibold">
+                  {balance.subscriptionTitle || '未知订阅类型'}
+                </span>
+              </div>
+
+              {/* 使用进度 */}
+              <div className="space-y-2">
+                <div className="flex justify-between text-sm">
+                  <span>已使用: ${formatNumber(balance.currentUsage)}</span>
+                  <span>限额: ${formatNumber(balance.usageLimit)}</span>
+                </div>
+                <Progress value={balance.usagePercentage} />
+                <div className="text-center text-sm text-muted-foreground">
+                  {balance.usagePercentage.toFixed(1)}% 已使用
+                </div>
+              </div>
+
+              {/* 详细信息 */}
+              <div className="grid grid-cols-2 gap-4 pt-4 border-t text-sm">
+                <div>
+                  <span className="text-muted-foreground">剩余额度：</span>
+                  <span className="font-medium text-green-600">
+                    ${formatNumber(balance.remaining)}
+                  </span>
+                </div>
+                <div>
+                  <span className="text-muted-foreground">下次重置：</span>
+                  <span className="font-medium">{formatDate(balance.nextResetAt)}</span>
+                </div>
+              </div>
+            </div>
+          ))}
       </DialogContent>
     </Dialog>
   )

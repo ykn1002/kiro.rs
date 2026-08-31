@@ -435,7 +435,13 @@ pub fn desktop_set_configured_port(port: u16) -> Result<(), String> {
 fn validate_desktop_config_json(content: &str) -> Result<String, String> {
     let config: Config =
         serde_json::from_str(content).map_err(|e| format!("配置格式非法，无法解析: {e}"))?;
-    if config.api_key.as_deref().map(str::trim).unwrap_or("").is_empty() {
+    if config
+        .api_key
+        .as_deref()
+        .map(str::trim)
+        .unwrap_or("")
+        .is_empty()
+    {
         return Err("导入的配置缺少 apiKey，桌面版无法启动".to_string());
     }
     if config

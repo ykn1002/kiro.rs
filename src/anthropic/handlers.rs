@@ -212,30 +212,41 @@ pub async fn get_models() -> impl IntoResponse {
 /// POST /v1/messages
 ///
 /// 创建消息（对话）
-pub async fn post_messages(
-    State(state): State<AppState>,
-    JsonExtractor(payload): JsonExtractor<MessagesRequest>,
-) -> Response {
-    handle_messages(state, payload, false, "/v1/messages").await
+pub async fn post_messages(State(state): State<AppState>, body: Bytes) -> Response {
+    handle_messages(state, body, false, "/v1/messages").await
 }
 
 /// POST /cc/v1/messages
 ///
 /// Claude Code 兼容端点：等待 contextUsageEvent 后再发送 message_start。
-pub async fn post_messages_cc(
-    State(state): State<AppState>,
-    JsonExtractor(payload): JsonExtractor<MessagesRequest>,
-) -> Response {
-    handle_messages(state, payload, true, "/cc/v1/messages").await
+pub async fn post_messages_cc(State(state): State<AppState>, body: Bytes) -> Response {
+    handle_messages(state, body, true, "/cc/v1/messages").await
 }
 
 /// /v1 与 /cc/v1 共享的消息处理逻辑
+///
+/// 保留原始入站字节 `raw_body`：选中透传凭据时原样转发（`MessagesRequest`
+/// 未捕获未知字段，重序列化会丢失，故必须用原始字节）。
 async fn handle_messages(
     state: AppState,
-    mut payload: MessagesRequest,
+    raw_body: Bytes,
     delay_message_start: bool,
     log_path: &str,
 ) -> Response {
+    let mut payload: MessagesRequest = match serde_json::from_slice(&raw_body) {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::warn!("请求体解析失败: {}", e);
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(ErrorResponse::new(
+                    "invalid_request_error",
+                    format!("Invalid request body: {e}"),
+                )),
+            )
+                .into_response();
+        }
+    };
     tracing::info!(
         path = log_path,
         model = %payload.model,
@@ -278,6 +289,21 @@ async fn handle_messages(
     let conversion_result = match convert_request(&payload) {
         Ok(result) => result,
         Err(e) => {
+            // Kiro 翻译失败（如透传专用模型名不在 Kiro 表）：若池内有可服务的 anthropic 透传凭据，
+            // fallback 到纯透传（原样转发原始字节）。
+            if provider
+                .has_passthrough_credential(crate::kiro::model::credentials::Capability::Anthropic)
+            {
+                tracing::info!(model = %payload.model, "Kiro 翻译失败，fallback 到 anthropic 透传（原样转发）");
+                return handle_anthropic_passthrough_only(
+                    provider,
+                    raw_body,
+                    &payload.model,
+                    payload.stream,
+                    state.passthrough_retry_after,
+                )
+                .await;
+            }
             let (error_type, message) = conversion_error_parts(&e);
             tracing::warn!("请求转换失败: {}", e);
             return (
@@ -327,6 +353,7 @@ async fn handle_messages(
         handle_stream_request(
             provider,
             request_body,
+            raw_body,
             &model,
             input_tokens,
             thinking_enabled,
@@ -339,6 +366,7 @@ async fn handle_messages(
         handle_non_stream_request(
             provider,
             &request_body,
+            &raw_body,
             &model,
             input_tokens,
             thinking_enabled,
@@ -363,6 +391,8 @@ const MAX_STREAM_RESTARTS: usize = 2;
 struct StreamRestarter {
     provider: std::sync::Arc<crate::kiro::provider::KiroProvider>,
     request_body: String,
+    /// 原始入站字节（透传凭据重放使用）
+    raw_body: Bytes,
     model: String,
     input_tokens: i32,
     thinking_enabled: bool,
@@ -391,6 +421,9 @@ impl StreamRestarter {
     }
 
     /// 重放上游请求；次数用尽或重放失败返回 None
+    ///
+    /// 仅服务 Kiro 场景（透传响应已是最终协议 SSE，不进入 create_sse_stream）。
+    /// 万一重放命中透传凭据，视为不可重放（返回 None）。
     async fn restart(&mut self) -> Option<reqwest::Response> {
         if self.remaining == 0 {
             return None;
@@ -398,13 +431,24 @@ impl StreamRestarter {
         self.remaining -= 1;
         match self
             .provider
-            .call_api_stream(&self.request_body, Some(&self.model))
+            .call_api_stream(crate::kiro::provider::UpstreamRequest {
+                kiro_body: &self.request_body,
+                raw_body: &self.raw_body,
+                capability: crate::kiro::model::credentials::Capability::Anthropic,
+                passthrough_only: false,
+                protocol: crate::kiro::provider::PassthroughProtocol::Anthropic,
+                model_hint: Some(&self.model),
+            })
             .await
         {
-            Ok((resp, cred_id)) => {
-                self.current_credential_id = cred_id as i64;
+            Ok(r) if r.passthrough => {
+                tracing::warn!("断流重连命中透传凭据，放弃重放");
+                None
+            }
+            Ok(r) => {
+                self.current_credential_id = r.credential_id as i64;
                 crate::metrics::inc_stream_restarted();
-                Some(resp)
+                Some(r.response)
             }
             Err(e) => {
                 tracing::error!("断流重连失败: {}", e);
@@ -414,10 +458,47 @@ impl StreamRestarter {
     }
 }
 
+/// 纯透传 Anthropic 请求（Kiro 翻译失败的 fallback）
+///
+/// 仅选 anthropic 透传凭据（`passthrough_only`），原样转发原始字节，不做翻译/解码。
+async fn handle_anthropic_passthrough_only(
+    provider: std::sync::Arc<crate::kiro::provider::KiroProvider>,
+    raw_body: Bytes,
+    model: &str,
+    stream: bool,
+    passthrough_retry_after: bool,
+) -> Response {
+    let req = crate::kiro::provider::UpstreamRequest {
+        kiro_body: "",
+        raw_body: &raw_body,
+        capability: crate::kiro::model::credentials::Capability::Anthropic,
+        passthrough_only: true,
+        protocol: crate::kiro::provider::PassthroughProtocol::Anthropic,
+        model_hint: Some(model),
+    };
+    let result = if stream {
+        provider.call_api_stream(req).await
+    } else {
+        provider.call_api(req).await
+    };
+    let upstream = match result {
+        Ok(r) => r,
+        Err(e) => return map_provider_error(e, passthrough_retry_after),
+    };
+    passthrough_response(
+        upstream.response,
+        model,
+        upstream.credential_id,
+        crate::common::passthrough_stats::PassthroughKind::Anthropic,
+    )
+}
+
 /// 处理流式请求
+#[allow(clippy::too_many_arguments)]
 async fn handle_stream_request(
     provider: std::sync::Arc<crate::kiro::provider::KiroProvider>,
     request_body: String,
+    raw_body: Bytes,
     model: &str,
     input_tokens: i32,
     thinking_enabled: bool,
@@ -428,6 +509,7 @@ async fn handle_stream_request(
     let mut restarter = StreamRestarter {
         provider: provider.clone(),
         request_body,
+        raw_body: raw_body.clone(),
         model: model.to_string(),
         input_tokens,
         thinking_enabled,
@@ -437,24 +519,92 @@ async fn handle_stream_request(
         current_credential_id: -1,
     };
 
-    let (response, cred_id) = match provider
-        .call_api_stream(&restarter.request_body, Some(model))
+    let upstream = match provider
+        .call_api_stream(crate::kiro::provider::UpstreamRequest {
+            kiro_body: &restarter.request_body,
+            raw_body: &raw_body,
+            capability: crate::kiro::model::credentials::Capability::Anthropic,
+            passthrough_only: false,
+            protocol: crate::kiro::provider::PassthroughProtocol::Anthropic,
+            model_hint: Some(model),
+        })
         .await
     {
-        Ok(pair) => pair,
+        Ok(r) => r,
         Err(e) => return map_provider_error(e, passthrough_retry_after),
     };
-    restarter.current_credential_id = cred_id as i64;
+
+    // 透传凭据：响应已是标准 Anthropic SSE，原样转发（不做 Kiro 解码 / 断流重放）
+    if upstream.passthrough {
+        return passthrough_response(
+            upstream.response,
+            model,
+            upstream.credential_id,
+            crate::common::passthrough_stats::PassthroughKind::Anthropic,
+        );
+    }
+
+    restarter.current_credential_id = upstream.credential_id as i64;
 
     let ctx = restarter.build_ctx();
 
-    let stream = create_sse_stream(response, ctx, restarter);
+    let stream = create_sse_stream(upstream.response, ctx, restarter);
 
     Response::builder()
         .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, "text/event-stream")
         .header(header::CACHE_CONTROL, "no-cache")
         .header(header::CONNECTION, "keep-alive")
+        .body(Body::from_stream(stream))
+        .unwrap()
+}
+
+/// 透传响应：原样转发上游响应（保留状态码与 content-type），
+/// 旁路 sniff usage 做轻量统计（sniff 不到只记请求计数）。
+///
+/// 同时用于流式与非流式：透传站返回什么就转发什么，不做协议解码。
+pub(crate) fn passthrough_response(
+    response: reqwest::Response,
+    model: &str,
+    credential_id: u64,
+    kind: crate::common::passthrough_stats::PassthroughKind,
+) -> Response {
+    let status = response.status();
+    let content_type = response
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("application/json")
+        .to_string();
+
+    let sniffer = crate::common::passthrough_stats::PassthroughUsageSniffer::new(
+        model.into(),
+        credential_id,
+        kind,
+    );
+
+    // unfold 持有 sniffer：每个字节块透传的同时喂给 sniffer；流耗尽（None）时
+    // sniffer 随 state drop，其 Drop 完成落库（无论是否 sniff 到 usage）。
+    let byte_stream = response.bytes_stream();
+    let stream = stream::unfold(
+        (byte_stream, sniffer),
+        |(mut body, mut sniffer)| async move {
+            match body.next().await {
+                Some(Ok(chunk)) => {
+                    sniffer.feed(&chunk);
+                    Some((Ok::<Bytes, Infallible>(chunk), (body, sniffer)))
+                }
+                // 上游出错：结束转发（sniffer 在 state drop 时落库）
+                Some(Err(_)) => None,
+                None => None,
+            }
+        },
+    );
+
+    Response::builder()
+        .status(status)
+        .header(header::CONTENT_TYPE, content_type)
+        .header(header::CACHE_CONTROL, "no-cache")
         .body(Body::from_stream(stream))
         .unwrap()
 }
@@ -681,9 +831,11 @@ fn create_sse_stream(
 use super::converter::get_context_window_size;
 
 /// 处理非流式请求
+#[allow(clippy::too_many_arguments)]
 async fn handle_non_stream_request(
     provider: std::sync::Arc<crate::kiro::provider::KiroProvider>,
     request_body: &str,
+    raw_body: &Bytes,
     model: &str,
     input_tokens: i32,
     thinking_enabled: bool,
@@ -691,10 +843,33 @@ async fn handle_non_stream_request(
     passthrough_retry_after: bool,
 ) -> Response {
     // 调用 Kiro API（支持多凭据故障转移）
-    let (response, credential_id) = match provider.call_api(request_body, Some(model)).await {
-        Ok(pair) => pair,
+    let upstream = match provider
+        .call_api(crate::kiro::provider::UpstreamRequest {
+            kiro_body: request_body,
+            raw_body,
+            capability: crate::kiro::model::credentials::Capability::Anthropic,
+            passthrough_only: false,
+            protocol: crate::kiro::provider::PassthroughProtocol::Anthropic,
+            model_hint: Some(model),
+        })
+        .await
+    {
+        Ok(r) => r,
         Err(e) => return map_provider_error(e, passthrough_retry_after),
     };
+
+    // 透传凭据：响应为标准 Anthropic JSON/SSE，原样转发（不做 Kiro 解码）
+    if upstream.passthrough {
+        return passthrough_response(
+            upstream.response,
+            model,
+            upstream.credential_id,
+            crate::common::passthrough_stats::PassthroughKind::Anthropic,
+        );
+    }
+
+    let response = upstream.response;
+    let credential_id = upstream.credential_id;
 
     // 读取响应体
     let body_bytes = match response.bytes().await {

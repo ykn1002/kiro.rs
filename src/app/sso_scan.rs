@@ -133,7 +133,10 @@ fn assemble_candidate(
         refresh_token,
         client_id,
         client_secret,
-        region: token.region.map(|s| s.trim().to_string()).filter(|s| !s.is_empty()),
+        region: token
+            .region
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty()),
         source_file: source_file.to_string(),
     }))
 }

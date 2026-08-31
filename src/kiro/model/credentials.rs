@@ -109,6 +109,44 @@ pub struct KiroCredentials {
     /// 端点名必须在启动时注册的端点 registry 中存在。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub endpoint: Option<String>,
+
+    /// 凭据类型（可选）
+    ///
+    /// - `None` 或 `"kiro"`：Kiro 凭据（默认，走翻译链 + AWS event-stream）
+    /// - `"anthropic"`：第三方 Claude透传凭据（原样转发 `/v1/messages`）
+    /// - `"openai"`：第三方 Codex透传凭据（原样转发 `/v1/responses`）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
+
+    /// 透传上游的 base URL（仅透传凭据）
+    ///
+    /// 如 `https://api.anthropic.com`。透传时拼接 `/v1/messages` 或 `/v1/responses`，
+    /// 余额查询拼接 `/v1/usage`。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub base_url: Option<String>,
+
+    /// 透传上游的 API Key（仅透传凭据）
+    ///
+    /// 格式 `sk-xxx`，作为 `Authorization: Bearer` 直接转发给上游。
+    /// 独立于 `kiro_api_key`（后者是 headless 模式的 `ksk_` key）。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub upstream_api_key: Option<String>,
+}
+
+/// 凭据选择能力
+///
+/// 用于在凭据池中按请求类型过滤：
+/// - Anthropic 请求（`/v1/messages`）→ Kiro 或 anthropic 透传凭据
+/// - OpenAI 请求（`/v1/responses`）→ Kiro 或 openai 透传凭据
+/// - MCP（WebSearch）→ 仅 Kiro 凭据（透传站不支持 Kiro 专有 MCP 端点）
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Capability {
+    /// Anthropic 协议（`/v1/messages`）→ Kiro 或 anthropic 透传
+    Anthropic,
+    /// OpenAI Responses 协议（`/v1/responses`）→ Kiro 或 openai 透传
+    Openai,
+    /// 仅 Kiro 凭据可服务（Kiro 专有 MCP、或 Chat Completions 等无对应透传协议的入站）
+    KiroOnly,
 }
 
 /// 判断是否为零（用于跳过序列化）
@@ -193,6 +231,42 @@ impl KiroCredentials {
     /// 特殊值：显式不使用代理
     pub const PROXY_DIRECT: &'static str = "direct";
 
+    /// kind 取值：Anthropic 透传
+    pub const KIND_ANTHROPIC: &'static str = "anthropic";
+    /// kind 取值：OpenAI 透传
+    pub const KIND_OPENAI: &'static str = "openai";
+    /// kind 取值：Kiro（默认）
+    pub const KIND_KIRO: &'static str = "kiro";
+
+    /// 是否为透传凭据（kind 为 anthropic / openai）
+    pub fn is_passthrough(&self) -> bool {
+        matches!(
+            self.kind.as_deref(),
+            Some(Self::KIND_ANTHROPIC) | Some(Self::KIND_OPENAI)
+        )
+    }
+
+    /// 透传凭据服务的入站协议；非透传凭据返回 None
+    pub fn passthrough_capability(&self) -> Option<Capability> {
+        match self.kind.as_deref() {
+            Some(Self::KIND_ANTHROPIC) => Some(Capability::Anthropic),
+            Some(Self::KIND_OPENAI) => Some(Capability::Openai),
+            _ => None,
+        }
+    }
+
+    /// 该凭据能否服务指定入站协议
+    ///
+    /// - Kiro 凭据：两个协议都能服务（内部翻译）
+    /// - anthropic 透传：仅 Anthropic
+    /// - openai 透传：仅 Openai
+    pub fn serves(&self, cap: Capability) -> bool {
+        match self.passthrough_capability() {
+            Some(c) => c == cap,
+            None => true, // Kiro 凭据服务所有协议
+        }
+    }
+
     /// 获取默认凭证文件路径
     pub fn default_credentials_path() -> &'static str {
         "credentials.json"
@@ -250,6 +324,10 @@ impl KiroCredentials {
     ///
     /// Free 账号不支持 Opus 模型，需要 PRO 或更高等级订阅
     pub fn supports_opus(&self) -> bool {
+        // 透传凭据无 Kiro 订阅概念，模型支持由上游决定，一律放行
+        if self.is_passthrough() {
+            return true;
+        }
         match &self.subscription_title {
             Some(title) => {
                 let title_upper = title.to_uppercase();
@@ -353,6 +431,9 @@ mod tests {
             disabled: false,
             kiro_api_key: None,
             endpoint: None,
+            kind: None,
+            base_url: None,
+            upstream_api_key: None,
         };
 
         let json = creds.to_pretty_json().unwrap();
@@ -471,6 +552,9 @@ mod tests {
             disabled: false,
             kiro_api_key: None,
             endpoint: None,
+            kind: None,
+            base_url: None,
+            upstream_api_key: None,
         };
 
         let json = creds.to_pretty_json().unwrap();
@@ -502,6 +586,9 @@ mod tests {
             disabled: false,
             kiro_api_key: None,
             endpoint: None,
+            kind: None,
+            base_url: None,
+            upstream_api_key: None,
         };
 
         let json = creds.to_pretty_json().unwrap();
@@ -616,6 +703,9 @@ mod tests {
             disabled: false,
             kiro_api_key: None,
             endpoint: None,
+            kind: None,
+            base_url: None,
+            upstream_api_key: None,
         };
 
         let json = original.to_pretty_json().unwrap();
@@ -879,5 +969,77 @@ mod tests {
         let creds = KiroCredentials::default();
         let result = creds.effective_proxy(None);
         assert_eq!(result, None);
+    }
+
+    // ============ 透传凭据能力测试 ============
+
+    #[test]
+    fn test_kiro_credential_serves_all_protocols() {
+        // 默认（kind=None）为 Kiro 凭据，服务所有协议
+        let creds = KiroCredentials::default();
+        assert!(!creds.is_passthrough());
+        assert!(creds.serves(Capability::Anthropic));
+        assert!(creds.serves(Capability::Openai));
+        assert!(creds.serves(Capability::KiroOnly));
+        assert_eq!(creds.passthrough_capability(), None);
+    }
+
+    #[test]
+    fn test_anthropic_passthrough_serves_only_anthropic() {
+        let mut creds = KiroCredentials::default();
+        creds.kind = Some("anthropic".to_string());
+        assert!(creds.is_passthrough());
+        assert!(creds.serves(Capability::Anthropic));
+        assert!(!creds.serves(Capability::Openai));
+        // 透传凭据不服务 Kiro 专有场景（MCP / Chat Completions）
+        assert!(!creds.serves(Capability::KiroOnly));
+        assert_eq!(creds.passthrough_capability(), Some(Capability::Anthropic));
+    }
+
+    #[test]
+    fn test_openai_passthrough_serves_only_openai() {
+        let mut creds = KiroCredentials::default();
+        creds.kind = Some("openai".to_string());
+        assert!(creds.is_passthrough());
+        assert!(creds.serves(Capability::Openai));
+        assert!(!creds.serves(Capability::Anthropic));
+        assert!(!creds.serves(Capability::KiroOnly));
+    }
+
+    #[test]
+    fn test_kind_kiro_is_not_passthrough() {
+        let mut creds = KiroCredentials::default();
+        creds.kind = Some("kiro".to_string());
+        assert!(!creds.is_passthrough());
+        assert!(creds.serves(Capability::Anthropic));
+        assert!(creds.serves(Capability::Openai));
+    }
+
+    #[test]
+    fn test_passthrough_supports_opus_shortcircuits() {
+        // 透传凭据无 Kiro 订阅概念，即使 subscription_title 含 FREE 也支持 opus
+        let mut creds = KiroCredentials::default();
+        creds.kind = Some("anthropic".to_string());
+        creds.subscription_title = Some("KIRO FREE".to_string());
+        assert!(creds.supports_opus());
+    }
+
+    #[test]
+    fn test_passthrough_fields_roundtrip() {
+        let json = r#"{
+            "kind": "anthropic",
+            "baseUrl": "https://api.anthropic.com",
+            "upstreamApiKey": "sk-test"
+        }"#;
+        let creds = KiroCredentials::from_json(json).unwrap();
+        assert_eq!(creds.kind, Some("anthropic".to_string()));
+        assert_eq!(creds.base_url, Some("https://api.anthropic.com".to_string()));
+        assert_eq!(creds.upstream_api_key, Some("sk-test".to_string()));
+
+        // 往返序列化保持字段
+        let out = creds.to_pretty_json().unwrap();
+        assert!(out.contains("kind"));
+        assert!(out.contains("baseUrl"));
+        assert!(out.contains("upstreamApiKey"));
     }
 }

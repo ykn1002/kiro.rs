@@ -231,10 +231,23 @@ async fn handle_stream_request(
     include_usage: bool,
     passthrough_retry_after: bool,
 ) -> Response {
-    let (response, cred_id) = match provider.call_api_stream(request_body, Some(model)).await {
-        Ok(pair) => pair,
+    // Chat Completions 无对应透传协议（透传站为 Responses API），仅走 Kiro
+    let upstream = match provider
+        .call_api_stream(crate::kiro::provider::UpstreamRequest {
+            kiro_body: request_body,
+            raw_body: &bytes::Bytes::new(),
+            capability: crate::kiro::model::credentials::Capability::KiroOnly,
+            passthrough_only: false,
+            protocol: crate::kiro::provider::PassthroughProtocol::Openai,
+            model_hint: Some(model),
+        })
+        .await
+    {
+        Ok(r) => r,
         Err(e) => return map_provider_error(e, passthrough_retry_after),
     };
+    let response = upstream.response;
+    let cred_id = upstream.credential_id;
 
     let mut ctx = OpenAiStreamContext::new(model, input_tokens, thinking_enabled, tool_name_map);
     ctx.set_credential_id(cred_id);
@@ -379,10 +392,22 @@ async fn handle_non_stream_request(
     tool_name_map: std::collections::HashMap<String, String>,
     passthrough_retry_after: bool,
 ) -> Response {
-    let (response, credential_id) = match provider.call_api(request_body, Some(model)).await {
-        Ok(pair) => pair,
+    let upstream = match provider
+        .call_api(crate::kiro::provider::UpstreamRequest {
+            kiro_body: request_body,
+            raw_body: &bytes::Bytes::new(),
+            capability: crate::kiro::model::credentials::Capability::KiroOnly,
+            passthrough_only: false,
+            protocol: crate::kiro::provider::PassthroughProtocol::Openai,
+            model_hint: Some(model),
+        })
+        .await
+    {
+        Ok(r) => r,
         Err(e) => return map_provider_error(e, passthrough_retry_after),
     };
+    let response = upstream.response;
+    let credential_id = upstream.credential_id;
 
     let body_bytes = match response.bytes().await {
         Ok(b) => b,

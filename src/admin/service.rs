@@ -111,6 +111,8 @@ impl AdminService {
                 refresh_failure_count: entry.refresh_failure_count,
                 disabled_reason: entry.disabled_reason,
                 endpoint: entry.endpoint.unwrap_or_else(|| default_endpoint.clone()),
+                kind: entry.kind,
+                base_url: entry.base_url,
                 rpm: entry.rpm,
                 cached_balance: self.cached_balance_fresh(entry.id),
             })
@@ -340,6 +342,11 @@ impl AdminService {
 
     /// 从上游获取余额（无缓存）
     async fn fetch_balance(&self, id: u64) -> Result<BalanceResponse, AdminServiceError> {
+        // 透传凭据走上游 /v1/usage（USD，balance 可为负）
+        if self.token_manager.is_passthrough_credential(id) {
+            return self.fetch_passthrough_balance(id).await;
+        }
+
         let usage = self
             .token_manager
             .get_usage_limits_for(id)
@@ -363,6 +370,35 @@ impl AdminService {
             remaining,
             usage_percentage,
             next_reset_at: usage.next_date_reset,
+        })
+    }
+
+    /// 获取透传凭据余额并映射到统一的 BalanceResponse
+    ///
+    /// 上游 /v1/usage 单位为 USD，只有钱包余额 `balance`（可为负），无硬性上限。
+    /// 映射：`remaining` = balance；余额 <= 0 视为耗尽（usage_percentage = 100）。
+    async fn fetch_passthrough_balance(
+        &self,
+        id: u64,
+    ) -> Result<BalanceResponse, AdminServiceError> {
+        let usage = self
+            .token_manager
+            .get_passthrough_usage_for(id)
+            .await
+            .map_err(|e| self.classify_balance_error(e, id))?;
+
+        let remaining = usage.remaining_balance();
+        // 钱包模式无硬上限：耗尽（<=0）按 100%，否则 0%（无从得知已用比例）
+        let usage_percentage = if remaining <= 0.0 { 100.0 } else { 0.0 };
+
+        Ok(BalanceResponse {
+            id,
+            subscription_title: usage.plan_name.clone(),
+            current_usage: 0.0,
+            usage_limit: 0.0,
+            remaining,
+            usage_percentage,
+            next_reset_at: None,
         })
     }
 
@@ -408,7 +444,29 @@ impl AdminService {
             disabled: false, // 新添加的凭据默认启用
             kiro_api_key: req.kiro_api_key,
             endpoint: req.endpoint,
+            kind: req.kind,
+            base_url: req.base_url,
+            upstream_api_key: req.upstream_api_key,
         };
+
+        // 透传凭据无 Kiro 认证概念：清掉默认带上的 authMethod（前端默认 social）
+        if new_cred.is_passthrough() {
+            new_cred.auth_method = None;
+        }
+
+        // 透传凭据校验：必须同时有 baseUrl + upstreamApiKey
+        if new_cred.is_passthrough()
+            && (new_cred.base_url.as_deref().unwrap_or("").is_empty()
+                || new_cred
+                    .upstream_api_key
+                    .as_deref()
+                    .unwrap_or("")
+                    .is_empty())
+        {
+            return Err(AdminServiceError::InvalidCredential(
+                "透传凭据（kind=anthropic/openai）必须提供 baseUrl 和 upstreamApiKey".to_string(),
+            ));
+        }
 
         // 规范化认证方式（builder-id / iam -> idc），用于后续判定是否需要获取订阅等级
         new_cred.canonicalize_auth_method();
@@ -425,7 +483,10 @@ impl AdminService {
         // IdC 账号没有 FREE/PRO 订阅等级概念，getUsageLimits 接口对其不适用
         // （会返回 "Invalid profileArn"）；但 IdC 需要 profileArn 才能正常请求，
         // 因此改为主动获取并持久化 Profile ARN。
-        if is_idc {
+        // 透传凭据无 Kiro 订阅/profileArn 概念，跳过（getUsageLimits 对其不适用）。
+        if self.token_manager.is_passthrough_credential(credential_id) {
+            // 透传凭据无需获取 Kiro 订阅等级
+        } else if is_idc {
             if let Err(e) = self
                 .token_manager
                 .ensure_profile_arn_for(credential_id)

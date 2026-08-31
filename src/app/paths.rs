@@ -5,8 +5,8 @@
 
 use std::path::PathBuf;
 
-use crate::model::config::Config;
 use crate::kiro::model::credentials::KiroCredentials;
+use crate::model::config::Config;
 
 use super::RunOptions;
 

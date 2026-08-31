@@ -88,6 +88,18 @@ function authMethodLabel(method: string | null | undefined): string | null {
   }
 }
 
+// 透传凭据的类型标签（Kiro 凭据返回 null，不显示）
+function passthroughKindLabel(kind: string | null | undefined): string | null {
+  switch (kind) {
+    case 'anthropic':
+      return 'Claude 透传'
+    case 'openai':
+      return 'Codex 透传'
+    default:
+      return null
+  }
+}
+
 // 凭据健康状态：驱动标题前的状态圆点
 type Health = 'active' | 'ok' | 'warn' | 'disabled'
 
@@ -210,6 +222,8 @@ export function CredentialCard({
   const health = credentialHealth(credential)
   const dot = healthDot[health]
   const authLabel = authMethodLabel(credential.authMethod)
+  const kindLabel = passthroughKindLabel(credential.kind)
+  const isPassthrough = kindLabel !== null
   const rpmUsage = formatRpmUsage(credential.rpm)
   const hasFailure = credential.failureCount > 0 || credential.refreshFailureCount > 0
   const title = credential.email || `凭据 #${credential.id}`
@@ -242,16 +256,31 @@ export function CredentialCard({
               </div>
               <div className="mt-1 flex items-center gap-1.5 text-xs text-muted-foreground">
                 {showIdInSub && <span className="font-mono">#{credential.id}</span>}
-                {authLabel && (
+                {isPassthrough ? (
                   <>
                     {showIdInSub && <span className="text-border">·</span>}
-                    <span>{authLabel}</span>
+                    <span>{kindLabel}</span>
+                    {credential.baseUrl && (
+                      <>
+                        <span className="text-border">·</span>
+                        <span className="truncate">{credential.baseUrl}</span>
+                      </>
+                    )}
                   </>
-                )}
-                {credential.endpoint && (
+                ) : (
                   <>
-                    {(showIdInSub || authLabel) && <span className="text-border">·</span>}
-                    <span className="truncate">{credential.endpoint}</span>
+                    {authLabel && (
+                      <>
+                        {showIdInSub && <span className="text-border">·</span>}
+                        <span>{authLabel}</span>
+                      </>
+                    )}
+                    {credential.endpoint && (
+                      <>
+                        {(showIdInSub || authLabel) && <span className="text-border">·</span>}
+                        <span className="truncate">{credential.endpoint}</span>
+                      </>
+                    )}
                   </>
                 )}
               </div>
@@ -281,44 +310,83 @@ export function CredentialCard({
         </CardHeader>
 
         <CardContent className="flex flex-1 flex-col gap-3 p-4 pt-0">
-          {/* 剩余用量：视觉主体 */}
-          <div className="rounded-lg bg-muted/40 p-3">
-            <div className="flex items-center justify-between">
-              <div className="flex items-center gap-1.5 text-xs text-muted-foreground">
-                <Wallet className="h-3.5 w-3.5" />
-                <span>剩余用量</span>
-                {!loadingBalance && balance?.subscriptionTitle && (
-                  <Badge variant="secondary" className="ml-0.5 px-1.5 py-0 text-[10px]">
-                    {balance.subscriptionTitle}
-                  </Badge>
+          {/* 余额区：透传凭据只有余额（无总额/百分比），Kiro 凭据显示剩余用量百分比 */}
+          {isPassthrough ? (
+            <div className="rounded-lg bg-muted/40 p-3">
+              <div className="flex items-center justify-between">
+                <div className="flex items-center gap-1.5 text-xs text-muted-foreground">
+                  <Wallet className="h-3.5 w-3.5" />
+                  <span>账户余额</span>
+                  {!loadingBalance && balance?.subscriptionTitle && (
+                    <Badge variant="secondary" className="ml-0.5 px-1.5 py-0 text-[10px]">
+                      {balance.subscriptionTitle}
+                    </Badge>
+                  )}
+                </div>
+                {loadingBalance ? (
+                  <Loader2 className="h-3.5 w-3.5 animate-spin text-muted-foreground" />
+                ) : balance ? (
+                  <span
+                    className={cn(
+                      'text-lg font-bold leading-none tabular-nums',
+                      balance.remaining <= 0 && 'text-destructive'
+                    )}
+                  >
+                    <span className="mr-0.5 text-xs font-normal text-muted-foreground">$</span>
+                    {balance.remaining.toFixed(2)}
+                  </span>
+                ) : (
+                  <span className="text-xs text-muted-foreground">未知</span>
                 )}
               </div>
-              {loadingBalance ? (
-                <Loader2 className="h-3.5 w-3.5 animate-spin text-muted-foreground" />
-              ) : remainingPct !== null ? (
-                <span className="text-lg font-bold leading-none tabular-nums">
-                  {remainingPct.toFixed(0)}
-                  <span className="ml-0.5 text-xs font-normal text-muted-foreground">%</span>
-                </span>
-              ) : (
-                <span className="text-xs text-muted-foreground">未知</span>
+              {!balance && !loadingBalance && (
+                <div className="mt-1.5 text-[11px] text-muted-foreground">
+                  点击「查看余额」获取账户余额
+                </div>
+              )}
+              {balance && !loadingBalance && balance.remaining <= 0 && (
+                <div className="mt-1.5 text-[11px] text-destructive">余额已耗尽</div>
               )}
             </div>
-            {balance && !loadingBalance ? (
-              <>
-                <Progress value={balance.usagePercentage} max={100} className="mt-2 h-1.5" />
-                <div className="mt-1.5 text-right text-[11px] text-muted-foreground tabular-nums">
-                  剩 {balance.remaining.toFixed(2)} / {balance.usageLimit.toFixed(2)}
+          ) : (
+            <div className="rounded-lg bg-muted/40 p-3">
+              <div className="flex items-center justify-between">
+                <div className="flex items-center gap-1.5 text-xs text-muted-foreground">
+                  <Wallet className="h-3.5 w-3.5" />
+                  <span>剩余用量</span>
+                  {!loadingBalance && balance?.subscriptionTitle && (
+                    <Badge variant="secondary" className="ml-0.5 px-1.5 py-0 text-[10px]">
+                      {balance.subscriptionTitle}
+                    </Badge>
+                  )}
                 </div>
-              </>
-            ) : (
-              !loadingBalance && (
-                <div className="mt-1.5 text-[11px] text-muted-foreground">
-                  点击「查询信息」或「查看余额」获取用量
-                </div>
-              )
-            )}
-          </div>
+                {loadingBalance ? (
+                  <Loader2 className="h-3.5 w-3.5 animate-spin text-muted-foreground" />
+                ) : remainingPct !== null ? (
+                  <span className="text-lg font-bold leading-none tabular-nums">
+                    {remainingPct.toFixed(0)}
+                    <span className="ml-0.5 text-xs font-normal text-muted-foreground">%</span>
+                  </span>
+                ) : (
+                  <span className="text-xs text-muted-foreground">未知</span>
+                )}
+              </div>
+              {balance && !loadingBalance ? (
+                <>
+                  <Progress value={balance.usagePercentage} max={100} className="mt-2 h-1.5" />
+                  <div className="mt-1.5 text-right text-[11px] text-muted-foreground tabular-nums">
+                    剩 {balance.remaining.toFixed(2)} / {balance.usageLimit.toFixed(2)}
+                  </div>
+                </>
+              ) : (
+                !loadingBalance && (
+                  <div className="mt-1.5 text-[11px] text-muted-foreground">
+                    点击「查询信息」或「查看余额」获取用量
+                  </div>
+                )
+              )}
+            </div>
+          )}
 
           {/* 元信息：标签—值 竖排 */}
           <div className="space-y-2">
@@ -413,8 +481,21 @@ export function CredentialCard({
               variant="ghost"
               className="h-8 w-8"
               onClick={handleForceRefresh}
-              disabled={forceRefresh.isPending || credential.disabled || credential.authMethod === 'api_key'}
-              title={credential.authMethod === 'api_key' ? 'API Key 凭据无需刷新 Token' : credential.disabled ? '已禁用的凭据无法刷新 Token' : '强制刷新 Token'}
+              disabled={
+                forceRefresh.isPending ||
+                credential.disabled ||
+                credential.authMethod === 'api_key' ||
+                isPassthrough
+              }
+              title={
+                isPassthrough
+                  ? '透传凭据无需刷新 Token'
+                  : credential.authMethod === 'api_key'
+                    ? 'API Key 凭据无需刷新 Token'
+                    : credential.disabled
+                      ? '已禁用的凭据无法刷新 Token'
+                      : '强制刷新 Token'
+              }
             >
               <RefreshCw className={cn('h-4 w-4', forceRefresh.isPending && 'animate-spin')} />
             </Button>

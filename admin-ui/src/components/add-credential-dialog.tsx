@@ -18,8 +18,10 @@ interface AddCredentialDialogProps {
 }
 
 type AuthMethod = 'social' | 'idc' | 'api_key'
+type CredKind = 'kiro' | 'anthropic' | 'openai'
 
 export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogProps) {
+  const [kind, setKind] = useState<CredKind>('kiro')
   const [refreshToken, setRefreshToken] = useState('')
   const [kiroApiKey, setKiroApiKey] = useState('')
   const [authMethod, setAuthMethod] = useState<AuthMethod>('social')
@@ -33,10 +35,14 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
   const [proxyUsername, setProxyUsername] = useState('')
   const [proxyPassword, setProxyPassword] = useState('')
   const [endpoint, setEndpoint] = useState('')
+  // 透传凭据字段
+  const [baseUrl, setBaseUrl] = useState('')
+  const [upstreamApiKey, setUpstreamApiKey] = useState('')
 
   const { mutate, isPending } = useAddCredential()
 
   const resetForm = () => {
+    setKind('kiro')
     setRefreshToken('')
     setKiroApiKey('')
     setAuthMethod('social')
@@ -50,12 +56,49 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
     setProxyUsername('')
     setProxyPassword('')
     setEndpoint('')
+    setBaseUrl('')
+    setUpstreamApiKey('')
   }
 
+  const isPassthrough = kind === 'anthropic' || kind === 'openai'
   const isApiKey = authMethod === 'api_key'
 
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault()
+
+    // 透传凭据：校验 baseUrl + upstreamApiKey，其余 Kiro 字段忽略
+    if (isPassthrough) {
+      if (!baseUrl.trim()) {
+        toast.error('请输入 Base URL')
+        return
+      }
+      if (!upstreamApiKey.trim()) {
+        toast.error('请输入 API Key')
+        return
+      }
+      mutate(
+        {
+          kind,
+          baseUrl: baseUrl.trim(),
+          upstreamApiKey: upstreamApiKey.trim(),
+          priority: parseInt(priority) || 0,
+          proxyUrl: proxyUrl.trim() || undefined,
+          proxyUsername: proxyUsername.trim() || undefined,
+          proxyPassword: proxyPassword.trim() || undefined,
+        },
+        {
+          onSuccess: (data) => {
+            toast.success(data.message)
+            onOpenChange(false)
+            resetForm()
+          },
+          onError: (error: unknown) => {
+            toast.error(`添加失败: ${extractErrorMessage(error)}`)
+          },
+        }
+      )
+      return
+    }
 
     // 验证必填字段
     if (isApiKey) {
@@ -77,6 +120,7 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
 
     mutate(
       {
+        kind: 'kiro',
         authMethod,
         refreshToken: isApiKey ? undefined : refreshToken.trim(),
         kiroApiKey: isApiKey ? kiroApiKey.trim() : undefined,
@@ -113,7 +157,69 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
 
         <form onSubmit={handleSubmit} className="flex flex-col min-h-0 flex-1">
           <div className="space-y-4 py-4 overflow-y-auto flex-1 pr-1">
-            {/* 认证方式 */}
+            {/* 凭据类型 */}
+            <div className="space-y-2">
+              <label htmlFor="kind" className="text-sm font-medium">
+                凭据类型
+              </label>
+              <select
+                id="kind"
+                value={kind}
+                onChange={(e) => setKind(e.target.value as CredKind)}
+                disabled={isPending}
+                className="flex h-10 w-full rounded-md border border-input bg-background px-3 py-2 text-sm ring-offset-background focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 disabled:cursor-not-allowed disabled:opacity-50"
+              >
+                <option value="kiro">Kiro（默认）</option>
+                <option value="anthropic">Claude 透传（Anthropic /v1/messages）</option>
+                <option value="openai">Codex 透传（OpenAI /v1/responses）</option>
+              </select>
+              {isPassthrough && (
+                <p className="text-xs text-muted-foreground">
+                  透传凭据原样转发到上游 API，与 Kiro 凭据混入同一池并按协议故障转移
+                </p>
+              )}
+            </div>
+
+            {/* 透传凭据字段 */}
+            {isPassthrough && (
+              <>
+                <div className="space-y-2">
+                  <label htmlFor="baseUrl" className="text-sm font-medium">
+                    Base URL <span className="text-red-500">*</span>
+                  </label>
+                  <Input
+                    id="baseUrl"
+                    placeholder={
+                      kind === 'openai'
+                        ? '如 https://api.openai.com'
+                        : '如 https://api.anthropic.com'
+                    }
+                    value={baseUrl}
+                    onChange={(e) => setBaseUrl(e.target.value)}
+                    disabled={isPending}
+                  />
+                  <p className="text-xs text-muted-foreground">
+                    上游 API 地址，自动拼接 /v1/messages 或 /v1/responses 与 /v1/usage
+                  </p>
+                </div>
+                <div className="space-y-2">
+                  <label htmlFor="upstreamApiKey" className="text-sm font-medium">
+                    API Key <span className="text-red-500">*</span>
+                  </label>
+                  <Input
+                    id="upstreamApiKey"
+                    type="password"
+                    placeholder="格式: sk-xxxxxxxx"
+                    value={upstreamApiKey}
+                    onChange={(e) => setUpstreamApiKey(e.target.value)}
+                    disabled={isPending}
+                  />
+                </div>
+              </>
+            )}
+
+            {/* 认证方式（仅 Kiro） */}
+            {!isPassthrough && (
             <div className="space-y-2">
               <label htmlFor="authMethod" className="text-sm font-medium">
                 认证方式
@@ -130,9 +236,10 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
                 <option value="api_key">API Key</option>
               </select>
             </div>
+            )}
 
             {/* Kiro API Key (API Key 模式) */}
-            {isApiKey && (
+            {!isPassthrough && isApiKey && (
               <div className="space-y-2">
                 <label htmlFor="kiroApiKey" className="text-sm font-medium">
                   Kiro API Key <span className="text-red-500">*</span>
@@ -149,7 +256,7 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
             )}
 
             {/* Refresh Token (OAuth 模式) */}
-            {!isApiKey && (
+            {!isPassthrough && !isApiKey && (
               <div className="space-y-2">
                 <label htmlFor="refreshToken" className="text-sm font-medium">
                   Refresh Token <span className="text-red-500">*</span>
@@ -165,7 +272,8 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
               </div>
             )}
 
-            {/* Region 配置 */}
+            {/* Region 配置（仅 Kiro） */}
+            {!isPassthrough && (
             <div className="space-y-2">
               <label className="text-sm font-medium">Region 配置</label>
               <div className="grid grid-cols-2 gap-2">
@@ -192,9 +300,10 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
                 均可留空使用全局配置。Auth Region 用于 Token 刷新，API Region 用于 API 请求
               </p>
             </div>
+            )}
 
             {/* IdC/Builder-ID/IAM 额外字段 */}
-            {authMethod === 'idc' && (
+            {!isPassthrough && authMethod === 'idc' && (
               <>
                 <div className="space-y-2">
                   <label htmlFor="clientId" className="text-sm font-medium">
@@ -243,7 +352,8 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
               </p>
             </div>
 
-            {/* Machine ID */}
+            {/* Machine ID（仅 Kiro） */}
+            {!isPassthrough && (
             <div className="space-y-2">
               <label htmlFor="machineId" className="text-sm font-medium">
                 Machine ID
@@ -259,8 +369,10 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
                 可选；64 位十六进制或 UUID
               </p>
             </div>
+            )}
 
-            {/* 端点 */}
+            {/* 端点（仅 Kiro） */}
+            {!isPassthrough && (
             <div className="space-y-2">
               <label htmlFor="endpoint" className="text-sm font-medium">
                 端点
@@ -276,6 +388,7 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
                 可选。决定该凭据走哪套 Kiro API。留空使用全局 defaultEndpoint
               </p>
             </div>
+            )}
 
             {/* 代理配置 */}
             <div className="space-y-2">

@@ -6,7 +6,6 @@ use std::{
 };
 
 use axum::{
-    Json as JsonExtractor,
     body::Body,
     extract::State,
     http::{StatusCode, header},
@@ -68,6 +67,8 @@ const RESPONSES_PING_INTERVAL: Duration = Duration::from_secs(25);
 struct ResponsesStreamRestarter {
     provider: std::sync::Arc<crate::kiro::provider::KiroProvider>,
     request_body: String,
+    /// 原始入站字节（透传凭据重放使用）
+    raw_body: bytes::Bytes,
     model: String,
     input_tokens: i32,
     thinking_enabled: bool,
@@ -100,13 +101,24 @@ impl ResponsesStreamRestarter {
         self.remaining -= 1;
         match self
             .provider
-            .call_api_stream(&self.request_body, Some(&self.model))
+            .call_api_stream(crate::kiro::provider::UpstreamRequest {
+                kiro_body: &self.request_body,
+                raw_body: &self.raw_body,
+                capability: crate::kiro::model::credentials::Capability::Openai,
+                passthrough_only: false,
+                protocol: crate::kiro::provider::PassthroughProtocol::Openai,
+                model_hint: Some(&self.model),
+            })
             .await
         {
-            Ok((response, cred_id)) => {
-                self.current_credential_id = cred_id as i64;
+            Ok(r) if r.passthrough => {
+                tracing::warn!("Responses 断流重连命中透传凭据，放弃重放");
+                None
+            }
+            Ok(r) => {
+                self.current_credential_id = r.credential_id as i64;
                 crate::metrics::inc_stream_restarted();
-                Some(response)
+                Some(r.response)
             }
             Err(error) => {
                 tracing::error!("Responses 断流重连失败: {error}");
@@ -190,10 +202,22 @@ struct ResponsesSseStreamState<S> {
 }
 
 /// POST /v1/responses
-pub async fn create_response(
-    State(state): State<AppState>,
-    JsonExtractor(payload): JsonExtractor<ResponsesRequest>,
-) -> Response {
+pub async fn create_response(State(state): State<AppState>, raw_body: bytes::Bytes) -> Response {
+    let payload: ResponsesRequest = match serde_json::from_slice(&raw_body) {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::warn!("Responses 请求体解析失败: {}", e);
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(ErrorResponse::new(
+                    "invalid_request_error",
+                    format!("Invalid request body: {e}"),
+                )),
+            )
+                .into_response();
+        }
+    };
+
     tracing::info!(
         model = %payload.model,
         stream = %payload.stream,
@@ -218,6 +242,24 @@ pub async fn create_response(
     let mut anthropic_payload = match responses_to_anthropic(&payload) {
         Ok(p) => p,
         Err(e) => {
+            // Kiro 翻译失败（如透传专用模型名 gpt-5.6-terra 不在 Kiro 表）：
+            // 若池内有可服务的 openai 透传凭据，fallback 到纯透传（原样转发原始字节）。
+            if provider
+                .has_passthrough_credential(crate::kiro::model::credentials::Capability::Openai)
+            {
+                tracing::info!(
+                    model = %payload.model,
+                    "Kiro 翻译失败，fallback 到 openai 透传（原样转发）"
+                );
+                return handle_responses_passthrough_only(
+                    provider,
+                    &raw_body,
+                    &payload.model,
+                    payload.stream,
+                    state.passthrough_retry_after,
+                )
+                .await;
+            }
             let (error_type, message) = conversion_error_parts(&e);
             return (
                 StatusCode::BAD_REQUEST,
@@ -232,6 +274,24 @@ pub async fn create_response(
     let conversion_result = match crate::anthropic::convert_responses_request(&anthropic_payload) {
         Ok(r) => r,
         Err(e) => {
+            // Kiro 翻译失败（如透传专用模型名不在 Kiro 表）：若池内有可服务的 openai 透传凭据，
+            // fallback 到纯透传（原样转发原始字节，不做翻译）。
+            if provider
+                .has_passthrough_credential(crate::kiro::model::credentials::Capability::Openai)
+            {
+                tracing::info!(
+                    model = %payload.model,
+                    "Kiro 翻译失败，fallback 到 openai 透传（原样转发）"
+                );
+                return handle_responses_passthrough_only(
+                    provider,
+                    &raw_body,
+                    &payload.model,
+                    payload.stream,
+                    state.passthrough_retry_after,
+                )
+                .await;
+            }
             let (error_type, message) = conversion_error_parts(&e);
             return (
                 StatusCode::BAD_REQUEST,
@@ -283,6 +343,7 @@ pub async fn create_response(
         handle_responses_stream(
             provider,
             &request_body,
+            &raw_body,
             &payload.model,
             input_tokens,
             thinking_enabled,
@@ -295,6 +356,7 @@ pub async fn create_response(
         handle_responses_non_stream(
             provider,
             &request_body,
+            &raw_body,
             &payload.model,
             input_tokens,
             thinking_enabled,
@@ -306,10 +368,47 @@ pub async fn create_response(
     }
 }
 
+/// 纯透传 Responses 请求（Kiro 翻译失败的 fallback）
+///
+/// 仅选 openai 透传凭据（`passthrough_only`），原样转发原始字节，不做任何翻译/解码。
+/// 流式与非流式都走同一条原样转发路径。
+async fn handle_responses_passthrough_only(
+    provider: std::sync::Arc<crate::kiro::provider::KiroProvider>,
+    raw_body: &bytes::Bytes,
+    model: &str,
+    stream: bool,
+    passthrough_retry_after: bool,
+) -> Response {
+    let req = crate::kiro::provider::UpstreamRequest {
+        kiro_body: "",
+        raw_body,
+        capability: crate::kiro::model::credentials::Capability::Openai,
+        passthrough_only: true,
+        protocol: crate::kiro::provider::PassthroughProtocol::Openai,
+        model_hint: Some(model),
+    };
+    let result = if stream {
+        provider.call_api_stream(req).await
+    } else {
+        provider.call_api(req).await
+    };
+    let upstream = match result {
+        Ok(r) => r,
+        Err(e) => return map_provider_error(e, passthrough_retry_after),
+    };
+    crate::anthropic::passthrough_response(
+        upstream.response,
+        model,
+        upstream.credential_id,
+        crate::common::passthrough_stats::PassthroughKind::Openai,
+    )
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn handle_responses_stream(
     provider: std::sync::Arc<crate::kiro::provider::KiroProvider>,
     request_body: &str,
+    raw_body: &bytes::Bytes,
     model: &str,
     input_tokens: i32,
     thinking_enabled: bool,
@@ -320,6 +419,7 @@ async fn handle_responses_stream(
     let mut restarter = ResponsesStreamRestarter {
         provider: provider.clone(),
         request_body: request_body.to_string(),
+        raw_body: raw_body.clone(),
         model: model.to_string(),
         input_tokens,
         thinking_enabled,
@@ -328,17 +428,35 @@ async fn handle_responses_stream(
         remaining: MAX_RESPONSES_STREAM_RESTARTS,
         current_credential_id: -1,
     };
-    let (response, cred_id) = match provider
-        .call_api_stream(&restarter.request_body, Some(model))
+    let upstream = match provider
+        .call_api_stream(crate::kiro::provider::UpstreamRequest {
+            kiro_body: &restarter.request_body,
+            raw_body,
+            capability: crate::kiro::model::credentials::Capability::Openai,
+            passthrough_only: false,
+            protocol: crate::kiro::provider::PassthroughProtocol::Openai,
+            model_hint: Some(model),
+        })
         .await
     {
-        Ok(pair) => pair,
+        Ok(r) => r,
         Err(e) => return map_provider_error(e, passthrough_retry_after),
     };
-    restarter.current_credential_id = cred_id as i64;
+
+    // 透传凭据：响应已是标准 OpenAI Responses SSE，原样转发
+    if upstream.passthrough {
+        return crate::anthropic::passthrough_response(
+            upstream.response,
+            model,
+            upstream.credential_id,
+            crate::common::passthrough_stats::PassthroughKind::Openai,
+        );
+    }
+
+    restarter.current_credential_id = upstream.credential_id as i64;
 
     let ctx = restarter.build_ctx();
-    let stream = create_responses_sse_stream(response, ctx, restarter);
+    let stream = create_responses_sse_stream(upstream.response, ctx, restarter);
 
     Response::builder()
         .status(StatusCode::OK)
@@ -558,6 +676,7 @@ fn create_responses_sse_stream(
 async fn handle_responses_non_stream(
     provider: std::sync::Arc<crate::kiro::provider::KiroProvider>,
     request_body: &str,
+    raw_body: &bytes::Bytes,
     model: &str,
     input_tokens: i32,
     thinking_enabled: bool,
@@ -565,10 +684,33 @@ async fn handle_responses_non_stream(
     passthrough_retry_after: bool,
     code_mode: bool,
 ) -> Response {
-    let (response, credential_id) = match provider.call_api(request_body, Some(model)).await {
-        Ok(pair) => pair,
+    let upstream = match provider
+        .call_api(crate::kiro::provider::UpstreamRequest {
+            kiro_body: request_body,
+            raw_body,
+            capability: crate::kiro::model::credentials::Capability::Openai,
+            passthrough_only: false,
+            protocol: crate::kiro::provider::PassthroughProtocol::Openai,
+            model_hint: Some(model),
+        })
+        .await
+    {
+        Ok(r) => r,
         Err(e) => return map_provider_error(e, passthrough_retry_after),
     };
+
+    // 透传凭据：响应为标准 OpenAI Responses JSON/SSE，原样转发
+    if upstream.passthrough {
+        return crate::anthropic::passthrough_response(
+            upstream.response,
+            model,
+            upstream.credential_id,
+            crate::common::passthrough_stats::PassthroughKind::Openai,
+        );
+    }
+
+    let response = upstream.response;
+    let credential_id = upstream.credential_id;
 
     let body_bytes = match response.bytes().await {
         Ok(b) => b,

@@ -19,7 +19,7 @@ use std::time::{Duration as StdDuration, Instant};
 
 use crate::http_client::{ProxyConfig, build_client};
 use crate::kiro::machine_id;
-use crate::kiro::model::credentials::KiroCredentials;
+use crate::kiro::model::credentials::{Capability, KiroCredentials};
 use crate::kiro::model::token_refresh::{
     IdcRefreshRequest, IdcRefreshResponse, RefreshRequest, RefreshResponse,
 };
@@ -801,6 +801,12 @@ pub struct CredentialEntrySnapshot {
     /// 端点名称（未显式配置时返回 None，由 Admin 层回退到默认值）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub endpoint: Option<String>,
+    /// 凭据类型（kiro / anthropic / openai；透传凭据用于前端打标签）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
+    /// 透传上游 base URL（仅透传凭据，用于前端展示）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub base_url: Option<String>,
     /// 凭据级 RPM 实时状态（各类别窗口占用 + 生效上限）
     pub rpm: RpmStatus,
 }
@@ -1032,7 +1038,12 @@ impl MultiTokenManager {
     ///
     /// # 参数
     /// - `model`: 可选的模型名称，用于过滤支持该模型的凭据（如 opus 模型需要付费订阅）
-    fn select_next_credential(&self, model: Option<&str>) -> Option<(u64, KiroCredentials)> {
+    fn select_next_credential(
+        &self,
+        model: Option<&str>,
+        cap: Capability,
+        passthrough_only: bool,
+    ) -> Option<(u64, KiroCredentials)> {
         let mut entries = self.entries.lock();
 
         // 检查是否是 opus 模型
@@ -1050,9 +1061,17 @@ impl MultiTokenManager {
             }
         }
 
-        // 基础可用过滤（禁用状态 / opus 订阅）
+        // 基础可用过滤（禁用状态 / 入站协议能力 / opus 订阅 / 仅透传）
         let base_available = |e: &&CredentialEntry| -> bool {
             if e.disabled {
+                return false;
+            }
+            // 仅透传模式（Kiro 翻译失败时的 fallback）：排除 Kiro 凭据
+            if passthrough_only && !e.credentials.is_passthrough() {
+                return false;
+            }
+            // 凭据必须能服务当前入站协议（透传凭据按 kind 隔离）
+            if !e.credentials.serves(cap) {
                 return false;
             }
             // 如果是 opus 模型，需要检查订阅等级
@@ -1112,28 +1131,49 @@ impl MultiTokenManager {
     /// 仅基于「禁用状态 / opus 订阅」做基础可用过滤，与 `select_next_credential`
     /// 的过滤口径保持一致。无任何可用凭据时返回 None，把"全灭"交给后续报错逻辑处理。
     /// 统计基础可用凭据数（未禁用且满足 opus 订阅要求），与 `select_next_credential` 口径一致。
-    fn count_base_available_credentials(&self, model: Option<&str>) -> usize {
+    fn count_base_available_credentials(
+        &self,
+        model: Option<&str>,
+        cap: Capability,
+        passthrough_only: bool,
+    ) -> usize {
         let is_opus = model
             .map(|m| m.to_lowercase().contains("opus"))
             .unwrap_or(false);
         self.entries
             .lock()
             .iter()
-            .filter(|e| !e.disabled && !(is_opus && !e.credentials.supports_opus()))
+            .filter(|e| {
+                !e.disabled
+                    && (!passthrough_only || e.credentials.is_passthrough())
+                    && e.credentials.serves(cap)
+                    && !(is_opus && !e.credentials.supports_opus())
+            })
             .count()
     }
 
     /// 所有基础可用凭据均已达到 RPM 上限时，构造本地 429 错误。
-    fn credential_rpm_exceeded_error(&self, model: Option<&str>) -> CredentialRpmExceeded {
+    fn credential_rpm_exceeded_error(
+        &self,
+        model: Option<&str>,
+        cap: Capability,
+        passthrough_only: bool,
+    ) -> CredentialRpmExceeded {
         let class = ModelClass::from_model(model);
         let limit = class.effective_rpm(&self.config());
         let retry_after = self
-            .rpm_wait_for_slot(model, Instant::now())
+            .rpm_wait_for_slot(model, cap, passthrough_only, Instant::now())
             .unwrap_or_else(|| StdDuration::from_secs(60));
         CredentialRpmExceeded { limit, retry_after }
     }
 
-    fn rpm_wait_for_slot(&self, model: Option<&str>, now: Instant) -> Option<StdDuration> {
+    fn rpm_wait_for_slot(
+        &self,
+        model: Option<&str>,
+        cap: Capability,
+        passthrough_only: bool,
+        now: Instant,
+    ) -> Option<StdDuration> {
         let class = ModelClass::from_model(model);
         let rpm = class.effective_rpm(&self.config());
         if rpm == 0 {
@@ -1149,7 +1189,11 @@ impl MultiTokenManager {
         let mut any_available = false;
 
         for e in entries.iter_mut() {
-            if e.disabled || (is_opus && !e.credentials.supports_opus()) {
+            if e.disabled
+                || (passthrough_only && !e.credentials.is_passthrough())
+                || !e.credentials.serves(cap)
+                || (is_opus && !e.credentials.supports_opus())
+            {
                 continue;
             }
             any_available = true;
@@ -1204,10 +1248,14 @@ impl MultiTokenManager {
     ///
     /// # 参数
     /// - `model`: 可选的模型名称，用于过滤支持该模型的凭据（如 opus 模型需要付费订阅）
+    /// - `cap`: 入站协议能力，用于按 kind 隔离透传凭据
+    /// - `passthrough_only`: 仅选透传凭据（Kiro 翻译失败时的 fallback，排除 Kiro 凭据）
     /// - `rpm_mode`: RPM 占位策略；provider 重试同一凭据时传 `Reuse(id)` 避免重复占槽
     pub async fn acquire_context(
         &self,
         model: Option<&str>,
+        cap: Capability,
+        passthrough_only: bool,
         rpm_mode: RpmChargeMode,
     ) -> anyhow::Result<CallContext> {
         let total = self.total_count();
@@ -1230,7 +1278,7 @@ impl MultiTokenManager {
             let max_wait_ms = self.config().credential_rpm_max_wait_ms;
             if max_wait_ms > 0 && !matches!(rpm_mode, RpmChargeMode::Reuse(_)) {
                 let now = Instant::now();
-                if let Some(wait) = self.rpm_wait_for_slot(model, now) {
+                if let Some(wait) = self.rpm_wait_for_slot(model, cap, passthrough_only, now) {
                     let wait = wait.min(StdDuration::from_millis(max_wait_ms));
                     if !wait.is_zero() {
                         tracing::info!(
@@ -1269,6 +1317,11 @@ impl MultiTokenManager {
                     entries
                         .iter_mut()
                         .find(|e| e.id == current_id && !e.disabled)
+                        // 当前凭据须能服务本次协议，且满足仅透传约束；否则触发下方分流选择
+                        .filter(|e| {
+                            e.credentials.serves(cap)
+                                && (!passthrough_only || e.credentials.is_passthrough())
+                        })
                         // 当前凭据达到该模型类别 RPM 上限时返回 None，触发下方分流选择
                         .and_then(|e| {
                             if e.is_rpm_exceeded(class, rpm, now) {
@@ -1285,7 +1338,7 @@ impl MultiTokenManager {
                     hit
                 } else {
                     // 当前凭据不可用或 balanced 模式，根据负载均衡策略选择
-                    let mut best = self.select_next_credential(model);
+                    let mut best = self.select_next_credential(model, cap, passthrough_only);
 
                     // 没有可用凭据：如果是"自动禁用导致全灭"，做一次类似重启的自愈
                     if best.is_none() {
@@ -1304,7 +1357,7 @@ impl MultiTokenManager {
                                 }
                             }
                             drop(entries);
-                            best = self.select_next_credential(model);
+                            best = self.select_next_credential(model, cap, passthrough_only);
                         }
                     }
 
@@ -1313,10 +1366,14 @@ impl MultiTokenManager {
                         let mut current_id = self.current_id.lock();
                         *current_id = new_id;
                         (new_id, new_creds)
-                    } else if self.count_base_available_credentials(model) > 0 {
+                    } else if self.count_base_available_credentials(model, cap, passthrough_only)
+                        > 0
+                    {
                         let class = ModelClass::from_model(model);
                         if class.effective_rpm(&self.config()) > 0 {
-                            return Err(self.credential_rpm_exceeded_error(model).into());
+                            return Err(self
+                                .credential_rpm_exceeded_error(model, cap, passthrough_only)
+                                .into());
                         }
                         let entries = self.entries.lock();
                         let available = entries.iter().filter(|e| !e.disabled).count();
@@ -1343,7 +1400,9 @@ impl MultiTokenManager {
                         || matches!(rpm_mode, RpmChargeMode::Reuse(r) if r == id);
                     if !skip_charge {
                         if entry.is_rpm_exceeded(class, rpm_limit, now) {
-                            return Err(self.credential_rpm_exceeded_error(model).into());
+                            return Err(self
+                                .credential_rpm_exceeded_error(model, cap, passthrough_only)
+                                .into());
                         }
                         entry.record_request(class, now);
                         rpm_charged_in_call = Some(id);
@@ -1413,6 +1472,16 @@ impl MultiTokenManager {
         id: u64,
         credentials: &KiroCredentials,
     ) -> anyhow::Result<CallContext> {
+        // 透传凭据无 Kiro OAuth/刷新概念，token 由 provider 透传分支从 upstream_api_key 取；
+        // 这里直接返回上下文（token 用 upstream_api_key 占位），不触发刷新。
+        if credentials.is_passthrough() {
+            return Ok(CallContext {
+                id,
+                credentials: credentials.clone(),
+                token: credentials.upstream_api_key.clone().unwrap_or_default(),
+            });
+        }
+
         // API Key 凭据直接使用 kiro_api_key 作为 Bearer Token，无需刷新
         if credentials.is_api_key_credential() {
             let token = credentials
@@ -2089,6 +2158,8 @@ impl MultiTokenManager {
                         .to_string()
                     }),
                     endpoint: e.credentials.endpoint.clone(),
+                    kind: e.credentials.kind.clone(),
+                    base_url: e.credentials.base_url.clone(),
                     rpm,
                 }
             })
@@ -2298,6 +2369,78 @@ impl MultiTokenManager {
         Ok(usage_limits)
     }
 
+    /// 是否存在未禁用的、能服务指定协议的透传凭据
+    ///
+    /// 用于 handler 在 Kiro 翻译失败（如透传专用模型名不在 Kiro 表）时判断能否 fallback 到透传。
+    pub fn has_passthrough_credential(&self, cap: Capability) -> bool {
+        self.entries
+            .lock()
+            .iter()
+            .any(|e| !e.disabled && e.credentials.is_passthrough() && e.credentials.serves(cap))
+    }
+
+    /// 判断指定凭据是否为透传凭据（Admin API 余额分派用）
+    pub fn is_passthrough_credential(&self, id: u64) -> bool {
+        self.entries
+            .lock()
+            .iter()
+            .find(|e| e.id == id)
+            .map(|e| e.credentials.is_passthrough())
+            .unwrap_or(false)
+    }
+
+    /// 获取透传凭据的余额（Admin API）
+    ///
+    /// 请求上游的 `GET {base_url}/v1/usage`，
+    /// 用透传凭据自己的 `upstream_api_key` 作 Bearer。单位为 USD。
+    pub async fn get_passthrough_usage_for(
+        &self,
+        id: u64,
+    ) -> anyhow::Result<crate::kiro::model::usage_limits::PassthroughUsageResponse> {
+        let credentials = {
+            let entries = self.entries.lock();
+            entries
+                .iter()
+                .find(|e| e.id == id)
+                .map(|e| e.credentials.clone())
+                .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?
+        };
+
+        if !credentials.is_passthrough() {
+            anyhow::bail!("凭据 #{} 非透传凭据，不支持 /v1/usage 余额查询", id);
+        }
+
+        let base_url = credentials
+            .base_url
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("透传凭据缺少 baseUrl"))?;
+        let api_key = credentials
+            .upstream_api_key
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("透传凭据缺少 upstreamApiKey"))?;
+
+        let url = format!("{}/v1/usage", base_url.trim_end_matches('/'));
+        let effective_proxy = credentials.effective_proxy(self.proxy.as_ref());
+        let client = build_client(effective_proxy.as_ref(), 30, self.config().tls_backend)?;
+
+        let response = client
+            .get(&url)
+            .header("Authorization", format!("Bearer {}", api_key))
+            .header("Connection", "close")
+            .send()
+            .await?;
+
+        let status = response.status();
+        if !status.is_success() {
+            let body = response.text().await.unwrap_or_default();
+            anyhow::bail!("获取透传余额失败: {} {}", status, body);
+        }
+
+        let data: crate::kiro::model::usage_limits::PassthroughUsageResponse =
+            response.json().await?;
+        Ok(data)
+    }
+
     /// 添加新凭据（Admin API）
     ///
     /// # 流程
@@ -2312,6 +2455,11 @@ impl MultiTokenManager {
     /// - `Ok(u64)` - 新凭据 ID
     /// - `Err(_)` - 验证失败或添加失败
     pub async fn add_credential(&self, new_cred: KiroCredentials) -> anyhow::Result<u64> {
+        // 透传凭据：无 Kiro OAuth/刷新概念，独立校验（baseUrl + upstreamApiKey）与去重（按 upstreamApiKey）
+        if new_cred.is_passthrough() {
+            return self.add_passthrough_credential(new_cred).await;
+        }
+
         // 1. 基本验证
         if new_cred.is_api_key_credential() {
             let api_key = new_cred
@@ -2425,6 +2573,64 @@ impl MultiTokenManager {
         self.persist_credentials()?;
 
         tracing::info!("成功添加凭据 #{}", new_id);
+        Ok(new_id)
+    }
+
+    /// 添加透传凭据（Admin API）
+    ///
+    /// 透传凭据无 Kiro OAuth/刷新概念：
+    /// - 校验 baseUrl + upstreamApiKey 非空
+    /// - 去重按 upstreamApiKey 哈希
+    /// - 不做 token 刷新验证
+    async fn add_passthrough_credential(&self, new_cred: KiroCredentials) -> anyhow::Result<u64> {
+        let base_url = new_cred.base_url.as_deref().unwrap_or("");
+        let api_key = new_cred.upstream_api_key.as_deref().unwrap_or("");
+        if base_url.is_empty() || api_key.is_empty() {
+            anyhow::bail!("透传凭据必须提供 baseUrl 和 upstreamApiKey");
+        }
+
+        // 去重：同一 upstreamApiKey 视为重复
+        let new_hash = sha256_hex(api_key);
+        {
+            let entries = self.entries.lock();
+            let dup = entries.iter().any(|e| {
+                e.credentials
+                    .upstream_api_key
+                    .as_deref()
+                    .map(sha256_hex)
+                    .as_deref()
+                    == Some(new_hash.as_str())
+            });
+            if dup {
+                anyhow::bail!("凭据已存在（upstreamApiKey 重复）");
+            }
+        }
+
+        let new_id = {
+            let entries = self.entries.lock();
+            entries.iter().map(|e| e.id).max().unwrap_or(0) + 1
+        };
+
+        let mut cred = new_cred;
+        cred.id = Some(new_id);
+
+        {
+            let mut entries = self.entries.lock();
+            entries.push(CredentialEntry {
+                id: new_id,
+                credentials: cred,
+                failure_count: 0,
+                refresh_failure_count: 0,
+                disabled: false,
+                disabled_reason: None,
+                success_count: 0,
+                last_used_at: None,
+                request_times: ModelRequestTimes::default(),
+            });
+        }
+
+        self.persist_credentials()?;
+        tracing::info!("成功添加透传凭据 #{}", new_id);
         Ok(new_id)
     }
 
@@ -2863,7 +3069,12 @@ mod tests {
         // 凭据 id 按输入顺序分配为 1(prio2)、2(prio0)、3(prio1)
         // 排序后顺序应为 id=2(prio0) → id=3(prio1) → id=1(prio2)
         let picks: Vec<u64> = (0..6)
-            .map(|_| manager.select_next_credential(None).unwrap().0)
+            .map(|_| {
+                manager
+                    .select_next_credential(None, Capability::Anthropic, false)
+                    .unwrap()
+                    .0
+            })
             .collect();
 
         assert_eq!(
@@ -2893,7 +3104,12 @@ mod tests {
         }
 
         let picks: Vec<u64> = (0..4)
-            .map(|_| manager.select_next_credential(None).unwrap().0)
+            .map(|_| {
+                manager
+                    .select_next_credential(None, Capability::Anthropic, false)
+                    .unwrap()
+                    .0
+            })
             .collect();
         // 严格交替，不受 success_count 影响
         assert_eq!(picks, vec![1, 2, 1, 2]);
@@ -2920,7 +3136,12 @@ mod tests {
         }
 
         let picks: Vec<u64> = (0..4)
-            .map(|_| manager.select_next_credential(None).unwrap().0)
+            .map(|_| {
+                manager
+                    .select_next_credential(None, Capability::Anthropic, false)
+                    .unwrap()
+                    .0
+            })
             .collect();
         assert!(
             picks.iter().all(|&id| id == 1 || id == 3),
@@ -3127,7 +3348,7 @@ mod tests {
 
         // 应触发自愈：重置失败计数并重新启用，避免必须重启进程
         let ctx = manager
-            .acquire_context(None, RpmChargeMode::Charge)
+            .acquire_context(None, Capability::Anthropic, false, RpmChargeMode::Charge)
             .await
             .unwrap();
         assert!(ctx.token == "t1" || ctx.token == "t2");
@@ -3153,7 +3374,7 @@ mod tests {
             MultiTokenManager::new(config, vec![bad_cred, good_cred], None, None, false).unwrap();
 
         let ctx = manager
-            .acquire_context(None, RpmChargeMode::Charge)
+            .acquire_context(None, Capability::Anthropic, false, RpmChargeMode::Charge)
             .await
             .unwrap();
         assert_eq!(ctx.id, 2);
@@ -3201,7 +3422,7 @@ mod tests {
         assert_eq!(manager.available_count(), 0);
 
         let err = manager
-            .acquire_context(None, RpmChargeMode::Charge)
+            .acquire_context(None, Capability::Anthropic, false, RpmChargeMode::Charge)
             .await
             .err()
             .unwrap()
@@ -3246,7 +3467,7 @@ mod tests {
         assert_eq!(manager.available_count(), 0);
 
         let err = manager
-            .acquire_context(None, RpmChargeMode::Charge)
+            .acquire_context(None, Capability::Anthropic, false, RpmChargeMode::Charge)
             .await
             .err()
             .unwrap()
@@ -3431,6 +3652,78 @@ mod tests {
         MultiTokenManager::new(config, creds, None, None, false).unwrap()
     }
 
+    /// 构造混池：#1 Kiro（social）、#2 anthropic 透传、#3 openai 透传
+    fn make_mixed_pool() -> MultiTokenManager {
+        let config = Config::default();
+        let kiro = {
+            let mut c = KiroCredentials::default();
+            c.priority = 0;
+            c.access_token = Some("t-kiro".to_string());
+            c.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
+            c
+        };
+        let anthropic = {
+            let mut c = KiroCredentials::default();
+            c.priority = 1;
+            c.kind = Some("anthropic".to_string());
+            c.base_url = Some("https://example.com".to_string());
+            c.upstream_api_key = Some("sk-a".to_string());
+            c
+        };
+        let openai = {
+            let mut c = KiroCredentials::default();
+            c.priority = 2;
+            c.kind = Some("openai".to_string());
+            c.base_url = Some("https://example.com".to_string());
+            c.upstream_api_key = Some("sk-o".to_string());
+            c
+        };
+        MultiTokenManager::new(config, vec![kiro, anthropic, openai], None, None, true).unwrap()
+    }
+
+    #[test]
+    fn test_capability_isolation_in_selection() {
+        let manager = make_mixed_pool();
+
+        // Anthropic 请求：可选 Kiro(#1) 或 anthropic 透传(#2)，priority 模式选 #1
+        let hit = manager
+            .select_next_credential(None, Capability::Anthropic, false)
+            .unwrap();
+        assert_eq!(hit.0, 1);
+
+        // 仅透传 + Anthropic：只能选 anthropic 透传(#2)
+        let hit = manager
+            .select_next_credential(None, Capability::Anthropic, true)
+            .unwrap();
+        assert_eq!(hit.0, 2);
+
+        // 仅透传 + Openai：只能选 openai 透传(#3)
+        let hit = manager
+            .select_next_credential(None, Capability::Openai, true)
+            .unwrap();
+        assert_eq!(hit.0, 3);
+
+        // KiroOnly：只能选 Kiro(#1)
+        let hit = manager
+            .select_next_credential(None, Capability::KiroOnly, false)
+            .unwrap();
+        assert_eq!(hit.0, 1);
+    }
+
+    #[test]
+    fn test_has_passthrough_credential() {
+        let manager = make_mixed_pool();
+        assert!(manager.has_passthrough_credential(Capability::Anthropic));
+        assert!(manager.has_passthrough_credential(Capability::Openai));
+        // KiroOnly 无透传凭据服务
+        assert!(!manager.has_passthrough_credential(Capability::KiroOnly));
+
+        // 纯 Kiro 池：无任何透传凭据
+        let kiro_only = make_manager_with_rpm(2, 0, 0);
+        assert!(!kiro_only.has_passthrough_credential(Capability::Anthropic));
+        assert!(!kiro_only.has_passthrough_credential(Capability::Openai));
+    }
+
     #[test]
     fn test_select_next_credential_returns_none_when_all_rpm_capped() {
         let manager = make_manager_with_rpm(1, 2, 0);
@@ -3441,7 +3734,11 @@ mod tests {
                 entries[0].record_request(ModelClass::Other, now);
             }
         }
-        assert!(manager.select_next_credential(None).is_none());
+        assert!(
+            manager
+                .select_next_credential(None, Capability::Anthropic, false)
+                .is_none()
+        );
     }
 
     #[tokio::test]
@@ -3452,7 +3749,10 @@ mod tests {
             let mut entries = manager.entries.lock();
             entries[0].record_request(ModelClass::Other, now);
         }
-        match manager.acquire_context(None, RpmChargeMode::Charge).await {
+        match manager
+            .acquire_context(None, Capability::Anthropic, false, RpmChargeMode::Charge)
+            .await
+        {
             Err(e) => assert!(e.downcast_ref::<CredentialRpmExceeded>().is_some()),
             Ok(_) => panic!("expected CredentialRpmExceeded"),
         }
@@ -3462,7 +3762,7 @@ mod tests {
     async fn test_acquire_context_allows_request_under_rpm_limit() {
         let manager = make_manager_with_rpm(1, 2, 0);
         manager
-            .acquire_context(None, RpmChargeMode::Charge)
+            .acquire_context(None, Capability::Anthropic, false, RpmChargeMode::Charge)
             .await
             .unwrap();
     }
@@ -3471,16 +3771,24 @@ mod tests {
     async fn test_acquire_context_reuse_skips_rpm_charge_on_retry() {
         let manager = make_manager_with_rpm(1, 1, 0);
         let ctx = manager
-            .acquire_context(None, RpmChargeMode::Charge)
+            .acquire_context(None, Capability::Anthropic, false, RpmChargeMode::Charge)
             .await
             .unwrap();
         // 同一逻辑请求重试：Reuse 不再占槽，窗口仍有余量
         manager
-            .acquire_context(None, RpmChargeMode::Reuse(ctx.id))
+            .acquire_context(
+                None,
+                Capability::Anthropic,
+                false,
+                RpmChargeMode::Reuse(ctx.id),
+            )
             .await
             .unwrap();
         // 新请求再次 Charge 应触发 RPM 上限
-        match manager.acquire_context(None, RpmChargeMode::Charge).await {
+        match manager
+            .acquire_context(None, Capability::Anthropic, false, RpmChargeMode::Charge)
+            .await
+        {
             Err(e) => assert!(e.downcast_ref::<CredentialRpmExceeded>().is_some()),
             Ok(_) => panic!("expected CredentialRpmExceeded"),
         }
@@ -3490,7 +3798,7 @@ mod tests {
     async fn test_acquire_context_reuse_failover_charges_new_credential() {
         let manager = make_manager_with_rpm(2, 1, 0);
         let ctx = manager
-            .acquire_context(None, RpmChargeMode::Charge)
+            .acquire_context(None, Capability::Anthropic, false, RpmChargeMode::Charge)
             .await
             .unwrap();
         // 禁用首张凭据，Reuse 模式下应切换到第二张并正常占位
@@ -3501,7 +3809,12 @@ mod tests {
             }
         }
         manager
-            .acquire_context(None, RpmChargeMode::Reuse(ctx.id))
+            .acquire_context(
+                None,
+                Capability::Anthropic,
+                false,
+                RpmChargeMode::Reuse(ctx.id),
+            )
             .await
             .unwrap();
     }
@@ -3510,7 +3823,10 @@ mod tests {
     fn test_rpm_wait_for_slot_disabled_when_rpm_zero() {
         // rpm = 0 表示不限制，永远不应等待
         let manager = make_manager_with_rpm(1, 0, 3000);
-        assert_eq!(manager.rpm_wait_for_slot(None, Instant::now()), None);
+        assert_eq!(
+            manager.rpm_wait_for_slot(None, Capability::Anthropic, false, Instant::now()),
+            None
+        );
     }
 
     #[test]
@@ -3524,7 +3840,10 @@ mod tests {
                 entries[0].record_request(ModelClass::Other, now);
             }
         }
-        assert_eq!(manager.rpm_wait_for_slot(None, now), None);
+        assert_eq!(
+            manager.rpm_wait_for_slot(None, Capability::Anthropic, false, now),
+            None
+        );
     }
 
     #[test]
@@ -3538,7 +3857,7 @@ mod tests {
                 entries[0].record_request(ModelClass::Other, now);
             }
         }
-        let wait = manager.rpm_wait_for_slot(None, now);
+        let wait = manager.rpm_wait_for_slot(None, Capability::Anthropic, false, now);
         assert!(wait.is_some(), "单凭据打满时应返回等待时长");
         let wait = wait.unwrap();
         assert!(
@@ -3560,7 +3879,10 @@ mod tests {
             }
             // entries[1] 留空
         }
-        assert_eq!(manager.rpm_wait_for_slot(None, now), None);
+        assert_eq!(
+            manager.rpm_wait_for_slot(None, Capability::Anthropic, false, now),
+            None
+        );
     }
 
     #[test]
@@ -3577,7 +3899,9 @@ mod tests {
             }
         }
         assert!(
-            manager.rpm_wait_for_slot(None, now).is_some(),
+            manager
+                .rpm_wait_for_slot(None, Capability::Anthropic, false, now)
+                .is_some(),
             "所有凭据打满时应返回等待时长"
         );
     }
@@ -3594,7 +3918,10 @@ mod tests {
             }
             entries[0].disabled = true;
         }
-        assert_eq!(manager.rpm_wait_for_slot(None, now), None);
+        assert_eq!(
+            manager.rpm_wait_for_slot(None, Capability::Anthropic, false, now),
+            None
+        );
     }
 
     #[test]
@@ -3611,11 +3938,14 @@ mod tests {
         // Sonnet 打满 → 需要等待
         assert!(
             manager
-                .rpm_wait_for_slot(Some("claude-sonnet-4"), now)
+                .rpm_wait_for_slot(Some("claude-sonnet-4"), Capability::Anthropic, false, now)
                 .is_some()
         );
         // Opus 窗口为空 → 无需等待
-        assert_eq!(manager.rpm_wait_for_slot(Some("claude-opus-4"), now), None);
+        assert_eq!(
+            manager.rpm_wait_for_slot(Some("claude-opus-4"), Capability::Anthropic, false, now),
+            None
+        );
     }
 
     #[test]

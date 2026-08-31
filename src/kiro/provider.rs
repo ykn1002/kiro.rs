@@ -15,10 +15,68 @@ use tokio::time::sleep;
 use crate::http_client::{ProxyConfig, build_client};
 use crate::kiro::endpoint::{KiroEndpoint, RequestContext};
 use crate::kiro::machine_id;
-use crate::kiro::model::credentials::KiroCredentials;
+use crate::kiro::model::credentials::{Capability, KiroCredentials};
 use crate::kiro::token_manager::{CredentialRpmExceeded, MultiTokenManager, RpmChargeMode};
 use crate::model::config::TlsBackend;
 use parking_lot::Mutex;
+
+/// 透传上游额度耗尽的响应标志（部分上游返回 `403 + INSUFFICIENT_BALANCE`）
+const PASSTHROUGH_QUOTA_EXHAUSTED_MARKER: &str = "INSUFFICIENT_BALANCE";
+
+/// 透传请求的入站协议
+///
+/// 决定 body 语义、目标路径（`/v1/messages` vs `/v1/responses`）和凭据选择能力。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PassthroughProtocol {
+    /// Anthropic `/v1/messages`
+    Anthropic,
+    /// OpenAI `/v1/responses`
+    Openai,
+}
+
+impl PassthroughProtocol {
+    /// 透传时拼接到 base_url 后的路径
+    fn path(&self) -> &'static str {
+        match self {
+            PassthroughProtocol::Anthropic => "/v1/messages",
+            PassthroughProtocol::Openai => "/v1/responses",
+        }
+    }
+}
+
+/// 一次上游请求的输入
+///
+/// 同时携带两份 body：选中 Kiro 凭据时用翻译后的 `kiro_body`，选中透传凭据时
+/// 用原始入站字节 `raw_body`（不经翻译，原样转发给上游）。
+pub struct UpstreamRequest<'a> {
+    /// 翻译后的 Kiro 请求体（Kiro 凭据使用）
+    pub kiro_body: &'a str,
+    /// 原始入站字节（透传凭据使用）
+    pub raw_body: &'a bytes::Bytes,
+    /// 凭据选择能力（决定哪些凭据可参与本次请求）
+    ///
+    /// - `Anthropic`：可落到 Kiro 或 anthropic 透传
+    /// - `Openai`：可落到 Kiro 或 openai 透传
+    /// - `KiroOnly`：仅 Kiro（Chat Completions 等无对应透传协议的入站）
+    pub capability: Capability,
+    /// 仅透传：Kiro 翻译失败（模型名不在 Kiro 表）时的 fallback，排除 Kiro 凭据。
+    /// 此时 `kiro_body` 通常为占位空串，只有透传凭据能被选中。
+    pub passthrough_only: bool,
+    /// 透传路径协议（仅当选中透传凭据时使用）
+    pub protocol: PassthroughProtocol,
+    /// 模型名提示（用于 RPM 凭据选择）
+    pub model_hint: Option<&'a str>,
+}
+
+/// 一次上游请求的成功结果
+pub struct UpstreamResponse {
+    /// 上游 HTTP 响应
+    pub response: reqwest::Response,
+    /// 最终成功的凭据 id（供监控按凭据统计）
+    pub credential_id: u64,
+    /// 是否为透传凭据（true 时响应为标准协议 SSE，需原样转发，不做 Kiro 解码）
+    pub passthrough: bool,
+}
 
 /// 上游 API 返回的 HTTP 错误，携带原始状态码以便上层按需透传给客户端。
 ///
@@ -138,6 +196,34 @@ impl KiroProvider {
         Ok(client)
     }
 
+    /// 构建透传请求：原样转发原始入站字节到第三方上游
+    fn build_passthrough_request(
+        &self,
+        credentials: &KiroCredentials,
+        protocol: PassthroughProtocol,
+        raw_body: &bytes::Bytes,
+    ) -> anyhow::Result<reqwest::RequestBuilder> {
+        let base_url = credentials
+            .base_url
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("透传凭据缺少 baseUrl"))?;
+        let api_key = credentials
+            .upstream_api_key
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("透传凭据缺少 upstreamApiKey"))?;
+
+        let url = format!("{}{}", base_url.trim_end_matches('/'), protocol.path());
+
+        let request = self
+            .client_for(credentials)?
+            .post(&url)
+            .body(raw_body.clone())
+            .header("content-type", "application/json")
+            .header("anthropic-version", "2023-06-01")
+            .header("Authorization", format!("Bearer {}", api_key));
+        Ok(request)
+    }
+
     /// 根据凭据选择 endpoint 实现
     fn endpoint_for(&self, credentials: &KiroCredentials) -> anyhow::Result<Arc<dyn KiroEndpoint>> {
         let name = credentials
@@ -158,32 +244,27 @@ impl KiroProvider {
         self.token_manager.available_count()
     }
 
+    /// 是否存在能服务指定协议的透传凭据（handler Kiro 翻译失败时判断能否 fallback）
+    pub fn has_passthrough_credential(&self, cap: Capability) -> bool {
+        self.token_manager.has_passthrough_credential(cap)
+    }
+
     /// 获取凭据总数
     pub fn total_credentials(&self) -> usize {
         self.token_manager.total_count()
     }
 
-    /// 发送非流式 API 请求
-    ///
-    /// `model_hint` 若提供则跳过从 request_body 解析 modelId（用于 RPM 凭据选择）。
     /// 发送非流式 API 请求，返回响应与最终成功的凭据 id（供监控按凭据统计）
-    pub async fn call_api(
-        &self,
-        request_body: &str,
-        model_hint: Option<&str>,
-    ) -> anyhow::Result<(reqwest::Response, u64)> {
-        self.call_api_with_retry(request_body, false, model_hint)
-            .await
+    pub async fn call_api(&self, request: UpstreamRequest<'_>) -> anyhow::Result<UpstreamResponse> {
+        self.call_api_with_retry(request, false).await
     }
 
     /// 发送流式 API 请求，返回响应与最终成功的凭据 id（供监控按凭据统计）
     pub async fn call_api_stream(
         &self,
-        request_body: &str,
-        model_hint: Option<&str>,
-    ) -> anyhow::Result<(reqwest::Response, u64)> {
-        self.call_api_with_retry(request_body, true, model_hint)
-            .await
+        request: UpstreamRequest<'_>,
+    ) -> anyhow::Result<UpstreamResponse> {
+        self.call_api_with_retry(request, true).await
     }
 
     /// 发送 MCP API 请求（WebSearch 等工具调用）
@@ -204,7 +285,11 @@ impl KiroProvider {
             let rpm_mode = rpm_reserved
                 .map(RpmChargeMode::Reuse)
                 .unwrap_or(RpmChargeMode::Charge);
-            let ctx = match self.token_manager.acquire_context(None, rpm_mode).await {
+            let ctx = match self
+                .token_manager
+                .acquire_context(None, Capability::KiroOnly, false, rpm_mode)
+                .await
+            {
                 Ok(c) => c,
                 Err(e) if e.downcast_ref::<CredentialRpmExceeded>().is_some() => {
                     crate::metrics::inc_local_rpm_rejected();
@@ -373,10 +458,17 @@ impl KiroProvider {
     /// - 硬上限 9 次，避免无限重试
     async fn call_api_with_retry(
         &self,
-        request_body: &str,
+        request: UpstreamRequest<'_>,
         is_stream: bool,
-        model_hint: Option<&str>,
-    ) -> anyhow::Result<(reqwest::Response, u64)> {
+    ) -> anyhow::Result<UpstreamResponse> {
+        let UpstreamRequest {
+            kiro_body,
+            raw_body,
+            capability: cap,
+            passthrough_only,
+            protocol,
+            model_hint,
+        } = request;
         let total_credentials = self.token_manager.total_count();
         let max_retries = (total_credentials * MAX_RETRIES_PER_CREDENTIAL).min(MAX_TOTAL_RETRIES);
         let mut last_error: Option<anyhow::Error> = None;
@@ -387,7 +479,7 @@ impl KiroProvider {
         // 优先使用 handler 传入的 model，避免重复解析 JSON
         let model = model_hint
             .map(|s| s.to_string())
-            .or_else(|| Self::extract_model_from_request(request_body));
+            .or_else(|| Self::extract_model_from_request(kiro_body));
 
         for attempt in 0..max_retries {
             let rpm_mode = rpm_reserved
@@ -396,7 +488,7 @@ impl KiroProvider {
             // 获取调用上下文（绑定 index、credentials、token）
             let ctx = match self
                 .token_manager
-                .acquire_context(model.as_deref(), rpm_mode)
+                .acquire_context(model.as_deref(), cap, passthrough_only, rpm_mode)
                 .await
             {
                 Ok(c) => c,
@@ -416,51 +508,86 @@ impl KiroProvider {
             }
 
             let config = self.token_manager.config();
-            let machine_id = machine_id::generate_from_credentials(&ctx.credentials, &config);
 
-            let endpoint = match self.endpoint_for(&ctx.credentials) {
-                Ok(e) => e,
-                Err(e) => {
-                    last_error = Some(e);
-                    self.token_manager.report_failure(ctx.id);
-                    continue;
-                }
-            };
+            // 透传凭据：原样转发原始入站字节到上游；额度耗尽为 403 + INSUFFICIENT_BALANCE
+            let is_passthrough = ctx.credentials.is_passthrough();
+            // Kiro 凭据的 endpoint（透传凭据为 None），用于失败响应的 body 关键字判定
+            let mut kiro_endpoint: Option<Arc<dyn KiroEndpoint>> = None;
 
-            let rctx = RequestContext {
-                credentials: &ctx.credentials,
-                token: &ctx.token,
-                machine_id: &machine_id,
-                config: &config,
-            };
-
-            let url = endpoint.api_url(&rctx);
-            let body = endpoint.transform_api_body(request_body, &rctx);
-
-            let base = self
-                .client_for(&ctx.credentials)?
-                .post(&url)
-                .body(body)
-                .header("content-type", "application/json")
-                .header("Connection", "close");
-            let request = endpoint.decorate_api(base, &rctx);
-
-            let response = match request.send().await {
-                Ok(resp) => resp,
-                Err(e) => {
-                    tracing::warn!(
-                        "API 请求发送失败（尝试 {}/{}）: {}",
-                        attempt + 1,
-                        max_retries,
-                        e
-                    );
-                    // 网络错误通常是上游/链路瞬态问题，不应导致"禁用凭据"或"切换凭据"
-                    // （否则一段时间网络抖动会把所有凭据都误禁用，需要重启才能恢复）
-                    last_error = Some(e.into());
-                    if attempt + 1 < max_retries {
-                        sleep(Self::retry_delay(attempt)).await;
+            let response = if is_passthrough {
+                let request =
+                    match self.build_passthrough_request(&ctx.credentials, protocol, raw_body) {
+                        Ok(req) => req,
+                        Err(e) => {
+                            last_error = Some(e);
+                            self.token_manager.report_failure(ctx.id);
+                            continue;
+                        }
+                    };
+                match request.send().await {
+                    Ok(resp) => resp,
+                    Err(e) => {
+                        tracing::warn!(
+                            "透传请求发送失败（尝试 {}/{}）: {}",
+                            attempt + 1,
+                            max_retries,
+                            e
+                        );
+                        last_error = Some(e.into());
+                        if attempt + 1 < max_retries {
+                            sleep(Self::retry_delay(attempt)).await;
+                        }
+                        continue;
                     }
-                    continue;
+                }
+            } else {
+                let machine_id = machine_id::generate_from_credentials(&ctx.credentials, &config);
+
+                let endpoint = match self.endpoint_for(&ctx.credentials) {
+                    Ok(e) => e,
+                    Err(e) => {
+                        last_error = Some(e);
+                        self.token_manager.report_failure(ctx.id);
+                        continue;
+                    }
+                };
+                kiro_endpoint = Some(endpoint.clone());
+
+                let rctx = RequestContext {
+                    credentials: &ctx.credentials,
+                    token: &ctx.token,
+                    machine_id: &machine_id,
+                    config: &config,
+                };
+
+                let url = endpoint.api_url(&rctx);
+                let body = endpoint.transform_api_body(kiro_body, &rctx);
+
+                let base = self
+                    .client_for(&ctx.credentials)?
+                    .post(&url)
+                    .body(body)
+                    .header("content-type", "application/json")
+                    .header("Connection", "close");
+                let http_request = endpoint.decorate_api(base, &rctx);
+
+                match http_request.send().await {
+                    Ok(resp) => resp,
+                    Err(e) => {
+                        tracing::warn!(
+                            "API 请求发送失败（尝试 {}/{}）: {}",
+                            attempt + 1,
+                            max_retries,
+                            e
+                        );
+                        // 网络错误通常是上游/链路瞬态问题，不应导致"禁用凭据"或"切换凭据"
+                        // （否则一段时间网络抖动会把所有凭据都误禁用，需要重启才能恢复）
+                        last_error = Some(e.into());
+                        if attempt + 1 < max_retries {
+                            sleep(Self::retry_delay(attempt)).await;
+                        }
+                        continue;
+                    }
                 }
             };
 
@@ -470,7 +597,11 @@ impl KiroProvider {
             if status.is_success() {
                 self.token_manager.report_success(ctx.id);
                 crate::metrics::inc_request_success();
-                return Ok((response, ctx.id));
+                return Ok(UpstreamResponse {
+                    response,
+                    credential_id: ctx.id,
+                    passthrough: is_passthrough,
+                });
             }
 
             // 在消费 body 前提取 Retry-After（429 限流时上游可能指示等待时长）
@@ -479,8 +610,44 @@ impl KiroProvider {
             // 失败响应：读取 body 用于日志/错误信息
             let body = response.text().await.unwrap_or_default();
 
+            // 透传凭据额度耗尽（403 + INSUFFICIENT_BALANCE）：等同 Kiro 的月度额度耗尽，
+            // 禁用凭据并故障转移到池内其他同协议凭据。
+            if is_passthrough
+                && status.as_u16() == 403
+                && body.contains(PASSTHROUGH_QUOTA_EXHAUSTED_MARKER)
+            {
+                tracing::warn!(
+                    "透传凭据额度耗尽（禁用并切换，尝试 {}/{}）: {} {}",
+                    attempt + 1,
+                    max_retries,
+                    status,
+                    body
+                );
+                let has_available = self.token_manager.report_quota_exhausted(ctx.id);
+                if !has_available {
+                    return Err(anyhow::Error::new(UpstreamApiError {
+                        status: 402,
+                        message: format!(
+                            "{} API 请求失败（所有凭据已用尽）: {} {}",
+                            api_type, status, body
+                        ),
+                        retry_after: None,
+                    }));
+                }
+                last_error = Some(anyhow::Error::new(UpstreamApiError {
+                    status: 402,
+                    message: format!("{} API 请求失败: {} {}", api_type, status, body),
+                    retry_after: None,
+                }));
+                continue;
+            }
+
             // 402 Payment Required 且额度用尽：禁用凭据并故障转移
-            if status.as_u16() == 402 && endpoint.is_monthly_request_limit(&body) {
+            if status.as_u16() == 402
+                && kiro_endpoint
+                    .as_ref()
+                    .is_some_and(|e| e.is_monthly_request_limit(&body))
+            {
                 tracing::warn!(
                     "API 请求失败（额度已用尽，禁用凭据并切换，尝试 {}/{}）: {} {}",
                     attempt + 1,
@@ -525,7 +692,12 @@ impl KiroProvider {
                 );
 
                 // token 被上游失效：先尝试 force-refresh，每凭据仅一次机会
-                if endpoint.is_bearer_token_invalid(&body) && !force_refreshed.contains(&ctx.id) {
+                // 透传凭据（kiro_endpoint 为 None）无 refresh token 机制，跳过
+                if kiro_endpoint
+                    .as_ref()
+                    .is_some_and(|e| e.is_bearer_token_invalid(&body))
+                    && !force_refreshed.contains(&ctx.id)
+                {
                     force_refreshed.insert(ctx.id);
                     tracing::info!("凭据 #{} token 疑似被上游失效，尝试强制刷新", ctx.id);
                     if self
