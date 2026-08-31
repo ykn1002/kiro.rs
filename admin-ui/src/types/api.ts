@@ -34,6 +34,8 @@ export interface CredentialStatusItem {
   authMethod: string | null
   hasProfileArn: boolean
   email?: string
+  /** 自定义备注名（展示优先级高于 email） */
+  name?: string
   refreshTokenHash?: string
   apiKeyHash?: string
   maskedApiKey?: string
@@ -149,6 +151,10 @@ export interface SetDisabledRequest {
 
 export interface SetPriorityRequest {
   priority: number
+}
+
+export interface SetNameRequest {
+  name: string | null
 }
 
 // 添加凭据请求

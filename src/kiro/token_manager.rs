@@ -784,6 +784,9 @@ pub struct CredentialEntrySnapshot {
     pub masked_api_key: Option<String>,
     /// 用户邮箱（用于前端显示）
     pub email: Option<String>,
+    /// 自定义备注名（用于前端显示，优先级高于 email）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
     /// API 调用成功次数
     pub success_count: u64,
     /// 最后一次 API 调用时间（RFC3339 格式）
@@ -2141,6 +2144,7 @@ impl MultiTokenManager {
                         None
                     },
                     email: e.credentials.email.clone(),
+                    name: e.credentials.name.clone(),
                     success_count: e.success_count,
                     last_used_at: e.last_used_at.clone(),
                     has_proxy: e.credentials.proxy_url.is_some(),
@@ -2212,6 +2216,28 @@ impl MultiTokenManager {
         // 立即按新优先级重新选择当前凭据（无论持久化是否成功）
         self.select_highest_priority();
         // 持久化更改
+        self.persist_credentials()?;
+        Ok(())
+    }
+
+    /// 设置凭据备注名（Admin API）。空字符串视为清除。
+    pub fn set_name(&self, id: u64, name: Option<String>) -> anyhow::Result<()> {
+        let normalized = name.and_then(|n| {
+            let trimmed = n.trim().to_string();
+            if trimmed.is_empty() {
+                None
+            } else {
+                Some(trimmed)
+            }
+        });
+        {
+            let mut entries = self.entries.lock();
+            let entry = entries
+                .iter_mut()
+                .find(|e| e.id == id)
+                .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?;
+            entry.credentials.name = normalized;
+        }
         self.persist_credentials()?;
         Ok(())
     }

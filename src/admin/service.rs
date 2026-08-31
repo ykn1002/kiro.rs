@@ -104,6 +104,7 @@ impl AdminService {
                 api_key_hash: entry.api_key_hash,
                 masked_api_key: entry.masked_api_key,
                 email: entry.email,
+                name: entry.name,
                 success_count: entry.success_count,
                 last_used_at: entry.last_used_at.clone(),
                 has_proxy: entry.has_proxy,
@@ -288,6 +289,13 @@ impl AdminService {
             .map_err(|e| self.classify_error(e, id))
     }
 
+    /// 设置凭据备注名
+    pub fn set_name(&self, id: u64, name: Option<String>) -> Result<(), AdminServiceError> {
+        self.token_manager
+            .set_name(id, name)
+            .map_err(|e| self.classify_error(e, id))
+    }
+
     /// 重置失败计数并重新启用
     pub fn reset_and_enable(&self, id: u64) -> Result<(), AdminServiceError> {
         self.token_manager
@@ -424,6 +432,7 @@ impl AdminService {
         let email = req.email.clone();
         let mut new_cred = KiroCredentials {
             id: None,
+            name: req.name,
             access_token: None,
             refresh_token: req.refresh_token,
             profile_arn: None,

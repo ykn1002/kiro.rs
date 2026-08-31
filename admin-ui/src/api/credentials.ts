@@ -6,6 +6,7 @@ import type {
   SuccessResponse,
   SetDisabledRequest,
   SetPriorityRequest,
+  SetNameRequest,
   AddCredentialRequest,
   AddCredentialResponse,
   AppConfig,
@@ -75,6 +76,18 @@ export async function setCredentialPriority(
   const { data } = await api.post<SuccessResponse>(
     `/credentials/${id}/priority`,
     { priority } as SetPriorityRequest
+  )
+  return data
+}
+
+// 设置凭据备注名（传 null 或空字符串清除）
+export async function setCredentialName(
+  id: number,
+  name: string | null
+): Promise<SuccessResponse> {
+  const { data } = await api.post<SuccessResponse>(
+    `/credentials/${id}/name`,
+    { name } as SetNameRequest
   )
   return data
 }

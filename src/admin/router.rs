@@ -9,8 +9,8 @@ use super::{
     handlers::{
         add_credential, delete_credential, force_refresh_token, get_all_credentials,
         get_app_config, get_credential_balance, get_load_balancing_mode, get_metrics,
-        get_timeseries, reset_failure_count, set_credential_disabled, set_credential_priority,
-        set_load_balancing_mode, update_app_config,
+        get_timeseries, reset_failure_count, set_credential_disabled, set_credential_name,
+        set_credential_priority, set_load_balancing_mode, update_app_config,
     },
     middleware::{AdminState, admin_auth_middleware},
 };
@@ -44,6 +44,7 @@ pub fn create_admin_router(state: AdminState) -> Router {
         .route("/credentials/{id}", delete(delete_credential))
         .route("/credentials/{id}/disabled", post(set_credential_disabled))
         .route("/credentials/{id}/priority", post(set_credential_priority))
+        .route("/credentials/{id}/name", post(set_credential_name))
         .route("/credentials/{id}/reset", post(reset_failure_count))
         .route("/credentials/{id}/refresh", post(force_refresh_token))
         .route("/credentials/{id}/balance", get(get_credential_balance))

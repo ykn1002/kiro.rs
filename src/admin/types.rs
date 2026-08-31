@@ -50,6 +50,9 @@ pub struct CredentialStatusItem {
     pub masked_api_key: Option<String>,
     /// 用户邮箱（用于前端显示）
     pub email: Option<String>,
+    /// 自定义备注名（用于前端显示，优先级高于 email）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
     /// API 调用成功次数
     pub success_count: u64,
     /// 最后一次 API 调用时间（RFC3339 格式）
@@ -97,10 +100,21 @@ pub struct SetPriorityRequest {
     pub priority: u32,
 }
 
+/// 修改备注名请求
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetNameRequest {
+    /// 新备注名（null 或空字符串表示清除）
+    pub name: Option<String>,
+}
+
 /// 添加凭据请求
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AddCredentialRequest {
+    /// 自定义备注名（可选，Admin UI 展示用）
+    pub name: Option<String>,
+
     /// 刷新令牌（OAuth 凭据必填，API Key 凭据不需要）
     pub refresh_token: Option<String>,
 

@@ -18,6 +18,10 @@ pub struct KiroCredentials {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub id: Option<u64>,
 
+    /// 自定义备注名（可选，Admin UI 展示用，优先级高于 email）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+
     /// 访问令牌
     #[serde(skip_serializing_if = "Option::is_none")]
     pub access_token: Option<String>,
@@ -411,6 +415,7 @@ mod tests {
     fn test_to_json() {
         let creds = KiroCredentials {
             id: None,
+            name: None,
             access_token: Some("token".to_string()),
             refresh_token: None,
             profile_arn: None,
@@ -532,6 +537,7 @@ mod tests {
     fn test_region_field_serialization() {
         let creds = KiroCredentials {
             id: None,
+            name: None,
             access_token: None,
             refresh_token: Some("test".to_string()),
             profile_arn: None,
@@ -566,6 +572,7 @@ mod tests {
     fn test_region_field_none_not_serialized() {
         let creds = KiroCredentials {
             id: None,
+            name: None,
             access_token: None,
             refresh_token: Some("test".to_string()),
             profile_arn: None,
@@ -683,6 +690,7 @@ mod tests {
         // 测试序列化和反序列化的往返一致性
         let original = KiroCredentials {
             id: Some(42),
+            name: None,
             access_token: Some("token".to_string()),
             refresh_token: Some("refresh".to_string()),
             profile_arn: None,
@@ -1033,7 +1041,10 @@ mod tests {
         }"#;
         let creds = KiroCredentials::from_json(json).unwrap();
         assert_eq!(creds.kind, Some("anthropic".to_string()));
-        assert_eq!(creds.base_url, Some("https://api.anthropic.com".to_string()));
+        assert_eq!(
+            creds.base_url,
+            Some("https://api.anthropic.com".to_string())
+        );
         assert_eq!(creds.upstream_api_key, Some("sk-test".to_string()));
 
         // 往返序列化保持字段

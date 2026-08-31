@@ -32,6 +32,7 @@ import type { CredentialStatusItem, BalanceResponse } from '@/types/api'
 import {
   useSetDisabled,
   useSetPriority,
+  useSetName,
   useResetFailure,
   useDeleteCredential,
   useForceRefreshToken,
@@ -137,10 +138,13 @@ export function CredentialCard({
 }: CredentialCardProps) {
   const [editingPriority, setEditingPriority] = useState(false)
   const [priorityValue, setPriorityValue] = useState(String(credential.priority))
+  const [editingName, setEditingName] = useState(false)
+  const [nameValue, setNameValue] = useState(credential.name ?? '')
   const [showDeleteDialog, setShowDeleteDialog] = useState(false)
 
   const setDisabled = useSetDisabled()
   const setPriority = useSetPriority()
+  const setName = useSetName()
   const resetFailure = useResetFailure()
   const deleteCredential = useDeleteCredential()
   const forceRefresh = useForceRefreshToken()
@@ -171,6 +175,32 @@ export function CredentialCard({
         onSuccess: (res) => {
           toast.success(res.message)
           setEditingPriority(false)
+        },
+        onError: (err) => {
+          toast.error('操作失败: ' + (err as Error).message)
+        },
+      }
+    )
+  }
+
+  const startEditName = () => {
+    setNameValue(credential.name ?? '')
+    setEditingName(true)
+  }
+
+  const handleNameChange = () => {
+    const trimmed = nameValue.trim()
+    // 与当前值一致（都为空或字符串相同）则直接收起，不发请求
+    if (trimmed === (credential.name ?? '')) {
+      setEditingName(false)
+      return
+    }
+    setName.mutate(
+      { id: credential.id, name: trimmed === '' ? null : trimmed },
+      {
+        onSuccess: (res) => {
+          toast.success(res.message)
+          setEditingName(false)
         },
         onError: (err) => {
           toast.error('操作失败: ' + (err as Error).message)
@@ -226,9 +256,9 @@ export function CredentialCard({
   const isPassthrough = kindLabel !== null
   const rpmUsage = formatRpmUsage(credential.rpm)
   const hasFailure = credential.failureCount > 0 || credential.refreshFailureCount > 0
-  const title = credential.email || `凭据 #${credential.id}`
-  // 邮箱作标题时副标题才显示 #ID，避免「凭据 #3 / #3」重复
-  const showIdInSub = Boolean(credential.email)
+  const title = credential.name || credential.email || `凭据 #${credential.id}`
+  // 有自定义名或邮箱作标题时，副标题才显示 #ID，避免「凭据 #3 / #3」重复
+  const showIdInSub = Boolean(credential.name || credential.email)
   const remainingPct = balance ? 100 - balance.usagePercentage : null
 
   return (
@@ -245,14 +275,60 @@ export function CredentialCard({
             <Checkbox checked={selected} onCheckedChange={onToggleSelect} className="shrink-0" />
 
             <div className="min-w-0 flex-1">
-              <div className="flex items-center gap-2">
+              <div className="group flex items-center gap-2">
                 <span
                   className={cn('h-2 w-2 shrink-0 rounded-full', dot.color)}
                   title={dot.label}
                 />
-                <span className="truncate text-sm font-semibold leading-tight" title={title}>
-                  {title}
-                </span>
+                {editingName ? (
+                  <span className="flex min-w-0 flex-1 items-center gap-1">
+                    <Input
+                      value={nameValue}
+                      onChange={(e) => setNameValue(e.target.value)}
+                      onKeyDown={(e) => {
+                        if (e.key === 'Enter') handleNameChange()
+                        if (e.key === 'Escape') setEditingName(false)
+                      }}
+                      placeholder="备注名（留空清除）"
+                      autoFocus
+                      className="h-7 min-w-0 flex-1 text-sm"
+                    />
+                    <Button
+                      size="icon"
+                      variant="ghost"
+                      className="h-7 w-7 shrink-0"
+                      onClick={handleNameChange}
+                      disabled={setName.isPending}
+                    >
+                      <Check className="h-4 w-4" />
+                    </Button>
+                    <Button
+                      size="icon"
+                      variant="ghost"
+                      className="h-7 w-7 shrink-0"
+                      onClick={() => setEditingName(false)}
+                    >
+                      <X className="h-4 w-4" />
+                    </Button>
+                  </span>
+                ) : (
+                  <>
+                    <span
+                      className="truncate text-sm font-semibold leading-tight"
+                      title={title}
+                    >
+                      {title}
+                    </span>
+                    <button
+                      type="button"
+                      className="shrink-0 text-muted-foreground opacity-0 transition-opacity hover:text-primary group-hover:opacity-100"
+                      onClick={startEditName}
+                      title="编辑备注名"
+                    >
+                      <Pencil className="h-3 w-3" />
+                    </button>
+                  </>
+                )}
               </div>
               <div className="mt-1 flex items-center gap-1.5 text-xs text-muted-foreground">
                 {showIdInSub && <span className="font-mono">#{credential.id}</span>}
