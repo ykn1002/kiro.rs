@@ -488,7 +488,7 @@ pub fn default_models() -> Vec<ModelDef> {
             kiro_id: "claude-sonnet-4.6".to_string(),
             display_id: "claude-sonnet-4-6".to_string(),
             display_name: "Claude Sonnet 4.6".to_string(),
-            created: 1771286400,
+            created: 1784249340,
             max_tokens: 64000,
             context_window: 1_000_000,
         },
@@ -761,24 +761,36 @@ mod tests {
         assert!(models[1].version.is_none(), "haiku 省略 version 应为 None");
     }
 
-    /// config.example.json 的 models 必须与内置 default_models() 完全一致
-    /// （样例脱节即报警，保证样例真实可复制为默认行为）
+    /// config.example.json 是桌面版首启模板，展示的是「当前推荐」模型组合；
+    /// default_models() 是未配置 models 时的请求兜底表，需要长期保留旧模型 ID
+    /// 以免旧客户端请求（如 claude-opus-4-7）失效。两者收录的模型集合可以不同，
+    /// 这里只校验两边同时出现的模型（按 kiro_id 匹配）字段没有互相冲突，
+    /// 避免样例和默认表各自维护出两份不一致的同名模型定义。
     #[test]
-    fn test_example_config_models_match_defaults() {
+    fn test_example_config_models_consistent_with_defaults() {
         let json = include_str!("../../config.example.json");
         let cfg: Config = serde_json::from_str(json).expect("config.example.json 应能解析");
         let example = cfg.models.expect("样例应包含 models");
         let defaults = default_models();
-        assert_eq!(example.len(), defaults.len(), "样例模型数量应与默认表一致");
-        for (e, d) in example.iter().zip(defaults.iter()) {
-            assert_eq!(e.family, d.family);
-            assert_eq!(e.version, d.version);
-            assert_eq!(e.kiro_id, d.kiro_id);
-            assert_eq!(e.display_id, d.display_id);
-            assert_eq!(e.display_name, d.display_name);
-            assert_eq!(e.created, d.created);
-            assert_eq!(e.max_tokens, d.max_tokens);
-            assert_eq!(e.context_window, d.context_window);
+        for d in defaults.iter() {
+            let Some(e) = example.iter().find(|e| e.kiro_id == d.kiro_id) else {
+                continue;
+            };
+            assert_eq!(e.family, d.family, "family 不一致: {}", d.kiro_id);
+            assert_eq!(e.version, d.version, "version 不一致: {}", d.kiro_id);
+            assert_eq!(e.display_id, d.display_id, "display_id 不一致: {}", d.kiro_id);
+            assert_eq!(
+                e.display_name, d.display_name,
+                "display_name 不一致: {}",
+                d.kiro_id
+            );
+            assert_eq!(e.created, d.created, "created 不一致: {}", d.kiro_id);
+            assert_eq!(e.max_tokens, d.max_tokens, "max_tokens 不一致: {}", d.kiro_id);
+            assert_eq!(
+                e.context_window, d.context_window,
+                "context_window 不一致: {}",
+                d.kiro_id
+            );
         }
     }
 }
