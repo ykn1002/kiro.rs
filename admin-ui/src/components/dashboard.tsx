@@ -64,6 +64,8 @@ export function Dashboard({ onLogout }: DashboardProps) {
   const [batchRefreshing, setBatchRefreshing] = useState(false)
   const [batchRefreshProgress, setBatchRefreshProgress] = useState({ current: 0, total: 0 })
   const cancelVerifyRef = useRef(false)
+  // 桌面版首次打开窗口后自动查询一次凭据信息，仅触发一次
+  const autoQueriedRef = useRef(false)
   const [mainTab, setMainTab] = useState<MainTab>('monitor')
   const [currentPage, setCurrentPage] = useState(1)
   const itemsPerPage = 12
@@ -138,6 +140,18 @@ export function Dashboard({ onLogout }: DashboardProps) {
       })
       return next.size === prev.size ? prev : next
     })
+  }, [data?.credentials])
+
+  // 桌面版：首次拿到凭据列表后自动静默查询一次当前页信息（用量）。
+  // 后端 balance 接口带 300s 缓存，重复开窗不会频繁打上游；autoQueriedRef 保证整个会话只自动触发一次。
+  useEffect(() => {
+    if (!DESKTOP) return
+    if (autoQueriedRef.current) return
+    if (!data?.credentials || data.credentials.length === 0) return
+
+    autoQueriedRef.current = true
+    void handleQueryCurrentPageInfo({ silent: true })
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [data?.credentials])
 
   const toggleDarkMode = () => {
@@ -419,9 +433,12 @@ export function Dashboard({ onLogout }: DashboardProps) {
   }
 
   // 查询当前页凭据信息（逐个查询，避免瞬时并发）
-  const handleQueryCurrentPageInfo = async () => {
+  // silent=true 用于桌面版自动触发：不弹提示、无可查凭据时静默返回
+  const handleQueryCurrentPageInfo = async (options?: { silent?: boolean }) => {
+    const silent = options?.silent ?? false
+
     if (currentCredentials.length === 0) {
-      toast.error('当前页没有可查询的凭据')
+      if (!silent) toast.error('当前页没有可查询的凭据')
       return
     }
 
@@ -430,7 +447,7 @@ export function Dashboard({ onLogout }: DashboardProps) {
       .map(credential => credential.id)
 
     if (ids.length === 0) {
-      toast.error('当前页没有可查询的启用凭据')
+      if (!silent) toast.error('当前页没有可查询的启用凭据')
       return
     }
 
@@ -473,10 +490,12 @@ export function Dashboard({ onLogout }: DashboardProps) {
 
     setQueryingInfo(false)
 
-    if (failCount === 0) {
-      toast.success(`查询完成：成功 ${successCount}/${ids.length}`)
-    } else {
-      toast.warning(`查询完成：成功 ${successCount} 个，失败 ${failCount} 个`)
+    if (!silent) {
+      if (failCount === 0) {
+        toast.success(`查询完成：成功 ${successCount}/${ids.length}`)
+      } else {
+        toast.warning(`查询完成：成功 ${successCount} 个，失败 ${failCount} 个`)
+      }
     }
   }
 
@@ -800,7 +819,7 @@ export function Dashboard({ onLogout }: DashboardProps) {
               )}
               {data?.credentials && data.credentials.length > 0 && (
                 <Button
-                  onClick={handleQueryCurrentPageInfo}
+                  onClick={() => handleQueryCurrentPageInfo()}
                   size="sm"
                   variant="outline"
                   disabled={queryingInfo}
