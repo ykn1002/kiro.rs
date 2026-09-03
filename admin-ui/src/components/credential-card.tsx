@@ -449,7 +449,7 @@ export function CredentialCard({
               </div>
               {balance && !loadingBalance ? (
                 <>
-                  <Progress value={balance.usagePercentage} max={100} className="mt-2 h-1.5" />
+                  <Progress value={remainingPct ?? 0} max={100} className="mt-2 h-1.5" />
                   <div className="mt-1.5 text-right text-[11px] text-muted-foreground tabular-nums">
                     剩 {balance.remaining.toFixed(2)} / {balance.usageLimit.toFixed(2)}
                   </div>
