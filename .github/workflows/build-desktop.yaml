@@ -21,11 +21,15 @@ jobs:
       matrix:
         include:
           - platform: macos-latest
-            target: universal-apple-darwin
-            name: macOS-universal
+            target: aarch64-apple-darwin
+            name: macOS-arm64
             bundles: app,dmg
-            # 通用包需同时具备两个架构的 std
-            rust-targets: aarch64-apple-darwin,x86_64-apple-darwin
+            rust-targets: aarch64-apple-darwin
+          - platform: macos-latest
+            target: x86_64-apple-darwin
+            name: macOS-x64
+            bundles: app,dmg
+            rust-targets: x86_64-apple-darwin
           - platform: windows-latest
             target: x86_64-pc-windows-msvc
             name: Windows-x64
