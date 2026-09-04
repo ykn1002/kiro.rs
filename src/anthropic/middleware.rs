@@ -34,6 +34,8 @@ pub struct AppState {
     pub extract_thinking: bool,
     /// 是否在 429 响应中向客户端透传 `Retry-After`
     pub passthrough_retry_after: bool,
+    /// `/cc` 延迟放行 `message_start` 的最长毫秒数（0 = 无上限）
+    pub cc_message_start_max_delay_ms: u64,
 }
 
 impl AppState {
@@ -42,12 +44,14 @@ impl AppState {
         api_key: SharedApiKey,
         extract_thinking: bool,
         passthrough_retry_after: bool,
+        cc_message_start_max_delay_ms: u64,
     ) -> Self {
         Self {
             api_key,
             kiro_provider: None,
             extract_thinking,
             passthrough_retry_after,
+            cc_message_start_max_delay_ms,
         }
     }
 

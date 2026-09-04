@@ -290,6 +290,7 @@ pub async fn build(opts: RunOptions) -> Result<Server, StartupError> {
         Some(kiro_provider),
         config.extract_thinking,
         config.passthrough_retry_after,
+        config.cc_message_start_max_delay_ms,
     );
 
     // Admin API 路由（仅当配置了非空 admin_api_key）

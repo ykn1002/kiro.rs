@@ -329,6 +329,19 @@ pub struct Config {
     #[serde(default = "default_codex_truncation_correction")]
     pub codex_truncation_correction: bool,
 
+    /// `/cc` 端点等待 `contextUsageEvent` 再放行 `message_start` 的最长毫秒数（默认 5000）
+    ///
+    /// `/cc` 默认缓冲 `message_start` 直到上游 `contextUsageEvent` 或首个非空正文
+    /// 事件到达，以便用精确 `input_tokens` 填充 `message_start`。但上游在首个有意义
+    /// 事件前可能思考数分钟，期间客户端只收到 ping、迟迟等不到 `message_start`，
+    /// Claude Code 会触发 "Waiting for API response … will retry" 的重试倒计时。
+    ///
+    /// 超过此上限仍未放行时，先用估算 `input_tokens` 放行 `message_start`；后续
+    /// `contextUsageEvent` / `metadataEvent` 仍会在 `message_delta` 与用量上报中修正
+    /// 真实 token 数，语义无损。`0` 表示不设上限（无限等待，旧行为）。仅影响 `/cc`。
+    #[serde(default = "default_cc_message_start_max_delay_ms")]
+    pub cc_message_start_max_delay_ms: u64,
+
     /// 默认端点名称（凭据未显式指定 endpoint 时使用，默认 "ide"）
     #[serde(default = "default_endpoint")]
     pub default_endpoint: String,
@@ -414,6 +427,14 @@ fn default_extract_thinking() -> bool {
 
 fn default_codex_truncation_correction() -> bool {
     true
+}
+
+/// `/cc` 延迟放行 `message_start` 的默认上限（毫秒）
+///
+/// 5 秒：足够覆盖多数请求的 `contextUsageEvent` 到达（精确 token 优先），
+/// 又远短于 Claude Code 的首响应重试阈值，避免长思考请求触发重试倒计时。
+fn default_cc_message_start_max_delay_ms() -> u64 {
+    5000
 }
 
 fn default_endpoint() -> String {
@@ -549,6 +570,7 @@ impl Default for Config {
             extract_thinking: default_extract_thinking(),
             chunked_write_policy: ChunkedWritePolicy::default(),
             codex_truncation_correction: default_codex_truncation_correction(),
+            cc_message_start_max_delay_ms: default_cc_message_start_max_delay_ms(),
             default_endpoint: default_endpoint(),
             endpoints: HashMap::new(),
             models: None,
@@ -778,14 +800,22 @@ mod tests {
             };
             assert_eq!(e.family, d.family, "family 不一致: {}", d.kiro_id);
             assert_eq!(e.version, d.version, "version 不一致: {}", d.kiro_id);
-            assert_eq!(e.display_id, d.display_id, "display_id 不一致: {}", d.kiro_id);
+            assert_eq!(
+                e.display_id, d.display_id,
+                "display_id 不一致: {}",
+                d.kiro_id
+            );
             assert_eq!(
                 e.display_name, d.display_name,
                 "display_name 不一致: {}",
                 d.kiro_id
             );
             assert_eq!(e.created, d.created, "created 不一致: {}", d.kiro_id);
-            assert_eq!(e.max_tokens, d.max_tokens, "max_tokens 不一致: {}", d.kiro_id);
+            assert_eq!(
+                e.max_tokens, d.max_tokens,
+                "max_tokens 不一致: {}",
+                d.kiro_id
+            );
             assert_eq!(
                 e.context_window, d.context_window,
                 "context_window 不一致: {}",

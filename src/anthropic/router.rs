@@ -43,8 +43,14 @@ pub fn create_router_with_provider(
     kiro_provider: Option<KiroProvider>,
     extract_thinking: bool,
     passthrough_retry_after: bool,
+    cc_message_start_max_delay_ms: u64,
 ) -> Router {
-    let mut state = AppState::new(api_key, extract_thinking, passthrough_retry_after);
+    let mut state = AppState::new(
+        api_key,
+        extract_thinking,
+        passthrough_retry_after,
+        cc_message_start_max_delay_ms,
+    );
     if let Some(provider) = kiro_provider {
         state = state.with_kiro_provider(provider);
     }

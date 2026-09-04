@@ -667,6 +667,36 @@ impl StreamContext {
         self.credential_id = id as i64;
     }
 
+    /// 是否处于「延迟放行 message_start 且尚未放行」的等待状态（仅 `/cc`）
+    ///
+    /// 供上层在超时兜底时判断是否需要强制放行：只有还在等待时才有意义。
+    pub fn awaiting_message_start_release(&self) -> bool {
+        self.delay_message_start && !self.message_start_released
+    }
+
+    /// 超时兜底：强制放行缓冲中的 `message_start`（仅 `/cc` 等待期有效）
+    ///
+    /// `/cc` 默认等 `contextUsageEvent` 到达再放行以填入精确 `input_tokens`；
+    /// 上游长时间思考时会迟迟不放行，客户端只收到 ping、触发重试倒计时。
+    /// 超过配置上限后调用此方法：用当前 `effective_input_tokens()`（此时多为
+    /// 本地估算值）放行 `message_start`，让客户端立即进入接收状态。后续
+    /// `contextUsageEvent` / `metadataEvent` 仍会在 `message_delta` 与用量上报中
+    /// 修正真实 token 数，语义无损。
+    ///
+    /// 返回需要立即发往客户端的事件（未在等待期则返回空）。
+    pub fn force_release_message_start(&mut self) -> Vec<SseEvent> {
+        if !self.awaiting_message_start_release() {
+            return Vec::new();
+        }
+        if !self.stream_initialized {
+            self.pending_events = self.generate_initial_events();
+            self.stream_initialized = true;
+        }
+        let out = self.release_pending_events();
+        self.message_start_released = true;
+        out
+    }
+
     /// 客户端是否已收到过正文事件（`message_start` 及其后续）
     ///
     /// 用于判断上游断流后能否透明重放请求：只要客户端还没看到 `message_start`，
@@ -1863,6 +1893,69 @@ mod tests {
                 "text_delta 用的块 {idx} 从未发过 content_block_start（孤立 delta）: {all:?}"
             );
         }
+    }
+
+    /// 超时兜底：/cc 等待期强制放行 message_start，用估算 input_tokens 填充，
+    /// 且不影响后续正文事件的正常转发
+    #[test]
+    fn test_cc_force_release_message_start_on_timeout() {
+        let mut ctx =
+            StreamContext::new_with_thinking("test-model", 42, false, HashMap::new(), true);
+
+        // 尚未收到任何事件：处于等待期
+        assert!(ctx.awaiting_message_start_release());
+
+        let released = ctx.force_release_message_start();
+        // 应放行 message_start，且 input_tokens 取估算值 42
+        let msg_start = released
+            .iter()
+            .find(|e| e.event == "message_start")
+            .expect("应放行 message_start");
+        assert_eq!(
+            msg_start.data["message"]["usage"]["input_tokens"], 42,
+            "强制放行时应使用估算 input_tokens，实际: {msg_start:?}"
+        );
+        // 放行后不再处于等待期
+        assert!(!ctx.awaiting_message_start_release());
+
+        // 放行后正文事件应实时转发（不再缓冲）
+        let text = ctx.process_assistant_response("hello");
+        assert!(
+            text.iter()
+                .any(|e| e.event == "content_block_delta" && e.data["delta"]["text"] == "hello"),
+            "放行后正文应实时转发，实际: {text:?}"
+        );
+    }
+
+    /// 强制放行对「非延迟模式」与「已放行」都是幂等 no-op
+    #[test]
+    fn test_force_release_message_start_is_noop_when_not_waiting() {
+        // 非 /cc（delay = false）：从不进入等待期
+        let mut v1 =
+            StreamContext::new_with_thinking("test-model", 1, false, HashMap::new(), false);
+        assert!(!v1.awaiting_message_start_release());
+        assert!(
+            v1.force_release_message_start().is_empty(),
+            "非延迟模式强制放行应为空"
+        );
+
+        // /cc 已放行后再次调用应为空
+        let mut cc = StreamContext::new_with_thinking("test-model", 1, false, HashMap::new(), true);
+        let _ = ctx_release(&mut cc);
+        assert!(!cc.awaiting_message_start_release());
+        assert!(
+            cc.force_release_message_start().is_empty(),
+            "已放行后再次强制放行应为空"
+        );
+    }
+
+    /// 触发一次正常放行（收到 contextUsageEvent）
+    fn ctx_release(ctx: &mut StreamContext) -> Vec<SseEvent> {
+        ctx.take_events_for_kiro(&Event::ContextUsage(
+            crate::kiro::model::events::ContextUsageEvent {
+                context_usage_percentage: 10.0,
+            },
+        ))
     }
 
     /// 缓冲模式（/cc）下，完整的 tool_use（收到 stop）应正常放行

@@ -360,6 +360,7 @@ async fn handle_messages(
             tool_name_map,
             delay_message_start,
             state.passthrough_retry_after,
+            state.cc_message_start_max_delay_ms,
         )
         .await
     } else {
@@ -505,6 +506,7 @@ async fn handle_stream_request(
     tool_name_map: std::collections::HashMap<String, String>,
     delay_message_start: bool,
     passthrough_retry_after: bool,
+    cc_message_start_max_delay_ms: u64,
 ) -> Response {
     let mut restarter = StreamRestarter {
         provider: provider.clone(),
@@ -548,7 +550,14 @@ async fn handle_stream_request(
 
     let ctx = restarter.build_ctx();
 
-    let stream = create_sse_stream(upstream.response, ctx, restarter);
+    // `/cc` 延迟放行 message_start 的兜底上限：仅在延迟模式且配置了正上限时生效。
+    let message_start_deadline = if delay_message_start && cc_message_start_max_delay_ms > 0 {
+        Some(Duration::from_millis(cc_message_start_max_delay_ms))
+    } else {
+        None
+    };
+
+    let stream = create_sse_stream(upstream.response, ctx, restarter, message_start_deadline);
 
     Response::builder()
         .status(StatusCode::OK)
@@ -653,6 +662,11 @@ struct SseStreamState<S> {
     restarter: StreamRestarter,
     /// 流建立（拿到 200 响应头）的时刻，用于诊断断流距开始的耗时
     started_at: std::time::Instant,
+    /// `/cc` 延迟放行 message_start 的兜底定时器（None = 不设上限）
+    ///
+    /// 只在延迟模式且配置了正上限时为 `Some`。到期后强制放行 message_start，
+    /// 避免上游长思考期间客户端只收 ping、触发重试倒计时。放行后置空（一次性）。
+    message_start_deadline: Option<std::pin::Pin<Box<tokio::time::Sleep>>>,
 }
 
 /// 创建 SSE 事件流
@@ -660,6 +674,7 @@ fn create_sse_stream(
     response: reqwest::Response,
     ctx: StreamContext,
     restarter: StreamRestarter,
+    message_start_deadline: Option<Duration>,
 ) -> impl Stream<Item = Result<Bytes, Infallible>> {
     let init = SseStreamState {
         body: response.bytes_stream(),
@@ -669,6 +684,7 @@ fn create_sse_stream(
         ping: interval(Duration::from_secs(PING_INTERVAL_SECS)),
         restarter,
         started_at: std::time::Instant::now(),
+        message_start_deadline: message_start_deadline.map(|d| Box::pin(tokio::time::sleep(d))),
     };
 
     let processing_stream = stream::unfold(init, |state| async move {
@@ -680,6 +696,7 @@ fn create_sse_stream(
             mut ping,
             mut restarter,
             mut started_at,
+            mut message_start_deadline,
         } = state;
 
         if finished {
@@ -696,6 +713,7 @@ fn create_sse_stream(
                     ping,
                     restarter,
                     started_at,
+                    message_start_deadline,
                 }
             };
         }
@@ -819,6 +837,24 @@ fn create_sse_stream(
             _ = ping.tick() => {
                 tracing::trace!("发送 ping 保活事件");
                 let bytes: Vec<Result<Bytes, Infallible>> = vec![Ok(create_ping_sse())];
+                Some((stream::iter(bytes), next_state!(false)))
+            }
+            // `/cc` 延迟放行 message_start 的兜底：等待上限到期仍未放行时强制放行。
+            // `if` 守卫保证仅在「设了上限 + 仍在等待」时才轮询该分支，
+            // 故 unwrap 不会 panic；放行后置空，此分支后续不再触发。
+            _ = async { message_start_deadline.as_mut().unwrap().await },
+                if message_start_deadline.is_some() && ctx.awaiting_message_start_release() =>
+            {
+                message_start_deadline = None;
+                let events = ctx.force_release_message_start();
+                tracing::info!(
+                    "/cc message_start 延迟超时，用估算 input_tokens 强制放行（距流建立 {}ms）",
+                    started_at.elapsed().as_millis()
+                );
+                let bytes: Vec<Result<Bytes, Infallible>> = events
+                    .into_iter()
+                    .map(|e| Ok(Bytes::from(e.to_sse_string())))
+                    .collect();
                 Some((stream::iter(bytes), next_state!(false)))
             }
         }
