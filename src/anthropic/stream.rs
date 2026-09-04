@@ -1478,18 +1478,44 @@ impl StreamContext {
         self.delay_message_start
     }
 
-    /// 放行所有已完整（收到 stop）的 tool_use 事件
+    /// 放行已完整（收到 stop）的 tool_use 事件，**严格按 block index 递增顺序**
+    ///
+    /// Anthropic 协议要求 content_block 的 index 按递增顺序开始。多个 tool_use 交错
+    /// 到达、且完成顺序与 start 顺序不一致时（Claude Code 并行调用多个工具的常见
+    /// 场景），若按「谁先收到 stop」放行，会先发高 index 的 `content_block_start`
+    /// 再发低 index 的，客户端据此报 "Invalid tool parameters"（首次失败、重试
+    /// 恰好顺序一致时又正常，表现为偶发）。
+    ///
+    /// 因此只放行「连续的、已完成的最小 index 前缀」：最小 index 的块尚未完成时
+    /// 停住，不放行任何更高 index 的块——哪怕它已经完成，也要等前面的先放行。
+    /// 残留的（因前序未完成而被扣住的）块由流结束时的收尾逻辑处理。
     fn release_buffered_tool_events(&mut self) -> Vec<SseEvent> {
-        let completed = &self.completed_tool_ids;
         let mut out = Vec::new();
-        self.buffered_tool_events.retain(|(id, event)| {
-            if completed.contains(id) {
-                out.push(event.clone());
-                false
-            } else {
-                true
+        loop {
+            // 找出缓冲中 block index 最小的工具 id
+            let next_id = {
+                let indices = &self.tool_block_indices;
+                self.buffered_tool_events
+                    .iter()
+                    .filter_map(|(id, _)| indices.get(id).map(|&idx| (idx, id)))
+                    .min_by_key(|(idx, _)| *idx)
+                    .map(|(_, id)| id.clone())
+            };
+            let Some(next_id) = next_id else { break };
+            // 最小 index 的块未完成 → 不能放行它，更不能越过它放行更高 index 的块
+            if !self.completed_tool_ids.contains(&next_id) {
+                break;
             }
-        });
+            // 放行该工具的全部缓冲事件（保持到达顺序：start → delta… → stop）
+            let mut i = 0;
+            while i < self.buffered_tool_events.len() {
+                if self.buffered_tool_events[i].0 == next_id {
+                    out.push(self.buffered_tool_events.remove(i).1);
+                } else {
+                    i += 1;
+                }
+            }
+        }
         out
     }
 
@@ -2020,6 +2046,72 @@ mod tests {
         assert!(
             !text.contains("truncated"),
             "完整调用不应触发纠正文本，实际: {text}"
+        );
+    }
+
+    /// 复现假设：/cc 缓冲模式下，多个 tool_use 交错到达、且**完成（stop）顺序与
+    /// start 顺序相反**时，放行的 content_block_start 的 index 是否保持单调递增。
+    ///
+    /// Anthropic 协议要求 content_block 的 index 按递增顺序开始。若放行时按“谁先
+    /// 收到 stop”排序，会先发 index 2 的 start 再发 index 1 的 start → 乱序 →
+    /// Claude Code 报 "Invalid tool parameters"。此测试断言放行顺序按 index 递增。
+    #[test]
+    fn test_cc_interleaved_tools_release_in_index_order() {
+        let mut ctx =
+            StreamContext::new_with_thinking("test-model", 1, false, HashMap::new(), true);
+        let _ = ctx.generate_initial_events();
+
+        // 按放行先后顺序记录所有 content_block_start 的 index
+        let mut start_order: Vec<i64> = Vec::new();
+        let collect = |events: Vec<SseEvent>, out: &mut Vec<i64>| {
+            for e in &events {
+                if e.event == "content_block_start"
+                    && e.data["content_block"]["type"] == "tool_use"
+                    && let Some(i) = e.data["index"].as_i64()
+                {
+                    out.push(i);
+                }
+            }
+        };
+
+        // 工具 A 先开始（占 index 1），参数未写完，暂不 stop
+        collect(
+            ctx.process_tool_use(&crate::kiro::model::events::ToolUseEvent {
+                name: "Read".to_string(),
+                tool_use_id: "toolu_A".to_string(),
+                input: r#"{"path":"/a"#.to_string(),
+                stop: false,
+            }),
+            &mut start_order,
+        );
+        // 工具 B 后开始（占 index 2），且先完成（stop）
+        collect(
+            ctx.process_tool_use(&crate::kiro::model::events::ToolUseEvent {
+                name: "Read".to_string(),
+                tool_use_id: "toolu_B".to_string(),
+                input: r#"{"path":"/b"}"#.to_string(),
+                stop: true,
+            }),
+            &mut start_order,
+        );
+        // 工具 A 后完成
+        collect(
+            ctx.process_tool_use(&crate::kiro::model::events::ToolUseEvent {
+                name: "Read".to_string(),
+                tool_use_id: "toolu_A".to_string(),
+                input: r#""}"#.to_string(),
+                stop: true,
+            }),
+            &mut start_order,
+        );
+
+        // 断言：放行的 tool_use start 的 index 必须单调递增（先 1 后 2）。
+        // 若实现按“谁先 stop”放行，会得到 [2, 1] → 违反协议 → 客户端报错。
+        let mut sorted = start_order.clone();
+        sorted.sort();
+        assert_eq!(
+            start_order, sorted,
+            "tool_use 的 content_block_start 放行顺序未按 index 递增（交错完成导致乱序）: {start_order:?}"
         );
     }
 
