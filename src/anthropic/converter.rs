@@ -503,6 +503,30 @@ pub(crate) fn metadata_from_openai_extra(
 ) -> Option<super::types::Metadata> {
     use super::types::Metadata;
 
+    // 排查用日志：确认 Codex/OpenAI 客户端实际携带哪些字段，用于判断能否稳定复用 conversationId。
+    // 只打字段名，不打可能含账号标识的值（user_id / user）。
+    if tracing::enabled!(tracing::Level::DEBUG) {
+        let mut keys: Vec<&str> = extra.keys().map(|s| s.as_str()).collect();
+        keys.sort_unstable();
+        tracing::debug!(extra_keys = ?keys, "openai/codex extra 字段");
+        tracing::debug!(
+            has_metadata = extra.contains_key("metadata"),
+            has_user = extra.contains_key("user"),
+            has_session_id = extra.contains_key("session_id"),
+            has_previous_response_id = extra.contains_key("previous_response_id"),
+            has_prompt_cache_key = extra.contains_key("prompt_cache_key"),
+            "openai/codex 会话标识字段探测"
+        );
+        // prompt_cache_key 目前未被用于 conversationId；其值即 Codex 的 conversation_id
+        // （UUID/hash，不含 PII），打出来以验证跨轮是否稳定。
+        if let Some(pck) = extra.get("prompt_cache_key").and_then(|v| v.as_str()) {
+            tracing::debug!(
+                prompt_cache_key = %pck,
+                "openai/codex 携带 prompt_cache_key（当前未用于 conversationId）"
+            );
+        }
+    }
+
     if let Some(meta_val) = extra.get("metadata") {
         let user_id = meta_val
             .get("user_id")
@@ -513,6 +537,11 @@ pub(crate) fn metadata_from_openai_extra(
             .and_then(|v| v.as_str())
             .map(String::from);
         if user_id.is_some() || continuation_id.is_some() {
+            tracing::debug!(
+                has_user_id = user_id.is_some(),
+                has_continuation_id = continuation_id.is_some(),
+                "会话标识来源: metadata.user_id/continuation_id"
+            );
             return Some(Metadata {
                 user_id,
                 continuation_id,
@@ -520,6 +549,7 @@ pub(crate) fn metadata_from_openai_extra(
         }
         if let Some(sid) = meta_val.get("session_id").and_then(|v| v.as_str()) {
             if is_valid_uuid(sid) {
+                tracing::debug!("会话标识来源: metadata.session_id");
                 return Some(Metadata {
                     user_id: Some(format!("user_codex_account__session_{sid}")),
                     ..Default::default()
@@ -530,6 +560,7 @@ pub(crate) fn metadata_from_openai_extra(
 
     if let Some(user) = extra.get("user").and_then(|v| v.as_str()) {
         if !user.is_empty() {
+            tracing::debug!("会话标识来源: 顶层 user");
             return Some(Metadata {
                 user_id: Some(user.to_string()),
                 ..Default::default()
@@ -539,8 +570,21 @@ pub(crate) fn metadata_from_openai_extra(
 
     if let Some(sid) = extra.get("session_id").and_then(|v| v.as_str()) {
         if is_valid_uuid(sid) {
+            tracing::debug!("会话标识来源: 顶层 session_id");
             return Some(Metadata {
                 user_id: Some(format!("user_codex_account__session_{sid}")),
+                ..Default::default()
+            });
+        }
+    }
+
+    // Codex CLI 把稳定的 conversation_id 放在 prompt_cache_key（跨轮不变，实测为 UUID）。
+    // 优先于 previous_response_id：后者每轮变化，无法跨轮复用同一 conversationId。
+    if let Some(pck) = extra.get("prompt_cache_key").and_then(|v| v.as_str()) {
+        if is_valid_uuid(pck) {
+            tracing::debug!("会话标识来源: prompt_cache_key（Codex 稳定 conversation_id）");
+            return Some(Metadata {
+                user_id: Some(format!("user_codex_account__session_{pck}")),
                 ..Default::default()
             });
         }
@@ -549,6 +593,8 @@ pub(crate) fn metadata_from_openai_extra(
     if let Some(prev) = extra.get("previous_response_id").and_then(|v| v.as_str()) {
         let raw = prev.strip_prefix("resp_").unwrap_or(prev);
         if is_valid_uuid(raw) {
+            // 注意：previous_response_id 每轮都变，用它当会话 ID 无法跨轮复用
+            tracing::debug!("会话标识来源: previous_response_id（逐轮变化，非稳定会话 ID）");
             return Some(Metadata {
                 user_id: Some(format!("user_codex_account__session_{raw}")),
                 ..Default::default()
@@ -556,6 +602,7 @@ pub(crate) fn metadata_from_openai_extra(
         }
     }
 
+    tracing::debug!("未提取到会话标识，conversationId 将回退为随机 UUID");
     None
 }
 
@@ -1428,6 +1475,58 @@ fn merge_assistant_messages(
 mod tests {
     use super::*;
     use std::sync::Mutex;
+
+    /// Codex 请求以 prompt_cache_key 携带稳定 conversation_id，应据此复用会话 ID
+    #[test]
+    fn test_openai_extra_prompt_cache_key() {
+        let mut extra = HashMap::new();
+        extra.insert(
+            "prompt_cache_key".to_string(),
+            serde_json::json!("01a0a3ce-4446-7243-a7a2-b1c6ec1f90cf"),
+        );
+        let meta = metadata_from_openai_extra(&extra).expect("应从 prompt_cache_key 提取会话标识");
+        let user_id = meta.user_id.expect("user_id 应存在");
+        assert_eq!(
+            extract_session_id(&user_id).as_deref(),
+            Some("01a0a3ce-4446-7243-a7a2-b1c6ec1f90cf"),
+            "会话 ID 应等于 prompt_cache_key"
+        );
+    }
+
+    /// prompt_cache_key 稳定，优先级应高于逐轮变化的 previous_response_id
+    #[test]
+    fn test_openai_extra_prompt_cache_key_beats_previous_response_id() {
+        let mut extra = HashMap::new();
+        extra.insert(
+            "prompt_cache_key".to_string(),
+            serde_json::json!("01a0a3ce-4446-7243-a7a2-b1c6ec1f90cf"),
+        );
+        extra.insert(
+            "previous_response_id".to_string(),
+            serde_json::json!("resp_0b4445e1-f5be-49e1-87ce-62bbc28ad705"),
+        );
+        let meta = metadata_from_openai_extra(&extra).expect("应提取会话标识");
+        let user_id = meta.user_id.expect("user_id 应存在");
+        assert_eq!(
+            extract_session_id(&user_id).as_deref(),
+            Some("01a0a3ce-4446-7243-a7a2-b1c6ec1f90cf"),
+            "应优先使用 prompt_cache_key 而非 previous_response_id"
+        );
+    }
+
+    /// prompt_cache_key 非 UUID 时不应命中该分支
+    #[test]
+    fn test_openai_extra_prompt_cache_key_non_uuid() {
+        let mut extra = HashMap::new();
+        extra.insert(
+            "prompt_cache_key".to_string(),
+            serde_json::json!("not-a-uuid"),
+        );
+        assert!(
+            metadata_from_openai_extra(&extra).is_none(),
+            "非 UUID 的 prompt_cache_key 不应作为会话标识"
+        );
+    }
 
     /// 全局模型注册表测试互斥锁（避免并行测试互相覆盖）
     static REGISTRY_TEST_LOCK: Mutex<()> = Mutex::new(());
