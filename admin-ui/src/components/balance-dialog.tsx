@@ -1,29 +1,57 @@
+import { useEffect } from 'react'
 import {
   Dialog,
   DialogContent,
   DialogHeader,
   DialogTitle,
 } from '@/components/ui/dialog'
+import { Badge } from '@/components/ui/badge'
 import { Progress } from '@/components/ui/progress'
 import { useCredentialBalance } from '@/hooks/use-credentials'
 import { parseError } from '@/lib/utils'
+import {
+  credentialTitle,
+  formatAmount,
+  isPassthroughKind,
+  remainingIndicatorClass,
+  remainingPercentage,
+} from '@/lib/credential'
+import type { BalanceResponse, CredentialStatusItem } from '@/types/api'
 
 interface BalanceDialogProps {
-  credentialId: number | null
+  credential: CredentialStatusItem | null
+  /** 卡片上已有的余额，开窗时先显示，避免和外部展示不一致 */
+  cachedBalance: BalanceResponse | null
   open: boolean
   onOpenChange: (open: boolean) => void
+  /** 查询到新余额时回传，保持卡片和弹窗同源 */
+  onBalanceLoaded?: (id: number, balance: BalanceResponse) => void
 }
 
-export function BalanceDialog({ credentialId, open, onOpenChange }: BalanceDialogProps) {
-  const { data: balance, isLoading, error } = useCredentialBalance(credentialId)
+export function BalanceDialog({
+  credential,
+  cachedBalance,
+  open,
+  onOpenChange,
+  onBalanceLoaded,
+}: BalanceDialogProps) {
+  const credentialId = credential?.id ?? null
+  const { data, isLoading, error } = useCredentialBalance(open ? credentialId : null)
+
+  // 查询结果回传给列表，卡片与弹窗始终展示同一份数据
+  useEffect(() => {
+    if (data && credentialId !== null) {
+      onBalanceLoaded?.(credentialId, data)
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [data, credentialId])
+
+  const balance = data ?? cachedBalance
+  const isPassthrough = isPassthroughKind(credential?.kind)
 
   const formatDate = (timestamp: number | null) => {
     if (!timestamp) return '未知'
     return new Date(timestamp * 1000).toLocaleString('zh-CN')
-  }
-
-  const formatNumber = (num: number) => {
-    return num.toLocaleString('zh-CN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })
   }
 
   return (
@@ -31,17 +59,17 @@ export function BalanceDialog({ credentialId, open, onOpenChange }: BalanceDialo
       <DialogContent className="sm:max-w-md">
         <DialogHeader>
           <DialogTitle>
-            凭据 #{credentialId} 余额信息
+            {credential ? credentialTitle(credential) : '凭据'} 余额信息
           </DialogTitle>
         </DialogHeader>
 
-        {isLoading && (
+        {isLoading && !balance && (
           <div className="flex items-center justify-center py-8">
             <div className="animate-spin rounded-full h-8 w-8 border-b-2 border-primary"></div>
           </div>
         )}
 
-        {error && (() => {
+        {error && !balance && (() => {
           const parsed = parseError(error)
           return (
             <div className="py-6 space-y-3">
@@ -61,12 +89,12 @@ export function BalanceDialog({ credentialId, open, onOpenChange }: BalanceDialo
         })()}
 
         {balance &&
-          // 透传凭据（钱包模式）：无总额/百分比概念，只显示余额
-          (balance.usageLimit <= 0 ? (
+          // 透传凭据（钱包模式）：无总额/百分比概念，只显示余额（USD）
+          (isPassthrough ? (
             <div className="space-y-4">
               {balance.subscriptionTitle && (
                 <div className="text-center">
-                  <span className="text-lg font-semibold">{balance.subscriptionTitle}</span>
+                  <Badge variant="secondary">{balance.subscriptionTitle}</Badge>
                 </div>
               )}
               <div className="flex flex-col items-center gap-1 py-2">
@@ -74,52 +102,69 @@ export function BalanceDialog({ credentialId, open, onOpenChange }: BalanceDialo
                 <span
                   className={
                     balance.remaining <= 0
-                      ? 'text-3xl font-bold text-red-500'
-                      : 'text-3xl font-bold text-green-600'
+                      ? 'text-3xl font-bold tabular-nums text-destructive'
+                      : 'text-3xl font-bold tabular-nums'
                   }
                 >
-                  ${formatNumber(balance.remaining)}
+                  <span className="mr-0.5 text-base font-normal text-muted-foreground">$</span>
+                  {formatAmount(balance.remaining)}
                 </span>
                 {balance.remaining <= 0 && (
-                  <span className="text-sm text-red-500">余额已耗尽</span>
+                  <span className="text-sm text-destructive">余额已耗尽</span>
                 )}
               </div>
             </div>
           ) : (
-            <div className="space-y-4">
-              {/* 订阅类型 */}
-              <div className="text-center">
-                <span className="text-lg font-semibold">
-                  {balance.subscriptionTitle || '未知订阅类型'}
-                </span>
-              </div>
+            (() => {
+              // Kiro 凭据：与卡片一致，主指标是「剩余用量」百分比
+              const remainingPct = remainingPercentage(balance)
+              return (
+                <div className="space-y-4">
+                  {/* 订阅类型 */}
+                  <div className="text-center">
+                    {balance.subscriptionTitle ? (
+                      <Badge variant="secondary">{balance.subscriptionTitle}</Badge>
+                    ) : (
+                      <span className="text-sm text-muted-foreground">未知订阅类型</span>
+                    )}
+                  </div>
 
-              {/* 使用进度 */}
-              <div className="space-y-2">
-                <div className="flex justify-between text-sm">
-                  <span>已使用: ${formatNumber(balance.currentUsage)}</span>
-                  <span>限额: ${formatNumber(balance.usageLimit)}</span>
-                </div>
-                <Progress value={balance.usagePercentage} />
-                <div className="text-center text-sm text-muted-foreground">
-                  {balance.usagePercentage.toFixed(1)}% 已使用
-                </div>
-              </div>
+                  {/* 剩余用量：方向与配色和卡片一致 */}
+                  <div className="space-y-2">
+                    <div className="flex items-baseline justify-between">
+                      <span className="text-sm text-muted-foreground">剩余用量</span>
+                      <span className="text-2xl font-bold leading-none tabular-nums">
+                        {remainingPct.toFixed(0)}
+                        <span className="ml-0.5 text-xs font-normal text-muted-foreground">%</span>
+                      </span>
+                    </div>
+                    <Progress
+                      value={remainingPct}
+                      max={100}
+                      className="h-1.5"
+                      indicatorClassName={remainingIndicatorClass(remainingPct)}
+                    />
+                    <div className="text-right text-[11px] text-muted-foreground tabular-nums">
+                      剩 {formatAmount(balance.remaining)} / {formatAmount(balance.usageLimit)}
+                    </div>
+                  </div>
 
-              {/* 详细信息 */}
-              <div className="grid grid-cols-2 gap-4 pt-4 border-t text-sm">
-                <div>
-                  <span className="text-muted-foreground">剩余额度：</span>
-                  <span className="font-medium text-green-600">
-                    ${formatNumber(balance.remaining)}
-                  </span>
+                  {/* 详细信息 */}
+                  <div className="grid grid-cols-2 gap-4 pt-4 border-t text-sm">
+                    <div>
+                      <span className="text-muted-foreground">已使用：</span>
+                      <span className="font-medium tabular-nums">
+                        {formatAmount(balance.currentUsage)}
+                      </span>
+                    </div>
+                    <div>
+                      <span className="text-muted-foreground">下次重置：</span>
+                      <span className="font-medium">{formatDate(balance.nextResetAt)}</span>
+                    </div>
+                  </div>
                 </div>
-                <div>
-                  <span className="text-muted-foreground">下次重置：</span>
-                  <span className="font-medium">{formatDate(balance.nextResetAt)}</span>
-                </div>
-              </div>
-            </div>
+              )
+            })()
           ))}
       </DialogContent>
     </Dialog>

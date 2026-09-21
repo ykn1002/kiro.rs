@@ -88,6 +88,8 @@ export function Dashboard({ onLogout }: DashboardProps) {
   const startIndex = (currentPage - 1) * itemsPerPage
   const endIndex = startIndex + itemsPerPage
   const currentCredentials = data?.credentials.slice(startIndex, endIndex) || []
+  const selectedCredential =
+    data?.credentials.find(credential => credential.id === selectedCredentialId) ?? null
   const disabledCredentialCount = data?.credentials.filter(credential => credential.disabled).length || 0
   const selectedDisabledCount = Array.from(selectedIds).filter(id => {
     const credential = data?.credentials.find(c => c.id === id)
@@ -162,6 +164,16 @@ export function Dashboard({ onLogout }: DashboardProps) {
   const handleViewBalance = (id: number) => {
     setSelectedCredentialId(id)
     setBalanceDialogOpen(true)
+  }
+
+  // 弹窗查到新余额后同步进列表缓存，保证卡片与弹窗展示同一份数据
+  const handleBalanceLoaded = (id: number, balance: BalanceResponse) => {
+    setBalanceMap(prev => {
+      if (prev.get(id) === balance) return prev
+      const next = new Map(prev)
+      next.set(id, balance)
+      return next
+    })
   }
 
   const handleRefresh = () => {
@@ -912,9 +924,11 @@ export function Dashboard({ onLogout }: DashboardProps) {
 
       {/* 余额对话框 */}
       <BalanceDialog
-        credentialId={selectedCredentialId}
+        credential={selectedCredential}
+        cachedBalance={selectedCredentialId !== null ? balanceMap.get(selectedCredentialId) ?? null : null}
         open={balanceDialogOpen}
         onOpenChange={setBalanceDialogOpen}
+        onBalanceLoaded={handleBalanceLoaded}
       />
 
       {/* 添加凭据对话框 */}

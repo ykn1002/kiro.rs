@@ -21,6 +21,14 @@ import { Checkbox } from '@/components/ui/checkbox'
 import { Progress } from '@/components/ui/progress'
 import { cn } from '@/lib/utils'
 import {
+  credentialTitle,
+  formatAmount,
+  isPassthroughKind,
+  passthroughKindLabel,
+  remainingIndicatorClass,
+  remainingPercentage,
+} from '@/lib/credential'
+import {
   Dialog,
   DialogContent,
   DialogDescription,
@@ -86,18 +94,6 @@ function authMethodLabel(method: string | null | undefined): string | null {
       return 'Social'
     default:
       return method
-  }
-}
-
-// 透传凭据的类型标签（Kiro 凭据返回 null，不显示）
-function passthroughKindLabel(kind: string | null | undefined): string | null {
-  switch (kind) {
-    case 'anthropic':
-      return 'Claude 透传'
-    case 'openai':
-      return 'Codex 透传'
-    default:
-      return null
   }
 }
 
@@ -253,13 +249,13 @@ export function CredentialCard({
   const dot = healthDot[health]
   const authLabel = authMethodLabel(credential.authMethod)
   const kindLabel = passthroughKindLabel(credential.kind)
-  const isPassthrough = kindLabel !== null
+  const isPassthrough = isPassthroughKind(credential.kind)
   const rpmUsage = formatRpmUsage(credential.rpm)
   const hasFailure = credential.failureCount > 0 || credential.refreshFailureCount > 0
-  const title = credential.name || credential.email || `凭据 #${credential.id}`
+  const title = credentialTitle(credential)
   // 有自定义名或邮箱作标题时，副标题才显示 #ID，避免「凭据 #3 / #3」重复
   const showIdInSub = Boolean(credential.name || credential.email)
-  const remainingPct = balance ? 100 - balance.usagePercentage : null
+  const remainingPct = balance ? remainingPercentage(balance) : null
 
   return (
     <>
@@ -409,7 +405,7 @@ export function CredentialCard({
                     )}
                   >
                     <span className="mr-0.5 text-xs font-normal text-muted-foreground">$</span>
-                    {balance.remaining.toFixed(2)}
+                    {formatAmount(balance.remaining)}
                   </span>
                 ) : (
                   <span className="text-xs text-muted-foreground">未知</span>
@@ -453,16 +449,10 @@ export function CredentialCard({
                     value={remainingPct ?? 0}
                     max={100}
                     className="mt-2 h-1.5"
-                    indicatorClassName={
-                      (remainingPct ?? 0) < 20
-                        ? 'bg-destructive'
-                        : (remainingPct ?? 0) < 40
-                          ? 'bg-warning'
-                          : 'bg-success'
-                    }
+                    indicatorClassName={remainingIndicatorClass(remainingPct ?? 0)}
                   />
                   <div className="mt-1.5 text-right text-[11px] text-muted-foreground tabular-nums">
-                    剩 {balance.remaining.toFixed(2)} / {balance.usageLimit.toFixed(2)}
+                    剩 {formatAmount(balance.remaining)} / {formatAmount(balance.usageLimit)}
                   </div>
                 </>
               ) : (
