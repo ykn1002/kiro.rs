@@ -108,7 +108,6 @@ export function SettingsDialog({ open, onOpenChange }: SettingsDialogProps) {
   const [streamingSdkVersion, setStreamingSdkVersion] = useState('')
   const [models, setModels] = useState<ModelDef[]>([])
   const [modelsExpanded, setModelsExpanded] = useState(true)
-  const [defaultModel, setDefaultModel] = useState('')
   const [modelAliases, setModelAliases] = useState<ModelAliasRow[]>([])
   const [aliasesExpanded, setAliasesExpanded] = useState(false)
   const [chunkedEnabled, setChunkedEnabled] = useState(false)
@@ -152,7 +151,6 @@ export function SettingsDialog({ open, onOpenChange }: SettingsDialogProps) {
     setNodeVersion(config.nodeVersion)
     setStreamingSdkVersion(config.streamingSdkVersion)
     setModels(config.models.map((m) => ({ ...m })))
-    setDefaultModel(config.defaultModel ?? '')
     setModelAliases(aliasesToRows(config.modelAliases ?? {}))
     setChunkedEnabled(config.chunkedWritePolicy?.enabled ?? false)
     setChunkedTriggerLines(String(config.chunkedWritePolicy?.triggerLines ?? 150))
@@ -386,7 +384,6 @@ export function SettingsDialog({ open, onOpenChange }: SettingsDialogProps) {
         nodeVersion: nodeVersion.trim(),
         streamingSdkVersion: streamingSdkVersion.trim(),
         models: cleanedModels,
-        defaultModel: defaultModel.trim() || null,
         modelAliases: rowsToAliases(modelAliases),
         chunkedWritePolicy: {
           enabled: chunkedEnabled,
@@ -724,18 +721,8 @@ export function SettingsDialog({ open, onOpenChange }: SettingsDialogProps) {
                 </button>
                 {aliasesExpanded && (
                   <>
-                    <div className="space-y-1">
-                      <label className="text-xs text-muted-foreground">defaultModel（未识别时回退）</label>
-                      <Input
-                        value={defaultModel}
-                        onChange={(e) => setDefaultModel(e.target.value)}
-                        disabled={isPending}
-                        placeholder="claude-opus-4-6"
-                        list="model-target-options"
-                      />
-                    </div>
                     <p className="text-xs text-muted-foreground">
-                      Codex 发送 gpt-5.5 等 OpenAI 模型名时，通过别名或 defaultModel 映射到下方模型列表中的 displayId
+                      Codex 发送 gpt-5.5 等 OpenAI 模型名时，通过别名映射到下方模型列表中的 displayId；未命中任何规则将返回「模型不支持」
                     </p>
                     <div className="space-y-2">
                       {modelAliases.map((row, index) => (

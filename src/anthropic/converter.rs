@@ -21,14 +21,12 @@ use crate::model::config::{ChunkedWritePolicy, ModelDef, default_models};
 
 use super::types::{ContentBlock, MessagesRequest};
 
-/// 全局模型注册表设置（模型表 + 别名 + 默认回退）
+/// 全局模型注册表设置（模型表 + 别名）
 #[derive(Debug, Clone)]
 pub struct ModelRegistrySettings {
     pub models: Vec<ModelDef>,
     /// 客户端模型名（小写）→ 目标模型名
     pub aliases: HashMap<String, String>,
-    /// 未匹配时的回退模型名
-    pub default_model: Option<String>,
 }
 
 impl Default for ModelRegistrySettings {
@@ -36,7 +34,6 @@ impl Default for ModelRegistrySettings {
         Self {
             models: default_models(),
             aliases: HashMap::new(),
-            default_model: None,
         }
     }
 }
@@ -61,20 +58,12 @@ fn registry() -> &'static RwLock<Arc<ModelRegistrySettings>> {
 /// 应在启动早期、任何请求进入前调用一次。若注册表尚未初始化则直接以注入值建立；
 /// 否则等价于一次热替换（见 [`set_model_registry`]）。
 pub fn init_model_registry(models: Vec<ModelDef>) {
-    init_model_mapping(models, HashMap::new(), None);
+    init_model_mapping(models, HashMap::new());
 }
 
-/// 初始化模型表、别名与默认回退（Codex / OpenAI 客户端模型名映射）
-pub fn init_model_mapping(
-    models: Vec<ModelDef>,
-    aliases: HashMap<String, String>,
-    default_model: Option<String>,
-) {
-    let settings = ModelRegistrySettings {
-        models,
-        aliases,
-        default_model,
-    };
+/// 初始化模型表与别名（Codex / OpenAI 客户端模型名映射）
+pub fn init_model_mapping(models: Vec<ModelDef>, aliases: HashMap<String, String>) {
+    let settings = ModelRegistrySettings { models, aliases };
     if MODEL_REGISTRY
         .set(RwLock::new(Arc::new(settings.clone())))
         .is_err()
@@ -85,13 +74,12 @@ pub fn init_model_mapping(
 
 /// 运行时热替换全局模型表（Admin API 修改 models 后调用）。
 ///
-/// 保留现有 aliases / default_model 不变。
+/// 保留现有 aliases 不变。
 pub fn set_model_registry(models: Vec<ModelDef>) {
     let current = registry().read().clone();
     set_model_registry_settings(ModelRegistrySettings {
         models,
         aliases: current.aliases.clone(),
-        default_model: current.default_model.clone(),
     });
 }
 
@@ -167,22 +155,6 @@ fn match_model_def(model: &str) -> Option<ModelDef> {
             );
         }
         return Some(def);
-    }
-
-    if let Some(default) = settings().default_model.clone() {
-        if default.to_lowercase() != model.to_lowercase()
-            && default.to_lowercase() != resolved.to_lowercase()
-        {
-            if let Some(def) = lookup_model_def(&resolve_aliases(&default)) {
-                tracing::debug!(
-                    original = %model,
-                    default = %default,
-                    kiro_id = %def.kiro_id,
-                    "模型映射: 使用 defaultModel 回退"
-                );
-                return Some(def);
-            }
-        }
     }
 
     None
@@ -1671,7 +1643,6 @@ mod tests {
         set_model_registry_settings(ModelRegistrySettings {
             models: default_models(),
             aliases: HashMap::new(),
-            default_model: None,
         });
         assert!(map_model("gpt-4").is_none());
     }
@@ -1682,7 +1653,6 @@ mod tests {
         set_model_registry_settings(ModelRegistrySettings {
             models: default_models(),
             aliases: HashMap::new(),
-            default_model: None,
         });
         // 命中模型表 → displayId；thinking 变体归并到基础模型
         let base = canonical_model_display("claude-opus-4-6");
@@ -1702,20 +1672,20 @@ mod tests {
         set_model_registry_settings(ModelRegistrySettings {
             models: default_models(),
             aliases,
-            default_model: None,
         });
         assert_eq!(map_model("gpt-5.5"), Some("claude-opus-4.6".to_string()));
     }
 
     #[test]
-    fn test_map_model_default_fallback() {
+    fn test_map_model_unmatched_returns_none() {
+        // 移除 defaultModel 兜底后：匹配不上的模型名一律返回 None，不再静默替换
         let _lock = REGISTRY_TEST_LOCK.lock().unwrap();
         set_model_registry_settings(ModelRegistrySettings {
             models: default_models(),
             aliases: HashMap::new(),
-            default_model: Some("claude-sonnet-4-6".to_string()),
         });
-        assert_eq!(map_model("gpt-5.5"), Some("claude-sonnet-4.6".to_string()));
+        assert!(map_model("gpt-5.5").is_none());
+        assert!(map_model("gpt-6-astra").is_none());
     }
 
     #[test]
@@ -1724,7 +1694,6 @@ mod tests {
         set_model_registry_settings(ModelRegistrySettings {
             models: default_models(),
             aliases: HashMap::new(),
-            default_model: None,
         });
         assert_eq!(
             map_model("claude-sonnet-4-6"),

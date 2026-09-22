@@ -141,11 +141,7 @@ pub async fn build(opts: RunOptions) -> Result<Server, StartupError> {
     http_client::warn_tls_backend_fallback(requested_tls, config.tls_backend);
 
     // 初始化全局模型注册表，须在任何请求进入前完成
-    anthropic::init_model_mapping(
-        config.effective_models(),
-        config.effective_model_aliases(),
-        config.default_model.clone(),
-    );
+    anthropic::init_model_mapping(config.effective_models(), config.effective_model_aliases());
 
     // 分块写入策略（默认关闭）
     anthropic::set_chunked_write_policy(config.chunked_write_policy.clone());
@@ -163,11 +159,10 @@ pub async fn build(opts: RunOptions) -> Result<Server, StartupError> {
         tracing::info!("codex 截断纠正文本已关闭（挂空 item 封口仍生效）");
     }
 
-    if config.default_model.is_some() || !config.model_aliases.is_empty() {
+    if !config.model_aliases.is_empty() {
         tracing::info!(
-            default_model = ?config.default_model,
             alias_count = config.model_aliases.len(),
-            "已加载 OpenAI/Codex 模型映射"
+            "已加载 OpenAI/Codex 模型别名映射"
         );
     }
 

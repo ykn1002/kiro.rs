@@ -270,9 +270,6 @@ pub struct AppConfigResponse {
     pub streaming_sdk_version: String,
     /// 模型列表（生效值，缺省时为内置默认表）
     pub models: Vec<ModelDef>,
-    /// OpenAI/Codex 未识别模型名的回退目标（displayId / kiroId）
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub default_model: Option<String>,
     /// 客户端模型名 → 本服务模型名
     pub model_aliases: HashMap<String, String>,
     /// Write/Edit 分块写入策略
@@ -325,9 +322,6 @@ pub struct UpdateAppConfigRequest {
     pub streaming_sdk_version: String,
     /// 模型列表（至少一个）
     pub models: Vec<ModelDef>,
-    /// OpenAI/Codex 未识别模型名的回退目标
-    #[serde(default)]
-    pub default_model: Option<String>,
     /// 客户端模型名 → 本服务模型名
     #[serde(default)]
     pub model_aliases: HashMap<String, String>,

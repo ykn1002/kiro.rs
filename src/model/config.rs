@@ -368,13 +368,6 @@ pub struct Config {
     #[serde(skip_serializing_if = "HashMap::is_empty")]
     pub model_aliases: HashMap<String, String>,
 
-    /// 未命中任何模型规则时的回退模型名（displayId / kiroId / 别名）。
-    ///
-    /// 适用于 Codex 等固定发送 `gpt-5.x` 但后端实际走 Claude/Kiro 的场景。
-    #[serde(default)]
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub default_model: Option<String>,
-
     /// 配置文件路径（运行时元数据，不写入 JSON）
     #[serde(skip)]
     config_path: Option<PathBuf>,
@@ -575,7 +568,6 @@ impl Default for Config {
             endpoints: HashMap::new(),
             models: None,
             model_aliases: HashMap::new(),
-            default_model: None,
             config_path: None,
         }
     }

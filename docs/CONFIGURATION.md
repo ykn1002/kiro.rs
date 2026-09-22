@@ -58,7 +58,6 @@
 | `defaultEndpoint` | string | `ide` | 默认 Kiro 端点。凭据未显式指定 `endpoint` 时使用。当前支持：`ide` |
 | `models` | array | 内置默认表 | 模型列表（驱动 `/v1/models` 展示、模型名映射、上下文窗口判断）。未配置时使用内置默认表，**完全向后兼容**；一旦提供则整张表以配置为准。每项字段见下方说明 |
 | `modelAliases` | object | `{}` | 客户端模型名 → 本服务模型名（`displayId` / `kiroId` / 别名）的显式映射，键不区分大小写。用于 Codex 等固定发送 `gpt-5.x` 的客户端，例如 `{"gpt-5.5": "claude-opus-4-6"}` |
-| `defaultModel` | string | - | 未命中任何模型规则时的回退模型名（`displayId` / `kiroId` / 别名）。适用于客户端发送未知模型名但后端统一走某个 Claude/Kiro 模型的场景 |
 
 #### `models` 项字段
 
@@ -413,7 +412,7 @@ wire_api = "responses"
 
 然后设置环境变量：`export KIRO_RS_API_KEY=<config.json 中的 apiKey>`
 
-> Codex 常固定发送 `gpt-5.x` 之类的模型名，可通过 `config.json` 的 `modelAliases` / `defaultModel` 映射到实际 Kiro 模型。`/v1/responses` 端点的工具参数截断纠正由 `codexTruncationCorrection` 控制（默认开）。
+> Codex 常固定发送 `gpt-5.x` 之类的模型名，可通过 `config.json` 的 `modelAliases` 映射到实际 Kiro 模型。`/v1/responses` 端点的工具参数截断纠正由 `codexTruncationCorrection` 控制（默认开）。
 
 ### 运维探针
 
@@ -482,7 +481,7 @@ wire_api = "responses"
 | `*sonnet*` 4.5 | `claude-sonnet-4.5` | `claude-sonnet-4-5-20250929` | 200,000 |
 | `*haiku*` | `claude-haiku-4.5` | `claude-haiku-4-5-20251001` | 200,000 |
 
-> 匹配按数组顺序取首个命中项。未命中任何规则时，若配置了 `defaultModel` 则回退到该模型，否则返回「模型不支持」。`modelAliases` 可为固定发送某模型名的客户端提供显式映射。
+> 匹配按数组顺序取首个命中项。未命中任何规则时返回「模型不支持」（若凭据池内有 anthropic 透传凭据，则 fallback 到原样透传）。`modelAliases` 可为固定发送某模型名的客户端提供显式映射。
 
 ## Admin（可选）
 

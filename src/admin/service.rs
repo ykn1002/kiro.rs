@@ -587,7 +587,6 @@ impl AdminService {
             node_version: config.node_version.clone(),
             streaming_sdk_version: config.streaming_sdk_version.clone(),
             models: config.effective_models(),
-            default_model: config.default_model.clone(),
             model_aliases: config.model_aliases.clone(),
             chunked_write_policy: config.chunked_write_policy.clone(),
             codex_truncation_correction: config.codex_truncation_correction,
@@ -670,15 +669,6 @@ impl AdminService {
                 ));
             }
         }
-        if req
-            .default_model
-            .as_ref()
-            .is_some_and(|s| s.trim().is_empty())
-        {
-            return Err(AdminServiceError::InvalidCredential(
-                "defaultModel 不能为空字符串".to_string(),
-            ));
-        }
         // 分块写入策略：仅在启用时校验行数（关闭时数值无意义，允许任意残留值）
         if let Some(ref p) = req.chunked_write_policy
             && p.enabled
@@ -700,11 +690,6 @@ impl AdminService {
             .iter()
             .map(|(k, v)| (k.trim().to_lowercase(), v.trim().to_string()))
             .collect();
-        let default_model = req
-            .default_model
-            .as_ref()
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty());
 
         // ---- 读盘 → 改字段 → 回写 ----
         let config_path = self
@@ -755,7 +740,6 @@ impl AdminService {
         new_config.streaming_sdk_version = req.streaming_sdk_version.trim().to_string();
         new_config.models = Some(req.models.clone());
         new_config.model_aliases = normalized_aliases.clone();
-        new_config.default_model = default_model.clone();
         if let Some(ref policy) = req.chunked_write_policy {
             new_config.chunked_write_policy = policy.clone();
         }
@@ -803,7 +787,7 @@ impl AdminService {
             // 热替换 adminApiKey：认证中间件与本服务共享该句柄，立即生效
             *self.shared_admin_api_key.write() = k;
         }
-        crate::anthropic::init_model_mapping(req.models, normalized_aliases, default_model);
+        crate::anthropic::init_model_mapping(req.models, normalized_aliases);
         crate::anthropic::set_chunked_write_policy(new_config.chunked_write_policy.clone());
         crate::openai::set_codex_truncation_correction(new_config.codex_truncation_correction);
         self.token_manager.replace_config(new_config);

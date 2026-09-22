@@ -223,7 +223,6 @@ export interface AppConfig {
   nodeVersion: string
   streamingSdkVersion: string
   models: ModelDef[]
-  defaultModel?: string | null
   modelAliases: Record<string, string>
   chunkedWritePolicy: ChunkedWritePolicy
   codexTruncationCorrection: boolean
@@ -250,7 +249,6 @@ export interface UpdateAppConfigRequest {
   nodeVersion: string
   streamingSdkVersion: string
   models: ModelDef[]
-  defaultModel?: string | null
   modelAliases: Record<string, string>
   chunkedWritePolicy: ChunkedWritePolicy
   codexTruncationCorrection?: boolean
