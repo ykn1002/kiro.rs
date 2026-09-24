@@ -17,9 +17,10 @@
 - **断流不白扣配额** — 上游断流时客户端不再整轮重试：首帧前**透明重放**（仅 Anthropic 端点，客户端无感知），中途断流按各协议原生「截断」语义**优雅收尾**（`max_tokens` / `incomplete` / `length`）让模型续写。Kiro 按请求次数计费，这一处直接省配额。
 - **桌面版开箱即用** — Tauri 托盘应用，AWS SSO **一键导入**凭证、**免登录**直达管理面板、关窗**自动释放内存**，全程零命令行、零手写配置。→ [桌面版](#桌面版)
 - **多凭据自动调度** — 多账号凭据池，三种负载均衡（`优先级` / `均衡` / `轮询`）叠加按模型（Opus/Sonnet/Haiku）RPM 限流、智能重试与故障转移，单账号额度耗尽自动切换，Token 自动刷新回写。
+- **第三方 API 透传凭证** — 可把标准协议的第三方 API（Claude / Codex）作为透传后端混入同一凭据池，与 Kiro 凭证一起负载均衡与故障转移、按入站协议隔离：Kiro 凭证走翻译链，透传凭证原样转发原始字节，额度耗尽（`403 INSUFFICIENT_BALANCE`）自动切换，余额走上游 `/v1/usage` 查询（USD）。
 - **双生态兼容** — 同时对接 Anthropic（`/v1/messages`，Claude Code 专用 `/cc/v1` 校正 `input_tokens` 并处理工具参数截断）与 OpenAI / Codex（`/v1/chat/completions`、`/v1/responses`）客户端，模型名自动映射与别名。
 - **Thinking / 工具调用 / WebSearch** — 支持 extended thinking、function calling（tool use），内置 WebSearch 工具转换。
-- **多模型支持** — 模型表由配置驱动，内置默认表涵盖 Opus 4.5–5、Sonnet 4.5-5、Haiku 4.5，支持自定义与别名映射。
+- **多模型支持** — 模型表由配置驱动，内置默认表涵盖 Opus 4.5–4.8、Sonnet 4.5 / 4.6、Haiku 4.5，支持自定义与别名映射。
 - **Admin 管理** — 可选的 Web 管理界面与 API：凭据管理、余额查询、实时监控、配置热更新。
 - **可观测性** — 内置 `/healthz`、`/readyz` 探针与 Prometheus `/metrics`。
 
