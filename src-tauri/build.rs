@@ -12,6 +12,7 @@ fn main() {
         "set_log_capture",
         "clear_logs",
         "import_config",
+        "save_text_file",
         "scan_sso_credentials",
         "check_update",
         "open_url",

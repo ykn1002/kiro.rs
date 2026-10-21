@@ -176,6 +176,26 @@ export async function importConfig(): Promise<ImportConfigResult | null> {
   }
 }
 
+export interface SaveFileResult {
+  /** 用户是否取消了保存 */
+  cancelled: boolean
+  /** 实际写入的路径 */
+  path: string
+}
+
+/** 弹系统保存对话框写入文本文件（WebView 不处理 blob 下载）；非桌面环境返回 null。 */
+export async function saveTextFile(
+  defaultName: string,
+  content: string
+): Promise<SaveFileResult | null> {
+  const t = tauri()
+  if (!t) return null
+  try {
+    return await t.core.invoke<SaveFileResult>('save_text_file', { defaultName, content })
+  } catch (e) {
+    throw toError(e, 'save_text_file')
+  }
+}
 
 export interface SsoCredentialCandidate {
   refreshToken: string

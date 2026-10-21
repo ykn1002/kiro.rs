@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react'
+import { useState, useEffect, useRef } from 'react'
 import {
   ChevronDown,
   ChevronRight,
@@ -33,10 +33,11 @@ import {
   getPortStatus,
   setConfiguredPort,
   importConfig,
+  saveTextFile,
   type PortStatus,
 } from '@/lib/desktop'
 import { storage } from '@/lib/storage'
-import { Monitor, FileUp } from 'lucide-react'
+import { Monitor, FileUp, FileDown } from 'lucide-react'
 import type { ModelDef } from '@/types/api'
 
 // 设置分组 Tab
@@ -75,6 +76,63 @@ interface ModelAliasRow {
 
 function aliasesToRows(aliases: Record<string, string>): ModelAliasRow[] {
   return Object.entries(aliases).map(([from, to]) => ({ from, to }))
+}
+
+// 清洗单个模型定义：trim 字符串、空 version 归一为 null
+function cleanModel(m: ModelDef): ModelDef {
+  return {
+    family: m.family.trim(),
+    version: m.version?.trim() ? m.version.trim() : null,
+    kiroId: m.kiroId.trim(),
+    displayId: m.displayId.trim(),
+    displayName: m.displayName.trim(),
+    created: m.created,
+    maxTokens: m.maxTokens,
+    contextWindow: m.contextWindow,
+  }
+}
+
+// 解析导入的模型 JSON：支持纯数组，或含 models 字段的对象（如完整 config.json）。
+// 字段不合法的条目跳过并计数，不中断整体导入。
+function parseImportedModels(text: string): { models: ModelDef[]; invalid: number } {
+  const data: unknown = JSON.parse(text)
+  const list: unknown =
+    Array.isArray(data) ? data : (data as { models?: unknown } | null)?.models
+  if (!Array.isArray(list)) {
+    throw new Error('文件中未找到模型数组（应为数组或含 models 字段的对象）')
+  }
+  const str = (v: unknown) => (typeof v === 'string' ? v.trim() : '')
+  const models: ModelDef[] = []
+  let invalid = 0
+  for (const raw of list) {
+    const r = (raw ?? {}) as Record<string, unknown>
+    const m: ModelDef = {
+      family: str(r.family),
+      version: str(r.version) || null,
+      kiroId: str(r.kiroId),
+      displayId: str(r.displayId),
+      displayName: str(r.displayName),
+      created:
+        typeof r.created === 'number' && Number.isFinite(r.created)
+          ? r.created
+          : Math.floor(Date.now() / 1000),
+      maxTokens: typeof r.maxTokens === 'number' ? r.maxTokens : 0,
+      contextWindow: typeof r.contextWindow === 'number' ? r.contextWindow : 0,
+    }
+    if (
+      !m.family ||
+      !m.kiroId ||
+      !m.displayId ||
+      !m.displayName ||
+      m.maxTokens <= 0 ||
+      m.contextWindow <= 0
+    ) {
+      invalid++
+      continue
+    }
+    models.push(m)
+  }
+  return { models, invalid }
 }
 
 function rowsToAliases(rows: ModelAliasRow[]): Record<string, string> {
@@ -275,6 +333,74 @@ export function SettingsDialog({ open, onOpenChange }: SettingsDialogProps) {
     setModels((prev) => prev.filter((_, i) => i !== index))
   }
 
+  const modelFileInputRef = useRef<HTMLInputElement>(null)
+
+  // 导出当前表单中的模型列表（含未保存的编辑）为 JSON 数组
+  const handleExportModels = async () => {
+    const content = JSON.stringify(models.map(cleanModel), null, 2)
+    const fileName = 'kiro-models.json'
+    try {
+      if (DESKTOP) {
+        // 桌面 WebView 不处理 blob 下载，走原生保存对话框
+        const res = await saveTextFile(fileName, content)
+        if (res && !res.cancelled) toast.success(`已导出 ${models.length} 个模型到 ${res.path}`)
+        return
+      }
+      const url = URL.createObjectURL(new Blob([content], { type: 'application/json' }))
+      const a = document.createElement('a')
+      a.href = url
+      a.download = fileName
+      a.click()
+      URL.revokeObjectURL(url)
+      toast.success(`已导出 ${models.length} 个模型`)
+    } catch (e) {
+      toast.error(`导出失败: ${extractErrorMessage(e)}`)
+    }
+  }
+
+  // 导入模型：按 displayId 去重，已存在的跳过，不同的追加到列表末尾（需点「保存并生效」才落盘）
+  const handleImportModels = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0]
+    // 允许重复选择同一文件
+    e.target.value = ''
+    if (!file) return
+    file
+      .text()
+      .then((text) => {
+        const { models: imported, invalid } = parseImportedModels(text)
+        const existing = new Set(models.map((m) => m.displayId.trim()))
+        const added: ModelDef[] = []
+        let duplicate = 0
+        for (const m of imported) {
+          if (existing.has(m.displayId)) {
+            duplicate++
+            continue
+          }
+          existing.add(m.displayId)
+          added.push(m)
+        }
+        if (added.length > 0) {
+          setModels((prev) => [...prev, ...added])
+          setModelsExpanded(true)
+        }
+        const extra = [
+          duplicate > 0 ? `跳过已存在 ${duplicate} 个` : '',
+          invalid > 0 ? `字段不合法 ${invalid} 个` : '',
+        ]
+          .filter(Boolean)
+          .join('，')
+        const summary = `新增 ${added.length} 个模型${extra ? `（${extra}）` : ''}`
+        if (added.length > 0) {
+          toast.success(`${summary}，点击「保存并生效」后生效`)
+        } else {
+          toast.info(`没有新模型可导入${extra ? `：${extra}` : ''}`)
+        }
+      })
+      .catch((err) => {
+        toast.error(`导入失败: ${extractErrorMessage(err)}`)
+      })
+  }
+
   const addAlias = () => {
     setModelAliases((prev) => [...prev, { from: '', to: '' }])
   }
@@ -357,16 +483,7 @@ export function SettingsDialog({ open, onOpenChange }: SettingsDialogProps) {
       return
     }
 
-    const cleanedModels: ModelDef[] = models.map((m) => ({
-      family: m.family.trim(),
-      version: m.version?.trim() ? m.version.trim() : null,
-      kiroId: m.kiroId.trim(),
-      displayId: m.displayId.trim(),
-      displayName: m.displayName.trim(),
-      created: m.created,
-      maxTokens: m.maxTokens,
-      contextWindow: m.contextWindow,
-    }))
+    const cleanedModels: ModelDef[] = models.map(cleanModel)
 
     const trimmedAdminKey = adminApiKey.trim()
     updateConfig(
@@ -793,6 +910,38 @@ export function SettingsDialog({ open, onOpenChange }: SettingsDialogProps) {
                 </button>
                 {modelsExpanded && (
                   <>
+                    <div className="flex items-center gap-2">
+                      <Button
+                        type="button"
+                        size="sm"
+                        variant="outline"
+                        onClick={() => modelFileInputRef.current?.click()}
+                        disabled={isPending}
+                      >
+                        <FileUp className="h-4 w-4 mr-1" />
+                        导入
+                      </Button>
+                      <Button
+                        type="button"
+                        size="sm"
+                        variant="outline"
+                        onClick={handleExportModels}
+                        disabled={isPending || models.length === 0}
+                      >
+                        <FileDown className="h-4 w-4 mr-1" />
+                        导出
+                      </Button>
+                      <input
+                        ref={modelFileInputRef}
+                        type="file"
+                        accept=".json,application/json"
+                        className="hidden"
+                        onChange={handleImportModels}
+                      />
+                      <span className="text-xs text-muted-foreground">
+                        导入按 displayId 去重，已存在的跳过，新的追加到末尾
+                      </span>
+                    </div>
                     <div className="space-y-3">
                       {models.map((m, index) => (
                         <ModelRow

@@ -186,6 +186,61 @@ async fn import_config(app: tauri::AppHandle) -> Result<ImportConfigDto, String>
     })
 }
 
+/// 保存文件的返回体。
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SaveFileDto {
+    /// 用户是否取消了保存
+    cancelled: bool,
+    /// 实际写入的路径（cancelled 时为空）
+    path: String,
+}
+
+/// IPC：弹出系统保存对话框，把前端给出的文本写入用户选择的文件（导出模型列表等）。
+///
+/// WebView 不处理 blob 下载，桌面端导出统一走这里。用户取消返回 `cancelled: true`。
+#[tauri::command]
+async fn save_text_file(
+    app: tauri::AppHandle,
+    default_name: String,
+    content: String,
+) -> Result<SaveFileDto, String> {
+    use tauri_plugin_dialog::DialogExt;
+
+    tracing::info!(
+        "导出文件：默认文件名 {default_name}，内容 {} 字节",
+        content.len()
+    );
+    let file = app
+        .dialog()
+        .file()
+        .add_filter("JSON", &["json"])
+        .set_file_name(&default_name)
+        .set_title("导出到文件")
+        .blocking_save_file();
+
+    let Some(path) = file else {
+        tracing::info!("导出文件：用户取消");
+        return Ok(SaveFileDto {
+            cancelled: true,
+            path: String::new(),
+        });
+    };
+
+    let path = path
+        .into_path()
+        .map_err(|e| format!("无法解析所选文件路径: {e}"))?;
+    std::fs::write(&path, content.as_bytes()).map_err(|e| {
+        tracing::warn!("导出文件写入失败 {}: {e}", path.display());
+        format!("写入文件失败: {e}")
+    })?;
+    tracing::info!("导出文件已写入 {}", path.display());
+    Ok(SaveFileDto {
+        cancelled: false,
+        path: path.to_string_lossy().to_string(),
+    })
+}
+
 /// IPC：扫描本机 AWS SSO 缓存，返回可导入的 Kiro IdC 凭证候选（不验活）。
 /// 前端拿到后逐条调 add_credential（走 HTTP）完成导入与验活。
 #[tauri::command]
@@ -304,6 +359,7 @@ fn main() {
             set_log_capture,
             clear_logs,
             import_config,
+            save_text_file,
             scan_sso_credentials,
             check_update,
             get_app_version,
