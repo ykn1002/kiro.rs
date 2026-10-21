@@ -57,11 +57,11 @@
 | `ccMessageStartMaxDelayMs` | number | `5000` | 仅影响 `/cc/v1/messages`。`/cc` 默认缓冲 `message_start` 直到上游 `contextUsageEvent`（或首个非空正文事件）到达，以填入精确 `input_tokens`。但上游在首个有意义事件前可能思考数分钟，期间客户端只收到 ping、迟迟等不到 `message_start`，Claude Code 会触发 "Waiting for API response … will retry" 的重试倒计时。超过此上限（毫秒）仍未放行时，先用估算 `input_tokens` 放行 `message_start`；后续 `contextUsageEvent` / `metadataEvent` 仍会在 `message_delta` 与用量上报中修正真实 token 数，语义无损。`0` = 不设上限（无限等待，旧行为） |
 | `defaultEndpoint` | string | `ide` | 默认 Kiro 端点。凭据未显式指定 `endpoint` 时使用。当前支持：`ide` |
 | `models` | array | 内置默认表 | 模型列表（驱动 `/v1/models` 展示、模型名映射、上下文窗口判断）。未配置时使用内置默认表，**完全向后兼容**；一旦提供则整张表以配置为准。每项字段见下方说明 |
-| `modelAliases` | object | `{}` | 客户端模型名 → 本服务模型名（`displayId` / `kiroId` / 别名）的显式映射，键不区分大小写。用于 Codex 等固定发送 `gpt-5.x` 的客户端，例如 `{"gpt-5.5": "claude-opus-4-6"}` |
+| `modelAliases` | object | `{}` | 客户端模型名 → 本服务模型名（`displayId` / `kiroId` / 别名）的显式映射，键不区分大小写。用于 Codex 等固定发送 `gpt-5.x` 的客户端，例如 `{"gpt-5.5": "gpt-5.6-terra"}` |
 
 #### `models` 项字段
 
-未配置 `models` 时使用内置默认表（涵盖 Opus 4.5–4.8、Sonnet 4.5/4.6、Haiku 4.5），老配置无需改动。如需自定义（增删模型、改窗口/展示信息），提供完整的 `models` 数组，每项：
+未配置 `models` 时使用内置默认表（涵盖 Opus 4.8/5.5、Sonnet 4.6/5.5、Haiku 4.5、GPT 5.6 Sol/Terra/Luna），老配置无需改动。如需自定义（增删模型、改窗口/展示信息），提供完整的 `models` 数组，每项：
 
 | 字段 | 类型 | 说明 |
 | --- | --- | --- |
@@ -189,8 +189,8 @@ Select-String -Path "$env:LOCALAPPDATA\Programs\Kiro\resources\app\extensions\ki
          "kiroId": "claude-sonnet-4.6",
          "displayId": "claude-sonnet-4-6",
          "displayName": "Claude Sonnet 4.6",
-         "created": 1771286400,
-         "maxTokens": 64000,
+         "created": 1784249340,
+         "maxTokens": 128000,
          "contextWindow": 1000000
       },
       {
@@ -206,7 +206,7 @@ Select-String -Path "$env:LOCALAPPDATA\Programs\Kiro\resources\app\extensions\ki
 }
 ```
 
-> `models` 为可选项。**不配置即使用内置默认表**（涵盖 Opus 4.5–4.8、Sonnet 4.5/4.6、Haiku 4.5），上方示例仅演示自定义写法；一旦提供则整张表以配置为准（按数组顺序匹配，`-thinking` 变体自动派生）。`haiku` 一项省略了 `version`，仅靠 `family` 命中。
+> `models` 为可选项。**不配置即使用内置默认表**（涵盖 Opus 4.8/5.5、Sonnet 4.6/5.5、Haiku 4.5、GPT 5.6 Sol/Terra/Luna），上方示例仅演示自定义写法；一旦提供则整张表以配置为准（按数组顺序匹配，`-thinking` 变体自动派生）。`haiku` 一项省略了 `version`，仅靠 `family` 命中。
 
 ### credentials.json
 
@@ -471,15 +471,16 @@ wire_api = "responses"
 
 内置默认表：
 
-| 客户端模型名（模糊匹配） | Kiro 模型 ID | 展示 ID | 上下文窗口 |
-|----------------|-----------|---------|-----------|
-| `*opus*` 4.8 | `claude-opus-4.8` | `claude-opus-4-8` | 1,000,000 |
-| `*opus*` 4.7 | `claude-opus-4.7` | `claude-opus-4-7` | 1,000,000 |
-| `*opus*` 4.6 | `claude-opus-4.6` | `claude-opus-4-6` | 1,000,000 |
-| `*opus*` 4.5 | `claude-opus-4.5` | `claude-opus-4-5-20251101` | 200,000 |
-| `*sonnet*` 4.6 | `claude-sonnet-4.6` | `claude-sonnet-4-6` | 1,000,000 |
-| `*sonnet*` 4.5 | `claude-sonnet-4.5` | `claude-sonnet-4-5-20250929` | 200,000 |
-| `*haiku*` | `claude-haiku-4.5` | `claude-haiku-4-5-20251001` | 200,000 |
+| 客户端模型名（模糊匹配） | Kiro 模型 ID | 展示 ID | 上下文窗口 | maxTokens |
+|----------------|-----------|---------|-----------|-----------|
+| `*opus*` 4.8 | `claude-opus-4.8` | `claude-opus-4-8` | 1,000,000 | 128,000 |
+| `*opus*` 5.5 | `claude-opus-5.5` | `claude-opus-5-5` | 1,000,000 | 128,000 |
+| `*sonnet*` 5.5 | `claude-sonnet-5.5` | `claude-sonnet-5-5` | 1,000,000 | 128,000 |
+| `*haiku*` | `claude-haiku-4.5` | `claude-haiku-4-5-20251001` | 200,000 | 64,000 |
+| `*gpt-5.6-sol*` | `gpt-5.6-sol` | `gpt-5.6-sol` | 1,000,000 | 128,000 |
+| `*gpt-5.6-terra*` | `gpt-5.6-terra` | `gpt-5.6-terra` | 1,000,000 | 128,000 |
+| `*gpt-5.6-luna*` | `gpt-5.6-luna` | `gpt-5.6-luna` | 1,000,000 | 128,000 |
+| `*sonnet*` 4.6 | `claude-sonnet-4.6` | `claude-sonnet-4-6` | 1,000,000 | 128,000 |
 
 > 匹配按数组顺序取首个命中项。未命中任何规则时返回「模型不支持」（若凭据池内有 anthropic 透传凭据，则 fallback 到原样透传）。`modelAliases` 可为固定发送某模型名的客户端提供显式映射。
 

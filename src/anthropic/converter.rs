@@ -1724,21 +1724,13 @@ mod tests {
 
     #[test]
     fn test_map_model_sonnet() {
-        assert!(
-            map_model("claude-sonnet-4-5-20250929")
-                .unwrap()
-                .contains("sonnet")
-        );
+        assert!(map_model("claude-sonnet-5-5").unwrap().contains("sonnet"));
         assert!(map_model("claude-sonnet-4-6").unwrap().contains("sonnet"));
     }
 
     #[test]
     fn test_map_model_opus() {
-        assert!(
-            map_model("claude-opus-4-5-20251101")
-                .unwrap()
-                .contains("opus")
-        );
+        assert!(map_model("claude-opus-5-5").unwrap().contains("opus"));
     }
 
     #[test]
@@ -1768,8 +1760,8 @@ mod tests {
             aliases: HashMap::new(),
         });
         // 命中模型表 → displayId；thinking 变体归并到基础模型
-        let base = canonical_model_display("claude-opus-4-6");
-        let thinking = canonical_model_display("claude-opus-4-6-thinking");
+        let base = canonical_model_display("claude-opus-4-8");
+        let thinking = canonical_model_display("claude-opus-4-8-thinking");
         assert_eq!(base, thinking, "thinking 变体应归并到基础模型的 displayId");
         // 未命中模型表 → 去掉 thinking 后缀的兜底名
         assert_eq!(canonical_model_display("gpt-foo-thinking"), "gpt-foo");
@@ -1781,12 +1773,12 @@ mod tests {
     fn test_map_model_alias() {
         let _lock = REGISTRY_TEST_LOCK.lock().unwrap();
         let mut aliases = HashMap::new();
-        aliases.insert("gpt-5.5".to_string(), "claude-opus-4-6".to_string());
+        aliases.insert("gpt-5.5".to_string(), "claude-opus-4-8".to_string());
         set_model_registry_settings(ModelRegistrySettings {
             models: default_models(),
             aliases,
         });
-        assert_eq!(map_model("gpt-5.5"), Some("claude-opus-4.6".to_string()));
+        assert_eq!(map_model("gpt-5.5"), Some("claude-opus-4.8".to_string()));
     }
 
     #[test]
@@ -1817,22 +1809,15 @@ mod tests {
     #[test]
     fn test_map_model_thinking_suffix_sonnet() {
         // thinking 后缀不应影响 sonnet 模型映射
-        let result = map_model("claude-sonnet-4-5-20250929-thinking");
-        assert_eq!(result, Some("claude-sonnet-4.5".to_string()));
+        let result = map_model("claude-sonnet-4-6-thinking");
+        assert_eq!(result, Some("claude-sonnet-4.6".to_string()));
     }
 
     #[test]
-    fn test_map_model_thinking_suffix_opus_4_5() {
-        // thinking 后缀不应影响 opus 4.5 模型映射
-        let result = map_model("claude-opus-4-5-20251101-thinking");
-        assert_eq!(result, Some("claude-opus-4.5".to_string()));
-    }
-
-    #[test]
-    fn test_map_model_thinking_suffix_opus_4_6() {
-        // thinking 后缀不应影响 opus 4.6 模型映射
-        let result = map_model("claude-opus-4-6-thinking");
-        assert_eq!(result, Some("claude-opus-4.6".to_string()));
+    fn test_map_model_thinking_suffix_opus_5_5() {
+        // thinking 后缀不应影响 opus 5.5 模型映射
+        let result = map_model("claude-opus-5-5-thinking");
+        assert_eq!(result, Some("claude-opus-5.5".to_string()));
     }
 
     #[test]
@@ -2914,34 +2899,32 @@ mod tests {
             Some("claude-opus-4.8".to_string())
         );
         assert_eq!(
-            map_model("claude-opus-4-7"),
-            Some("claude-opus-4.7".to_string())
+            map_model("claude-opus-5-5"),
+            Some("claude-opus-5.5".to_string())
         );
         assert_eq!(
-            map_model("claude-opus-4-6"),
-            Some("claude-opus-4.6".to_string())
-        );
-        assert_eq!(
-            map_model("claude-opus-4-5-20251101"),
-            Some("claude-opus-4.5".to_string())
+            map_model("claude-sonnet-5-5"),
+            Some("claude-sonnet-5.5".to_string())
         );
         assert_eq!(
             map_model("claude-sonnet-4-6"),
             Some("claude-sonnet-4.6".to_string())
         );
         assert_eq!(
-            map_model("claude-sonnet-4-5-20250929"),
-            Some("claude-sonnet-4.5".to_string())
-        );
-        assert_eq!(
             map_model("claude-haiku-4-5-20251001"),
             Some("claude-haiku-4.5".to_string())
         );
+        assert_eq!(
+            map_model("gpt-5.6-terra"),
+            Some("gpt-5.6-terra".to_string())
+        );
         // 点号写法同样命中
         assert_eq!(
-            map_model("claude-opus-4.6"),
-            Some("claude-opus-4.6".to_string())
+            map_model("claude-opus-5.5"),
+            Some("claude-opus-5.5".to_string())
         );
+        // 已移出默认表的旧模型不再命中
+        assert_eq!(map_model("claude-opus-4-7"), None);
         // 不支持的模型返回 None
         assert_eq!(map_model("gpt-4"), None);
     }
@@ -2950,15 +2933,11 @@ mod tests {
     fn test_default_models_context_window_parity() {
         // 1M 上下文模型
         assert_eq!(get_context_window_size("claude-opus-4-8"), 1_000_000);
-        assert_eq!(get_context_window_size("claude-opus-4-7"), 1_000_000);
-        assert_eq!(get_context_window_size("claude-opus-4-6"), 1_000_000);
+        assert_eq!(get_context_window_size("claude-opus-5-5"), 1_000_000);
+        assert_eq!(get_context_window_size("claude-sonnet-5-5"), 1_000_000);
         assert_eq!(get_context_window_size("claude-sonnet-4-6"), 1_000_000);
+        assert_eq!(get_context_window_size("gpt-5.6-luna"), 1_000_000);
         // 200K 上下文模型
-        assert_eq!(get_context_window_size("claude-opus-4-5-20251101"), 200_000);
-        assert_eq!(
-            get_context_window_size("claude-sonnet-4-5-20250929"),
-            200_000
-        );
         assert_eq!(
             get_context_window_size("claude-haiku-4-5-20251001"),
             200_000
@@ -2971,12 +2950,16 @@ mod tests {
     fn test_match_model_def_respects_order() {
         // opus 各版本应按表顺序精确命中各自版本，互不串扰
         assert_eq!(
-            map_model("claude-opus-4-6-thinking"),
-            Some("claude-opus-4.6".to_string())
+            map_model("claude-opus-5-5-thinking"),
+            Some("claude-opus-5.5".to_string())
         );
         assert_eq!(
-            map_model("claude-opus-4-7-thinking"),
-            Some("claude-opus-4.7".to_string())
+            map_model("claude-sonnet-5-5-thinking"),
+            Some("claude-sonnet-5.5".to_string())
+        );
+        assert_eq!(
+            map_model("claude-sonnet-4-6-thinking"),
+            Some("claude-sonnet-4.6".to_string())
         );
         assert_eq!(
             map_model("claude-opus-4-8-thinking"),

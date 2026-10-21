@@ -25,26 +25,27 @@
     },
     {
       "family": "opus",
-      "version": "5",
-      "kiroId": "claude-opus-5",
-      "displayId": "claude-opus-5",
-      "displayName": "Claude Opus 5",
+      "version": "5.5",
+      "kiroId": "claude-opus-5.5",
+      "displayId": "claude-opus-5-5",
+      "displayName": "Claude Opus 5.5",
       "created": 1776276000,
-      "maxTokens": 64000,
+      "maxTokens": 128000,
       "contextWindow": 1000000
     },
     {
       "family": "sonnet",
-      "version": "5",
-      "kiroId": "claude-sonnet-5",
-      "displayId": "claude-sonnet-5",
-      "displayName": "Claude Sonnet 5",
+      "version": "5.5",
+      "kiroId": "claude-sonnet-5.5",
+      "displayId": "claude-sonnet-5-5",
+      "displayName": "Claude Sonnet 5.5",
       "created": 1771286400,
-      "maxTokens": 64000,
+      "maxTokens": 128000,
       "contextWindow": 1000000
     },
     {
       "family": "haiku",
+      "version": null,
       "kiroId": "claude-haiku-4.5",
       "displayId": "claude-haiku-4-5-20251001",
       "displayName": "Claude Haiku 4.5",
@@ -54,30 +55,33 @@
     },
     {
       "family": "gpt-5.6-sol",
+      "version": null,
       "kiroId": "gpt-5.6-sol",
       "displayId": "gpt-5.6-sol",
       "displayName": "GPT 5.6 Sol",
       "created": 1784000381,
-      "maxTokens": 64000,
-      "contextWindow": 272000
+      "maxTokens": 128000,
+      "contextWindow": 1000000
     },
     {
       "family": "gpt-5.6-terra",
+      "version": null,
       "kiroId": "gpt-5.6-terra",
       "displayId": "gpt-5.6-terra",
       "displayName": "GPT 5.6 Terra",
       "created": 1784000462,
-      "maxTokens": 64000,
-      "contextWindow": 272000
+      "maxTokens": 128000,
+      "contextWindow": 1000000
     },
     {
       "family": "gpt-5.6-luna",
+      "version": null,
       "kiroId": "gpt-5.6-luna",
       "displayId": "gpt-5.6-luna",
       "displayName": "GPT 5.6 Luna",
       "created": 1784000499,
-      "maxTokens": 64000,
-      "contextWindow": 200050
+      "maxTokens": 128000,
+      "contextWindow": 1000000
     },
     {
       "family": "sonnet",
@@ -86,7 +90,7 @@
       "displayId": "claude-sonnet-4-6",
       "displayName": "Claude Sonnet 4.6",
       "created": 1784249340,
-      "maxTokens": 64000,
+      "maxTokens": 128000,
       "contextWindow": 1000000
     }
   ],

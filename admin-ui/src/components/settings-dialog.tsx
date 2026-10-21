@@ -323,8 +323,8 @@ export function SettingsDialog({ open, onOpenChange }: SettingsDialogProps) {
         displayId: '',
         displayName: '',
         created: Math.floor(Date.now() / 1000),
-        maxTokens: 64000,
-        contextWindow: 200000,
+        maxTokens: 128000,
+        contextWindow: 1000000,
       },
     ])
   }
@@ -856,7 +856,7 @@ export function SettingsDialog({ open, onOpenChange }: SettingsDialogProps) {
                             value={row.to}
                             disabled={isPending}
                             onChange={(v) => updateAlias(index, { to: v })}
-                            placeholder="claude-opus-4-6"
+                            placeholder="gpt-5.6-terra"
                           />
                           <Button
                             type="button"
