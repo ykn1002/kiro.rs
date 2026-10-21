@@ -1,6 +1,6 @@
 [package]
 name = "kiro-rs-desktop"
-version = "2026.9.23"
+version = "2026.10.21"
 edition = "2021"
 description = "kiro-rs 桌面版"
 publish = false
