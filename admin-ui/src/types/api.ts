@@ -159,6 +159,10 @@ export interface SetNameRequest {
 
 // 添加凭据请求
 export interface AddCredentialRequest {
+  /** 自定义备注名 */
+  name?: string
+  /** 用户邮箱（前端显示用） */
+  email?: string
   refreshToken?: string
   authMethod?: 'social' | 'idc' | 'api_key'
   clientId?: string
@@ -258,4 +262,25 @@ export interface UpdateAppConfigRequest {
   proxyUsername?: string
   /** 全局代理认证密码；空串清除、缺省保留原值 */
   proxyPassword?: string
+}
+
+// AWS SSO（IdC）凭据导出文件中的单条凭据（可直接回导）
+export interface SsoExportItem {
+  refreshToken: string
+  clientId: string
+  clientSecret: string
+  region: string
+  apiRegion?: string
+  email?: string
+  name?: string
+}
+
+// AWS SSO 凭据导出文件（即导出接口响应）
+export interface SsoExportFile {
+  type: 'kiro-rs-aws-sso-credentials'
+  version: number
+  exportedAt: string
+  /** 被跳过的凭据数（非 IdC 或字段不全） */
+  skipped: number
+  credentials: SsoExportItem[]
 }

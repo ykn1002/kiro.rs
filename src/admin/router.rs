@@ -7,10 +7,10 @@ use axum::{
 
 use super::{
     handlers::{
-        add_credential, delete_credential, force_refresh_token, get_all_credentials,
-        get_app_config, get_credential_balance, get_load_balancing_mode, get_metrics,
-        get_timeseries, reset_failure_count, set_credential_disabled, set_credential_name,
-        set_credential_priority, set_load_balancing_mode, update_app_config,
+        add_credential, delete_credential, export_sso_credentials, force_refresh_token,
+        get_all_credentials, get_app_config, get_credential_balance, get_load_balancing_mode,
+        get_metrics, get_timeseries, reset_failure_count, set_credential_disabled,
+        set_credential_name, set_credential_priority, set_load_balancing_mode, update_app_config,
     },
     middleware::{AdminState, admin_auth_middleware},
 };
@@ -20,6 +20,7 @@ use super::{
 /// # 端点
 /// - `GET /credentials` - 获取所有凭据状态
 /// - `POST /credentials` - 添加新凭据
+/// - `POST /credentials/export/sso` - 导出 AWS SSO（IdC）凭据
 /// - `DELETE /credentials/:id` - 删除凭据
 /// - `POST /credentials/:id/disabled` - 设置凭据禁用状态
 /// - `POST /credentials/:id/priority` - 设置凭据优先级
@@ -39,6 +40,7 @@ pub fn create_admin_router(state: AdminState) -> Router {
             "/credentials",
             get(get_all_credentials).post(add_credential),
         )
+        .route("/credentials/export/sso", post(export_sso_credentials))
         .route("/metrics", get(get_metrics))
         .route("/metrics/timeseries", get(get_timeseries))
         .route("/credentials/{id}", delete(delete_credential))

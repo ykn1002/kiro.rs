@@ -1,6 +1,6 @@
 import { useMemo, useRef, useState } from 'react'
 import { toast } from 'sonner'
-import { CheckCircle2, XCircle, Loader2, Upload } from 'lucide-react'
+import { CheckCircle2, XCircle, Loader2, Upload, FileDown } from 'lucide-react'
 import {
   Dialog,
   DialogContent,
@@ -10,13 +10,16 @@ import {
 } from '@/components/ui/dialog'
 import { Button } from '@/components/ui/button'
 import { useCredentials, useAddCredential, useDeleteCredential } from '@/hooks/use-credentials'
-import { getCredentialBalance, setCredentialDisabled } from '@/api/credentials'
+import { getCredentialBalance, setCredentialDisabled, exportSsoCredentials } from '@/api/credentials'
 import { extractErrorMessage, sha256Hex } from '@/lib/utils'
-import { isDesktop, scanSsoCredentials } from '@/lib/desktop'
+import { isDesktop, scanSsoCredentials, saveTextFile } from '@/lib/desktop'
+import type { SsoExportItem } from '@/types/api'
 
 interface AwsSsoImportDialogProps {
   open: boolean
   onOpenChange: (open: boolean) => void
+  /** Dashboard 当前勾选的凭据；非空时导出仅限所选 */
+  selectedIds?: Set<number>
 }
 
 // OIDC 客户端注册文件（db6...json）：clientId + clientSecret
@@ -74,6 +77,39 @@ function parseTokenJson(raw: string): AuthToken {
   }
 }
 
+// 解析 kiro-rs 导出的 AWS SSO 凭据文件（「AWS SSO 导出」按钮生成）
+// 兼容直接粘贴 credentials 数组；字段不全的条目跳过并计数
+function parseExportFile(raw: string): { items: SsoExportItem[]; invalid: number } {
+  const parsed: unknown = JSON.parse(raw)
+  const list: unknown = Array.isArray(parsed)
+    ? parsed
+    : (parsed as { credentials?: unknown } | null)?.credentials
+  if (!Array.isArray(list)) {
+    throw new Error('文件中未找到 credentials 数组（应为 kiro-rs AWS SSO 导出文件）')
+  }
+  const str = (v: unknown) => (typeof v === 'string' ? v.trim() : '')
+  const items: SsoExportItem[] = []
+  let invalid = 0
+  for (const raw of list) {
+    const r = (raw ?? {}) as Record<string, unknown>
+    const item: SsoExportItem = {
+      refreshToken: str(r.refreshToken),
+      clientId: str(r.clientId),
+      clientSecret: str(r.clientSecret),
+      region: str(r.region),
+      apiRegion: str(r.apiRegion) || undefined,
+      email: str(r.email) || undefined,
+      name: str(r.name) || undefined,
+    }
+    if (!item.refreshToken || !item.clientId || !item.clientSecret) {
+      invalid++
+      continue
+    }
+    items.push(item)
+  }
+  return { items, invalid }
+}
+
 // 按当前平台返回 SSO 缓存目录的展示路径（仅用于提示文案）
 function ssoCacheDisplayPath(): string {
   const ua = navigator.userAgent
@@ -81,7 +117,7 @@ function ssoCacheDisplayPath(): string {
   return '~/.aws/sso/cache'
 }
 
-export function AwsSsoImportDialog({ open, onOpenChange }: AwsSsoImportDialogProps) {
+export function AwsSsoImportDialog({ open, onOpenChange, selectedIds }: AwsSsoImportDialogProps) {
   const [clientJson, setClientJson] = useState('')
   const [tokenJson, setTokenJson] = useState('')
   const [importing, setImporting] = useState(false)
@@ -89,7 +125,12 @@ export function AwsSsoImportDialog({ open, onOpenChange }: AwsSsoImportDialogPro
   const [scanning, setScanning] = useState(false)
   const [scanMsg, setScanMsg] = useState('')
 
+  const [bundleImporting, setBundleImporting] = useState(false)
+  const [bundleMsg, setBundleMsg] = useState('')
+  const [exporting, setExporting] = useState(false)
+
   const clientFileRef = useRef<HTMLInputElement>(null)
+  const bundleFileRef = useRef<HTMLInputElement>(null)
   const tokenFileRef = useRef<HTMLInputElement>(null)
 
   const { data: existingCredentials } = useCredentials()
@@ -100,6 +141,7 @@ export function AwsSsoImportDialog({ open, onOpenChange }: AwsSsoImportDialogPro
     setClientJson('')
     setTokenJson('')
     setResult(null)
+    setBundleMsg('')
   }
 
   const handleFile = (
@@ -151,6 +193,9 @@ export function AwsSsoImportDialog({ open, onOpenChange }: AwsSsoImportDialogPro
     clientSecret: string
     refreshToken: string
     region?: string
+    apiRegion?: string
+    email?: string
+    name?: string
   }): Promise<ImportOneResult> => {
     // 去重
     const tokenHash = await sha256Hex(params.refreshToken)
@@ -166,6 +211,9 @@ export function AwsSsoImportDialog({ open, onOpenChange }: AwsSsoImportDialogPro
         clientId: params.clientId,
         clientSecret: params.clientSecret,
         authRegion: params.region || undefined,
+        apiRegion: params.apiRegion || undefined,
+        email: params.email,
+        name: params.name,
       })
       addedCredId = addedCred.credentialId
       let usage: string | undefined
@@ -217,6 +265,80 @@ export function AwsSsoImportDialog({ open, onOpenChange }: AwsSsoImportDialogPro
     setImporting(false)
   }
 
+  // 导出：有勾选导出所选，否则导出全部 IdC 凭据。文件可在下方「从导出文件导入」回导
+  const selectedCount = selectedIds?.size ?? 0
+  const handleExport = async () => {
+    const ids = selectedCount > 0 ? Array.from(selectedIds!) : undefined
+    setExporting(true)
+    try {
+      const file = await exportSsoCredentials(ids)
+      const count = file.credentials.length
+      if (count === 0) {
+        toast.info(ids ? '所选凭据中没有可导出的 AWS SSO（IdC）凭据' : '没有可导出的 AWS SSO（IdC）凭据')
+        return
+      }
+      const skippedHint = file.skipped > 0 ? `，跳过非 IdC ${file.skipped} 个` : ''
+      const content = JSON.stringify(file, null, 2)
+      const fileName = `kiro-aws-sso-credentials-${new Date().toISOString().slice(0, 10)}.json`
+      if (isDesktop()) {
+        // 桌面 WebView 不处理 blob 下载，走原生保存对话框
+        const res = await saveTextFile(fileName, content)
+        if (res && !res.cancelled) toast.success(`已导出 ${count} 个 AWS SSO 凭据到 ${res.path}${skippedHint}`)
+        return
+      }
+      const url = URL.createObjectURL(new Blob([content], { type: 'application/json' }))
+      const a = document.createElement('a')
+      a.href = url
+      a.download = fileName
+      a.click()
+      URL.revokeObjectURL(url)
+      toast.success(`已导出 ${count} 个 AWS SSO 凭据${skippedHint}`)
+    } catch (e) {
+      toast.error(`导出失败: ${extractErrorMessage(e)}`)
+    } finally {
+      setExporting(false)
+    }
+  }
+
+  // 从导出文件批量回导（逐条去重 + 验活）
+  const handleBundleFile = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0]
+    // 允许重复选择同一文件
+    e.target.value = ''
+    if (!file) return
+    setBundleImporting(true)
+    try {
+      const { items, invalid } = parseExportFile(await file.text())
+      if (items.length === 0) {
+        setBundleMsg(`文件中没有可导入的凭据${invalid > 0 ? `（字段不全 ${invalid} 条）` : ''}`)
+        toast.info('文件中没有可导入的凭据')
+        return
+      }
+      let ok = 0
+      let dup = 0
+      let fail = 0
+      for (let i = 0; i < items.length; i++) {
+        const c = items[i]
+        setBundleMsg(`导入中 ${i + 1}/${items.length}（${c.email || c.name || `#${i + 1}`}）…`)
+        const r = await importOne(c)
+        if (r.kind === 'verified') ok++
+        else if (r.kind === 'duplicate') dup++
+        else fail++
+      }
+      const invalidHint = invalid > 0 ? `，字段不全跳过 ${invalid}` : ''
+      setBundleMsg(`完成：新增 ${ok}，已存在 ${dup}，失败 ${fail}${invalidHint}`)
+      if (ok > 0) toast.success(`导出文件导入完成：新增 ${ok} 个凭证`)
+      else if (dup > 0 && fail === 0) toast.info('文件中的凭证均已存在')
+      else if (fail > 0) toast.error(`有 ${fail} 个凭证导入失败`)
+    } catch (err) {
+      const msg = extractErrorMessage(err)
+      setBundleMsg(`导入失败：${msg}`)
+      toast.error('导入失败: ' + msg)
+    } finally {
+      setBundleImporting(false)
+    }
+  }
+
   // 一键导入：扫描本机 AWS SSO 缓存并逐条导入验活（仅桌面版）
   const handleScanImport = async () => {
     setScanning(true)
@@ -265,17 +387,75 @@ export function AwsSsoImportDialog({ open, onOpenChange }: AwsSsoImportDialogPro
     <Dialog
       open={open}
       onOpenChange={(newOpen) => {
-        if (!newOpen && importing) return
+        if (!newOpen && (importing || bundleImporting)) return
         if (!newOpen) resetForm()
         onOpenChange(newOpen)
       }}
     >
       <DialogContent className="sm:max-w-2xl max-h-[80vh] flex flex-col">
         <DialogHeader>
-          <DialogTitle>AWS SSO 导入（自动验活）</DialogTitle>
+          <DialogTitle>AWS SSO 导入 / 导出</DialogTitle>
         </DialogHeader>
 
         <div className="flex-1 overflow-y-auto space-y-4 py-4">
+          {/* 导出 + 从导出文件导入（同一行，导出文件可直接回导）*/}
+          <div className="grid gap-3 sm:grid-cols-2">
+            <div className="rounded-md border bg-muted/30 px-3 py-3 flex flex-col gap-2">
+              <div className="text-sm font-medium">
+                导出{selectedCount > 0 ? `所选凭据（${selectedCount} 个）` : '全部 IdC 凭据'}
+              </div>
+              <div className="text-xs text-muted-foreground flex-1">
+                {selectedCount > 0 ? '仅导出所选中的 IdC 凭据' : '在列表中勾选凭据可仅导出所选'}
+                ；文件含明文密钥，请妥善保管
+              </div>
+              <Button variant="outline" onClick={handleExport} disabled={exporting}>
+                {exporting ? (
+                  <>
+                    <Loader2 className="mr-1 h-4 w-4 animate-spin" />
+                    导出中
+                  </>
+                ) : (
+                  <>
+                    <FileDown className="h-4 w-4 mr-2" />
+                    导出
+                  </>
+                )}
+              </Button>
+            </div>
+
+            <div className="rounded-md border bg-muted/30 px-3 py-3 flex flex-col gap-2">
+              <div className="text-sm font-medium">从导出文件导入</div>
+              <div className="text-xs text-muted-foreground flex-1">
+                选择导出的 JSON 文件，批量导入并验活（已存在的自动跳过）
+              </div>
+              <Button
+                variant="outline"
+                onClick={() => bundleFileRef.current?.click()}
+                disabled={bundleImporting || scanning || importing}
+              >
+                {bundleImporting ? (
+                  <>
+                    <Loader2 className="mr-1 h-4 w-4 animate-spin" />
+                    导入中
+                  </>
+                ) : (
+                  <>
+                    <Upload className="h-4 w-4 mr-2" />
+                    选择文件
+                  </>
+                )}
+              </Button>
+              <input
+                ref={bundleFileRef}
+                type="file"
+                accept=".json,application/json"
+                className="hidden"
+                onChange={handleBundleFile}
+              />
+              {bundleMsg && <div className="text-xs text-muted-foreground">{bundleMsg}</div>}
+            </div>
+          </div>
+
           {/* 一键导入（仅桌面版：自动扫描本机 AWS SSO 缓存）*/}
           {isDesktop() && (
             <div className="rounded-md border bg-muted/30 px-3 py-3 space-y-2">
@@ -287,7 +467,7 @@ export function AwsSsoImportDialog({ open, onOpenChange }: AwsSsoImportDialogPro
                     并导入验活，无需手动粘贴
                   </div>
                 </div>
-                <Button onClick={handleScanImport} disabled={scanning || importing}>
+                <Button onClick={handleScanImport} disabled={scanning || importing || bundleImporting}>
                   {scanning ? (
                     <>
                       <Loader2 className="mr-1 h-4 w-4 animate-spin" />

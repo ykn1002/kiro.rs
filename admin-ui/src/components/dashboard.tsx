@@ -859,7 +859,7 @@ export function Dashboard({ onLogout }: DashboardProps) {
               </Button>
               <Button onClick={() => setAwsSsoImportDialogOpen(true)} size="sm" variant="outline">
                 <FileUp className="h-4 w-4 mr-2" />
-                AWS SSO 导入
+                AWS SSO 导入 / 导出
               </Button>
               <Button onClick={() => setBatchImportDialogOpen(true)} size="sm" variant="outline">
                 <Upload className="h-4 w-4 mr-2" />
@@ -953,6 +953,7 @@ export function Dashboard({ onLogout }: DashboardProps) {
       <AwsSsoImportDialog
         open={awsSsoImportDialogOpen}
         onOpenChange={setAwsSsoImportDialogOpen}
+        selectedIds={selectedIds}
       />
 
       {/* 系统设置对话框 */}

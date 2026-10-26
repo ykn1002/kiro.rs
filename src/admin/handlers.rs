@@ -9,8 +9,9 @@ use axum::{
 use super::{
     middleware::AdminState,
     types::{
-        AddCredentialRequest, SetDisabledRequest, SetLoadBalancingModeRequest, SetNameRequest,
-        SetPriorityRequest, SuccessResponse, TimeseriesQuery, UpdateAppConfigRequest,
+        AddCredentialRequest, ExportSsoCredentialsRequest, SetDisabledRequest,
+        SetLoadBalancingModeRequest, SetNameRequest, SetPriorityRequest, SuccessResponse,
+        TimeseriesQuery, UpdateAppConfigRequest,
     },
 };
 
@@ -121,6 +122,18 @@ pub async fn add_credential(
     Json(payload): Json<AddCredentialRequest>,
 ) -> impl IntoResponse {
     match state.service.add_credential(payload).await {
+        Ok(response) => Json(response).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+/// POST /api/admin/credentials/export/sso
+/// 导出 AWS SSO（IdC）凭据（含敏感字段）
+pub async fn export_sso_credentials(
+    State(state): State<AdminState>,
+    Json(payload): Json<ExportSsoCredentialsRequest>,
+) -> impl IntoResponse {
+    match state.service.export_sso_credentials(payload) {
         Ok(response) => Json(response).into_response(),
         Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
     }

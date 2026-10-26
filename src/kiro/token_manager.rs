@@ -2415,6 +2415,18 @@ impl MultiTokenManager {
             .unwrap_or(false)
     }
 
+    /// 克隆全部凭据（含敏感字段，供 Admin 导出使用），按 `(priority, id)` 排序
+    pub fn credentials_for_export(&self) -> Vec<(u64, KiroCredentials)> {
+        let mut list: Vec<(u64, KiroCredentials)> = self
+            .entries
+            .lock()
+            .iter()
+            .map(|e| (e.id, e.credentials.clone()))
+            .collect();
+        list.sort_by_key(|(id, c)| (c.priority, *id));
+        list
+    }
+
     /// 获取透传凭据的余额（Admin API）
     ///
     /// 请求上游的 `GET {base_url}/v1/usage`，
