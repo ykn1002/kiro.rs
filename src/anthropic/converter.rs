@@ -794,8 +794,10 @@ fn process_message_content(
                         }
                         "image" => {
                             if let Some(source) = block.source {
-                                if let Some(format) = get_image_format(&source.media_type) {
-                                    images.push(KiroImage::from_base64(format, source.data));
+                                if let Some(image) =
+                                    build_kiro_image(&source.media_type, &source.data)
+                                {
+                                    images.push(image);
                                 }
                             }
                         }
@@ -852,8 +854,8 @@ fn extract_tool_result_images(content: &Option<serde_json::Value>) -> Vec<KiroIm
             let media_type = source.get("media_type").and_then(|v| v.as_str());
             let data = source.get("data").and_then(|v| v.as_str());
             if let (Some(media_type), Some(data)) = (media_type, data) {
-                if let Some(format) = get_image_format(media_type) {
-                    images.push(KiroImage::from_base64(format, data));
+                if let Some(image) = build_kiro_image(media_type, data) {
+                    images.push(image);
                 }
             }
         }
@@ -861,14 +863,103 @@ fn extract_tool_result_images(content: &Option<serde_json::Value>) -> Vec<KiroIm
     images
 }
 
+/// 构造发往上游的图片
+///
+/// 上游按图片真实字节校验格式，声明的 media_type 与实际内容不符时直接返回
+/// 400 `IMAGE_FORMAT_UNSUPPORTED`，且该图片留在历史里会让后续每轮都失败。
+/// 客户端（如 MCP 工具返回的截图）声明的 media_type 并不可靠，因此这里以
+/// 魔数嗅探结果为准：
+/// - 嗅探出支持的格式 → 使用嗅探结果（与声明不符时打 warn）
+/// - 嗅探不出支持的格式 → 丢弃该图片（发上去也必然 400）
+fn build_kiro_image(media_type: &str, data: &str) -> Option<KiroImage> {
+    // 兼容 data URL 形式（data:image/png;base64,xxxx）
+    let data = match data.strip_prefix("data:") {
+        Some(rest) => rest.split_once(',').map(|(_, d)| d).unwrap_or(rest),
+        None => data,
+    };
+    let declared = get_image_format(media_type);
+    let sniffed = sniff_image_format(data);
+
+    match (declared, sniffed) {
+        (Some(d), Some(s)) if d == s => {
+            tracing::debug!(format = s, bytes_len = data.len(), "图片格式校验通过");
+            Some(KiroImage::from_base64(s, data))
+        }
+        (_, Some(s)) => {
+            tracing::warn!(
+                media_type,
+                sniffed = s,
+                bytes_len = data.len(),
+                "图片声明的 media_type 与实际内容不符，按实际格式发送"
+            );
+            Some(KiroImage::from_base64(s, data))
+        }
+        (_, None) => {
+            tracing::warn!(
+                media_type,
+                bytes_len = data.len(),
+                head = %data.chars().take(16).collect::<String>(),
+                "图片实际内容不是 jpeg/png/gif/webp，已丢弃（上游不支持）"
+            );
+            None
+        }
+    }
+}
+
 /// 从 media_type 获取图片格式
-fn get_image_format(media_type: &str) -> Option<String> {
+fn get_image_format(media_type: &str) -> Option<&'static str> {
     match media_type {
-        "image/jpeg" => Some("jpeg".to_string()),
-        "image/png" => Some("png".to_string()),
-        "image/gif" => Some("gif".to_string()),
-        "image/webp" => Some("webp".to_string()),
+        "image/jpeg" | "image/jpg" => Some("jpeg"),
+        "image/png" => Some("png"),
+        "image/gif" => Some("gif"),
+        "image/webp" => Some("webp"),
         _ => None,
+    }
+}
+
+/// 解码 base64 前若干字符，按魔数识别图片真实格式
+fn sniff_image_format(data: &str) -> Option<&'static str> {
+    fn val(c: u8) -> Option<u32> {
+        match c {
+            b'A'..=b'Z' => Some((c - b'A') as u32),
+            b'a'..=b'z' => Some((c - b'a' + 26) as u32),
+            b'0'..=b'9' => Some((c - b'0' + 52) as u32),
+            b'+' | b'-' => Some(62),
+            b'/' | b'_' => Some(63),
+            _ => None,
+        }
+    }
+
+    // 16 个 base64 字符 → 12 字节，足够覆盖 RIFF....WEBP
+    let mut head = Vec::with_capacity(12);
+    let chars: Vec<u8> = data
+        .bytes()
+        .filter(|c| !c.is_ascii_whitespace())
+        .take(16)
+        .collect();
+    // 遇到填充符 / 非法字符即停止，用已解码的部分判断
+    'outer: for chunk in chars.chunks(4) {
+        if chunk.len() < 4 {
+            break;
+        }
+        let mut n = 0u32;
+        for &c in chunk {
+            let Some(v) = val(c) else { break 'outer };
+            n = (n << 6) | v;
+        }
+        head.extend_from_slice(&[(n >> 16) as u8, (n >> 8) as u8, n as u8]);
+    }
+
+    if head.starts_with(&[0x89, b'P', b'N', b'G']) {
+        Some("png")
+    } else if head.starts_with(&[0xFF, 0xD8, 0xFF]) {
+        Some("jpeg")
+    } else if head.starts_with(b"GIF8") {
+        Some("gif")
+    } else if head.len() >= 12 && head.starts_with(b"RIFF") && &head[8..12] == b"WEBP" {
+        Some("webp")
+    } else {
+        None
     }
 }
 
@@ -2572,7 +2663,7 @@ mod tests {
         let content = Some(serde_json::json!([
             {
                 "type": "image",
-                "source": {"type": "base64", "media_type": "image/jpeg", "data": "AAAA"}
+                "source": {"type": "base64", "media_type": "image/jpeg", "data": "/9j/4AAQ"}
             },
             {"type": "text", "text": "看这张图"},
             {
@@ -2585,7 +2676,35 @@ mod tests {
         // svg+xml 不在支持列表中，应被跳过；只保留 jpeg 一张
         assert_eq!(images.len(), 1);
         assert_eq!(images[0].format, "jpeg");
-        assert_eq!(images[0].source.bytes, "AAAA");
+        assert_eq!(images[0].source.bytes, "/9j/4AAQ");
+    }
+
+    #[test]
+    fn test_build_kiro_image_sniffs_real_format() {
+        // 声明 png、实际是 jpeg → 按实际格式发送
+        let img = build_kiro_image("image/png", "/9j/4AAQ").unwrap();
+        assert_eq!(img.format, "jpeg");
+        // png 魔数
+        let img = build_kiro_image("image/jpeg", "iVBORw0KGgo=").unwrap();
+        assert_eq!(img.format, "png");
+        // gif / webp
+        assert_eq!(
+            build_kiro_image("image/gif", "R0lGODlh").unwrap().format,
+            "gif"
+        );
+        assert_eq!(
+            build_kiro_image("image/webp", "UklGRiQAAABXRUJQ")
+                .unwrap()
+                .format,
+            "webp"
+        );
+        // data URL 前缀被剥离
+        let img = build_kiro_image("image/jpeg", "data:image/jpeg;base64,/9j/4AAQ").unwrap();
+        assert_eq!(img.source.bytes, "/9j/4AAQ");
+        // 声明 png、实际是 svg/文本 → 丢弃
+        assert!(build_kiro_image("image/png", "PHN2ZyB4bWxucz0i").is_none());
+        // 非法 base64 → 丢弃
+        assert!(build_kiro_image("image/png", "!!!!").is_none());
     }
 
     #[test]
@@ -2615,7 +2734,7 @@ mod tests {
                         "content": [
                             {
                                 "type": "image",
-                                "source": {"type": "base64", "media_type": "image/jpeg", "data": "AAAA"}
+                                "source": {"type": "base64", "media_type": "image/jpeg", "data": "/9j/4AAQ"}
                             }
                         ]
                     }]),
@@ -2635,7 +2754,7 @@ mod tests {
         // 图片应从 tool_result 提升到当前消息的 images
         assert_eq!(user_input.images.len(), 1);
         assert_eq!(user_input.images[0].format, "jpeg");
-        assert_eq!(user_input.images[0].source.bytes, "AAAA");
+        assert_eq!(user_input.images[0].source.bytes, "/9j/4AAQ");
     }
 
     #[test]
