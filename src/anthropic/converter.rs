@@ -794,10 +794,11 @@ fn process_message_content(
                         }
                         "image" => {
                             if let Some(source) = block.source {
-                                if let Some(image) =
-                                    build_kiro_image(&source.media_type, &source.data)
-                                {
-                                    images.push(image);
+                                match build_kiro_image(&source.media_type, &source.data) {
+                                    Ok(image) => images.push(image),
+                                    Err(reason) => {
+                                        text_parts.push(omitted_image_placeholder(&reason))
+                                    }
                                 }
                             }
                         }
@@ -807,9 +808,19 @@ fn process_message_content(
                                 // Claude Code 读取图片时，图片作为工具返回值嵌在
                                 // tool_result.content 里，而 Kiro 的 tool_result 通道只支持
                                 // 文本，因此这些图片必须改走消息的 images 字段才能传到上游。
-                                images.extend(extract_tool_result_images(&block.content));
+                                let (tr_images, omitted) =
+                                    extract_tool_result_images(&block.content);
+                                images.extend(tr_images);
 
-                                let result_content = extract_tool_result_content(&block.content);
+                                let mut result_content =
+                                    extract_tool_result_content(&block.content);
+                                // 被丢弃的图片以文字占位附在工具结果里，让模型知道截图失败
+                                for note in omitted {
+                                    if !result_content.is_empty() {
+                                        result_content.push('\n');
+                                    }
+                                    result_content.push_str(&note);
+                                }
                                 let is_error = block.is_error.unwrap_or(false);
 
                                 let mut result = if is_error {
@@ -841,8 +852,13 @@ fn process_message_content(
 /// 形如 `{ "type": "image", "source": { "media_type": "image/jpeg", "data": "..." } }`。
 /// Kiro 的 tool_result 通道不支持图片，因此这里把它们抽出来，交由调用方提升到消息的
 /// 顶层 images 字段。
-fn extract_tool_result_images(content: &Option<serde_json::Value>) -> Vec<KiroImage> {
+///
+/// 返回 (通过校验的图片, 被丢弃图片的文字占位)。
+fn extract_tool_result_images(
+    content: &Option<serde_json::Value>,
+) -> (Vec<KiroImage>, Vec<String>) {
     let mut images = Vec::new();
+    let mut omitted = Vec::new();
     if let Some(serde_json::Value::Array(arr)) = content {
         for item in arr {
             if item.get("type").and_then(|v| v.as_str()) != Some("image") {
@@ -854,56 +870,83 @@ fn extract_tool_result_images(content: &Option<serde_json::Value>) -> Vec<KiroIm
             let media_type = source.get("media_type").and_then(|v| v.as_str());
             let data = source.get("data").and_then(|v| v.as_str());
             if let (Some(media_type), Some(data)) = (media_type, data) {
-                if let Some(image) = build_kiro_image(media_type, data) {
-                    images.push(image);
+                match build_kiro_image(media_type, data) {
+                    Ok(image) => images.push(image),
+                    Err(reason) => omitted.push(omitted_image_placeholder(&reason)),
                 }
             }
         }
     }
-    images
+    (images, omitted)
 }
+
+/// 上游对单张图片 base64 长度的上限（实测：超过 5MB 返回 400 `IMAGE_SIZE_EXCEEDED`）
+const MAX_IMAGE_BASE64_LEN: usize = 5 * 1024 * 1024;
+/// 上游对图片宽高的上限（实测：任一边 > 8000px 返回 400 `IMAGE_DIMENSION_EXCEEDED`）
+const MAX_IMAGE_DIMENSION: u32 = 8000;
 
 /// 构造发往上游的图片
 ///
-/// 上游按图片真实字节校验格式，声明的 media_type 与实际内容不符时直接返回
-/// 400 `IMAGE_FORMAT_UNSUPPORTED`，且该图片留在历史里会让后续每轮都失败。
-/// 客户端（如 MCP 工具返回的截图）声明的 media_type 并不可靠，因此这里以
-/// 魔数嗅探结果为准：
-/// - 嗅探出支持的格式 → 使用嗅探结果（与声明不符时打 warn）
-/// - 嗅探不出支持的格式 → 丢弃该图片（发上去也必然 400）
-fn build_kiro_image(media_type: &str, data: &str) -> Option<KiroImage> {
+/// 上游对坏图直接返回 400（实测：截断 / CRC 错误 / 压缩数据损坏 →
+/// `IMAGE_FORMAT_UNSUPPORTED`；超尺寸 / 超大小另有错误码），且坏图留在历史里会让
+/// 该会话后续每轮都失败。客户端（如 MCP 工具返回的截图）给的图片并不可靠，因此
+/// 这里先在本地校验：
+/// - 格式以魔数嗅探为准（与声明的 media_type 不符时打 warn）
+/// - 校验大小、宽高、文件结构完整性
+///
+/// 校验不通过返回 `Err(原因)`，调用方应丢弃该图片并以文字占位告知模型。
+/// 本地校验覆盖不到的坏图由 provider 的 `IMAGE_*` 错误兜底重试处理。
+fn build_kiro_image(media_type: &str, data: &str) -> Result<KiroImage, String> {
     // 兼容 data URL 形式（data:image/png;base64,xxxx）
     let data = match data.strip_prefix("data:") {
         Some(rest) => rest.split_once(',').map(|(_, d)| d).unwrap_or(rest),
         None => data,
     };
-    let declared = get_image_format(media_type);
-    let sniffed = sniff_image_format(data);
 
-    match (declared, sniffed) {
-        (Some(d), Some(s)) if d == s => {
-            tracing::debug!(format = s, bytes_len = data.len(), "图片格式校验通过");
-            Some(KiroImage::from_base64(s, data))
-        }
-        (_, Some(s)) => {
-            tracing::warn!(
-                media_type,
-                sniffed = s,
-                bytes_len = data.len(),
-                "图片声明的 media_type 与实际内容不符，按实际格式发送"
-            );
-            Some(KiroImage::from_base64(s, data))
-        }
-        (_, None) => {
-            tracing::warn!(
-                media_type,
-                bytes_len = data.len(),
-                head = %data.chars().take(16).collect::<String>(),
-                "图片实际内容不是 jpeg/png/gif/webp，已丢弃（上游不支持）"
-            );
-            None
-        }
+    let reject = |reason: String| {
+        tracing::warn!(
+            media_type,
+            base64_len = data.len(),
+            head = %data.chars().take(16).collect::<String>(),
+            reason = %reason,
+            "图片未通过本地校验，已丢弃"
+        );
+        Err(reason)
+    };
+
+    if data.len() > MAX_IMAGE_BASE64_LEN {
+        return reject(format!(
+            "图片过大（base64 {} 字节，上限 {} 字节）",
+            data.len(),
+            MAX_IMAGE_BASE64_LEN
+        ));
     }
+    let Some(bytes) = decode_base64(data) else {
+        return reject("图片 base64 数据无法解码".to_string());
+    };
+    let Some(format) = sniff_image_format(&bytes) else {
+        return reject("图片实际内容不是 jpeg/png/gif/webp".to_string());
+    };
+    if let Err(reason) = validate_image_bytes(format, &bytes) {
+        return reject(format!("{format} 图片{reason}"));
+    }
+
+    if get_image_format(media_type) == Some(format) {
+        tracing::debug!(format, base64_len = data.len(), "图片校验通过");
+    } else {
+        tracing::warn!(
+            media_type,
+            sniffed = format,
+            base64_len = data.len(),
+            "图片声明的 media_type 与实际内容不符，按实际格式发送"
+        );
+    }
+    Ok(KiroImage::from_base64(format, data))
+}
+
+/// 被丢弃图片的文字占位，让模型知道这里原本有一张图
+fn omitted_image_placeholder(reason: &str) -> String {
+    format!("[图片已省略：{reason}]")
 }
 
 /// 从 media_type 获取图片格式
@@ -917,8 +960,8 @@ fn get_image_format(media_type: &str) -> Option<&'static str> {
     }
 }
 
-/// 解码 base64 前若干字符，按魔数识别图片真实格式
-fn sniff_image_format(data: &str) -> Option<&'static str> {
+/// 解码 base64（兼容标准与 URL-safe 字母表、忽略空白、遇 `=` 结束）
+fn decode_base64(data: &str) -> Option<Vec<u8>> {
     fn val(c: u8) -> Option<u32> {
         match c {
             b'A'..=b'Z' => Some((c - b'A') as u32),
@@ -930,26 +973,139 @@ fn sniff_image_format(data: &str) -> Option<&'static str> {
         }
     }
 
-    // 16 个 base64 字符 → 12 字节，足够覆盖 RIFF....WEBP
-    let mut head = Vec::with_capacity(12);
-    let chars: Vec<u8> = data
-        .bytes()
-        .filter(|c| !c.is_ascii_whitespace())
-        .take(16)
-        .collect();
-    // 遇到填充符 / 非法字符即停止，用已解码的部分判断
-    'outer: for chunk in chars.chunks(4) {
-        if chunk.len() < 4 {
+    let mut out = Vec::with_capacity(data.len() / 4 * 3);
+    let mut buf = 0u32;
+    let mut bits = 0u32;
+    for c in data.bytes() {
+        if c.is_ascii_whitespace() {
+            continue;
+        }
+        if c == b'=' {
             break;
         }
-        let mut n = 0u32;
-        for &c in chunk {
-            let Some(v) = val(c) else { break 'outer };
-            n = (n << 6) | v;
+        buf = (buf << 6) | val(c)?;
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push((buf >> bits) as u8);
+            buf &= (1 << bits) - 1;
         }
-        head.extend_from_slice(&[(n >> 16) as u8, (n >> 8) as u8, n as u8]);
     }
+    Some(out)
+}
 
+/// 校验图片尺寸与结构完整性（上游对截断 / 损坏的图片返回 `IMAGE_FORMAT_UNSUPPORTED`）
+///
+/// 返回 `Err(原因)`，原因不含格式名（由调用方拼接）。
+fn validate_image_bytes(format: &str, bytes: &[u8]) -> Result<(), String> {
+    let check_dims = |w: u32, h: u32| {
+        if w > MAX_IMAGE_DIMENSION || h > MAX_IMAGE_DIMENSION {
+            Err(format!("尺寸 {w}x{h} 超过上限 {MAX_IMAGE_DIMENSION}px"))
+        } else {
+            Ok(())
+        }
+    };
+    match format {
+        "png" => {
+            let (w, h) = validate_png(bytes)?;
+            check_dims(w, h)
+        }
+        "jpeg" => {
+            let (w, h) = validate_jpeg(bytes)?;
+            check_dims(w, h)
+        }
+        "gif" => {
+            if bytes.len() < 10 {
+                return Err("数据不完整".to_string());
+            }
+            let w = u16::from_le_bytes([bytes[6], bytes[7]]) as u32;
+            let h = u16::from_le_bytes([bytes[8], bytes[9]]) as u32;
+            check_dims(w, h)
+        }
+        // webp 结构较复杂，交给上游判断（失败由 provider 兜底）
+        _ => Ok(()),
+    }
+}
+
+/// 逐块校验 PNG：每块 CRC 正确、首块为 IHDR、以 IEND 结束；返回 (宽, 高)
+fn validate_png(bytes: &[u8]) -> Result<(u32, u32), String> {
+    const CRC32: crc::Crc<u32> = crc::Crc::<u32>::new(&crc::CRC_32_ISO_HDLC);
+    let mut pos = 8; // 跳过签名
+    let mut dims = None;
+    loop {
+        let Some(header) = bytes.get(pos..pos + 8) else {
+            return Err("数据被截断（缺少 IEND）".to_string());
+        };
+        let len = u32::from_be_bytes([header[0], header[1], header[2], header[3]]) as usize;
+        let chunk_type = &header[4..8];
+        let data_end = pos + 8 + len;
+        let Some(crc_bytes) = bytes.get(data_end..data_end + 4) else {
+            return Err("数据被截断（块不完整）".to_string());
+        };
+        let expected = u32::from_be_bytes([crc_bytes[0], crc_bytes[1], crc_bytes[2], crc_bytes[3]]);
+        if CRC32.checksum(&bytes[pos + 4..data_end]) != expected {
+            return Err(format!(
+                "数据已损坏（{} 块 CRC 校验失败）",
+                String::from_utf8_lossy(chunk_type)
+            ));
+        }
+        if dims.is_none() {
+            if chunk_type != b"IHDR" || len < 8 {
+                return Err("缺少 IHDR 头".to_string());
+            }
+            let d = &bytes[pos + 8..pos + 16];
+            dims = Some((
+                u32::from_be_bytes([d[0], d[1], d[2], d[3]]),
+                u32::from_be_bytes([d[4], d[5], d[6], d[7]]),
+            ));
+        }
+        if chunk_type == b"IEND" {
+            return Ok(dims.unwrap_or((0, 0)));
+        }
+        pos = data_end + 4;
+    }
+}
+
+/// 校验 JPEG：能解析出 SOF 帧头（取宽高），且帧头之后存在 EOI 结束标记；返回 (宽, 高)
+fn validate_jpeg(bytes: &[u8]) -> Result<(u32, u32), String> {
+    let mut pos = 2; // 跳过 SOI
+    let mut dims = None;
+    // 依次跳过各段，直到 SOF（帧头）或 SOS（扫描数据开始）
+    while let Some(&[0xFF, marker]) = bytes.get(pos..pos + 2) {
+        if marker == 0xFF {
+            pos += 1; // 填充字节
+            continue;
+        }
+        let Some(len_bytes) = bytes.get(pos + 2..pos + 4) else {
+            break;
+        };
+        let seg_len = u16::from_be_bytes([len_bytes[0], len_bytes[1]]) as usize;
+        let is_sof = matches!(marker, 0xC0..=0xCF) && !matches!(marker, 0xC4 | 0xC8 | 0xCC);
+        if is_sof && let Some(f) = bytes.get(pos + 5..pos + 9) {
+            dims = Some((
+                u16::from_be_bytes([f[2], f[3]]) as u32,
+                u16::from_be_bytes([f[0], f[1]]) as u32,
+            ));
+        }
+        if marker == 0xDA {
+            break;
+        }
+        pos += 2 + seg_len;
+    }
+    let Some(dims) = dims else {
+        return Err("数据被截断或损坏（缺少帧头）".to_string());
+    };
+    if !bytes[pos.min(bytes.len())..]
+        .windows(2)
+        .any(|w| w == [0xFF, 0xD9])
+    {
+        return Err("数据被截断（缺少 EOI 结束标记）".to_string());
+    }
+    Ok(dims)
+}
+
+/// 按魔数识别图片真实格式
+fn sniff_image_format(head: &[u8]) -> Option<&'static str> {
     if head.starts_with(&[0x89, b'P', b'N', b'G']) {
         Some("png")
     } else if head.starts_with(&[0xFF, 0xD8, 0xFF]) {
@@ -2658,53 +2814,169 @@ mod tests {
         );
     }
 
+    /// 4x4 合法 PNG
+    const TEST_PNG: &str = "iVBORw0KGgoAAAANSUhEUgAAAAQAAAAECAIAAAAmkwkpAAAADklEQVR4nGOoQAIMxHEASVIWgdx3xewAAAAASUVORK5CYII=";
+    /// 4x4 合法 JPEG
+    const TEST_JPEG: &str = "/9j/4AAQSkZJRgABAQAASABIAAD/4QBMRXhpZgAATU0AKgAAAAgAAYdpAAQAAAABAAAAGgAAAAAAA6ABAAMAAAABAAEAAKACAAQAAAABAAAABKADAAQAAAABAAAABAAAAAD/7QA4UGhvdG9zaG9wIDMuMAA4QklNBAQAAAAAAAA4QklNBCUAAAAAABDUHYzZjwCyBOmACZjs+EJ+/8AAEQgABAAEAwEiAAIRAQMRAf/EAB8AAAEFAQEBAQEBAAAAAAAAAAABAgMEBQYHCAkKC//EALUQAAIBAwMCBAMFBQQEAAABfQECAwAEEQUSITFBBhNRYQcicRQygZGhCCNCscEVUtHwJDNicoIJChYXGBkaJSYnKCkqNDU2Nzg5OkNERUZHSElKU1RVVldYWVpjZGVmZ2hpanN0dXZ3eHl6g4SFhoeIiYqSk5SVlpeYmZqio6Slpqeoqaqys7S1tre4ubrCw8TFxsfIycrS09TV1tfY2drh4uPk5ebn6Onq8fLz9PX29/j5+v/EAB8BAAMBAQEBAQEBAQEAAAAAAAABAgMEBQYHCAkKC//EALURAAIBAgQEAwQHBQQEAAECdwABAgMRBAUhMQYSQVEHYXETIjKBCBRCkaGxwQkjM1LwFWJy0QoWJDThJfEXGBkaJicoKSo1Njc4OTpDREVGR0hJSlNUVVZXWFlaY2RlZmdoaWpzdHV2d3h5eoKDhIWGh4iJipKTlJWWl5iZmqKjpKWmp6ipqrKztLW2t7i5usLDxMXGx8jJytLT1NXW19jZ2uLj5OXm5+jp6vLz9PX29/j5+v/bAEMAGxsbGxsbLxsbL0IvLy9CWUJCQkJZcFlZWVlZcIhwcHBwcHCIiIiIiIiIiKOjo6Ojo76+vr6+1dXV1dXV1dXV1f/bAEMBISMjNjI2XTIyXd+XfJff39/f39/f39/f39/f39/f39/f39/f39/f39/f39/f39/f39/f39/f39/f39/f39/f3//dAAQAAf/aAAwDAQACEQMRAD8AbRRRQB//2Q==";
+
+    fn b64_encode(bytes: &[u8]) -> String {
+        const T: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        let mut out = String::new();
+        for c in bytes.chunks(3) {
+            let n = (c[0] as u32) << 16
+                | (*c.get(1).unwrap_or(&0) as u32) << 8
+                | *c.get(2).unwrap_or(&0) as u32;
+            for i in 0..4 {
+                if i <= c.len() {
+                    out.push(T[(n >> (18 - 6 * i) & 63) as usize] as char);
+                } else {
+                    out.push('=');
+                }
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn test_decode_base64_roundtrip() {
+        let bytes = decode_base64(TEST_PNG).unwrap();
+        assert_eq!(b64_encode(&bytes), TEST_PNG);
+        assert!(decode_base64("!!!!").is_none());
+    }
+
     #[test]
     fn test_extract_tool_result_images() {
         let content = Some(serde_json::json!([
             {
                 "type": "image",
-                "source": {"type": "base64", "media_type": "image/jpeg", "data": "/9j/4AAQ"}
+                "source": {"type": "base64", "media_type": "image/jpeg", "data": TEST_JPEG}
             },
             {"type": "text", "text": "看这张图"},
             {
                 "type": "image",
-                "source": {"type": "base64", "media_type": "image/svg+xml", "data": "ZZZZ"}
+                "source": {"type": "base64", "media_type": "image/svg+xml", "data": "PHN2ZyB4bWxucz0i"}
             }
         ]));
 
-        let images = extract_tool_result_images(&content);
-        // svg+xml 不在支持列表中，应被跳过；只保留 jpeg 一张
+        let (images, omitted) = extract_tool_result_images(&content);
+        // svg 不在支持列表中，应被丢弃并留下文字占位；只保留 jpeg 一张
         assert_eq!(images.len(), 1);
         assert_eq!(images[0].format, "jpeg");
-        assert_eq!(images[0].source.bytes, "/9j/4AAQ");
+        assert_eq!(images[0].source.bytes, TEST_JPEG);
+        assert_eq!(omitted.len(), 1);
+        assert!(omitted[0].starts_with("[图片已省略"));
     }
 
     #[test]
     fn test_build_kiro_image_sniffs_real_format() {
         // 声明 png、实际是 jpeg → 按实际格式发送
-        let img = build_kiro_image("image/png", "/9j/4AAQ").unwrap();
-        assert_eq!(img.format, "jpeg");
-        // png 魔数
-        let img = build_kiro_image("image/jpeg", "iVBORw0KGgo=").unwrap();
-        assert_eq!(img.format, "png");
-        // gif / webp
         assert_eq!(
-            build_kiro_image("image/gif", "R0lGODlh").unwrap().format,
-            "gif"
+            build_kiro_image("image/png", TEST_JPEG).unwrap().format,
+            "jpeg"
         );
         assert_eq!(
-            build_kiro_image("image/webp", "UklGRiQAAABXRUJQ")
-                .unwrap()
-                .format,
+            build_kiro_image("image/jpeg", TEST_PNG).unwrap().format,
+            "png"
+        );
+        // gif（1x1）
+        assert_eq!(
+            build_kiro_image(
+                "image/gif",
+                "R0lGODlhAQABAIAAAP///wAAACH5BAEAAAAALAAAAAABAAEAAAICRAEAOw=="
+            )
+            .unwrap()
+            .format,
+            "gif"
+        );
+        // webp 只嗅探不做结构校验
+        assert_eq!(
+            build_kiro_image(
+                "image/webp",
+                "UklGRhoAAABXRUJQVlA4TA0AAAAvAAAAEAcQERGIiP4HAA=="
+            )
+            .unwrap()
+            .format,
             "webp"
         );
         // data URL 前缀被剥离
-        let img = build_kiro_image("image/jpeg", "data:image/jpeg;base64,/9j/4AAQ").unwrap();
-        assert_eq!(img.source.bytes, "/9j/4AAQ");
-        // 声明 png、实际是 svg/文本 → 丢弃
-        assert!(build_kiro_image("image/png", "PHN2ZyB4bWxucz0i").is_none());
-        // 非法 base64 → 丢弃
-        assert!(build_kiro_image("image/png", "!!!!").is_none());
+        let img =
+            build_kiro_image("image/png", &format!("data:image/png;base64,{TEST_PNG}")).unwrap();
+        assert_eq!(img.source.bytes, TEST_PNG);
+        // 非图片 / 非法 base64 → 丢弃
+        assert!(build_kiro_image("image/png", "PHN2ZyB4bWxucz0i").is_err());
+        assert!(build_kiro_image("image/png", "!!!!").is_err());
+    }
+
+    #[test]
+    fn test_build_kiro_image_rejects_corrupted() {
+        let png = decode_base64(TEST_PNG).unwrap();
+        let jpeg = decode_base64(TEST_JPEG).unwrap();
+
+        // 截断的 PNG（实测上游 IMAGE_FORMAT_UNSUPPORTED）
+        let err = build_kiro_image("image/png", &b64_encode(&png[..png.len() / 2])).unwrap_err();
+        assert!(err.contains("截断"), "{err}");
+        // 缺少 IEND
+        assert!(build_kiro_image("image/png", &b64_encode(&png[..png.len() - 12])).is_err());
+        // CRC 错误
+        let mut bad = png.clone();
+        bad[20] ^= 0xFF;
+        let err = build_kiro_image("image/png", &b64_encode(&bad)).unwrap_err();
+        assert!(err.contains("CRC"), "{err}");
+        // 尾部多余字节可接受（实测上游接受）
+        let mut trailing = png.clone();
+        trailing.extend_from_slice(&[0; 16]);
+        assert!(build_kiro_image("image/png", &b64_encode(&trailing)).is_ok());
+
+        // JPEG 缺少 EOI / 只剩一半
+        assert!(build_kiro_image("image/jpeg", &b64_encode(&jpeg[..jpeg.len() - 2])).is_err());
+        assert!(build_kiro_image("image/jpeg", &b64_encode(&jpeg[..jpeg.len() / 2])).is_err());
+        // JPEG 尾部多余字节可接受
+        let mut jt = jpeg.clone();
+        jt.extend_from_slice(b"hello");
+        assert!(build_kiro_image("image/jpeg", &b64_encode(&jt)).is_ok());
+    }
+
+    #[test]
+    fn test_build_kiro_image_rejects_oversized() {
+        // 宽度 8001px 的 PNG：改写 IHDR 宽度并重算 CRC
+        let mut png = decode_base64(TEST_PNG).unwrap();
+        png[16..20].copy_from_slice(&8001u32.to_be_bytes());
+        let crc = crc::Crc::<u32>::new(&crc::CRC_32_ISO_HDLC).checksum(&png[12..29]);
+        png[29..33].copy_from_slice(&crc.to_be_bytes());
+        let err = build_kiro_image("image/png", &b64_encode(&png)).unwrap_err();
+        assert!(err.contains("8001x4"), "{err}");
+
+        // base64 超过 5MB
+        let big = "A".repeat(MAX_IMAGE_BASE64_LEN + 1);
+        let err = build_kiro_image("image/png", &big).unwrap_err();
+        assert!(err.contains("过大"), "{err}");
+    }
+
+    #[test]
+    fn test_convert_request_replaces_bad_image_with_placeholder() {
+        let req = MessagesRequest {
+            model: "claude-sonnet-4-6".to_string(),
+            max_tokens: 1024,
+            messages: vec![super::super::types::Message {
+                role: "user".to_string(),
+                content: serde_json::json!([
+                    {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "iVBORw0KGgoAAAANSUhEUgAA"}},
+                    {"type": "text", "text": "看图"}
+                ]),
+            }],
+            stream: true,
+            system: None,
+            tools: None,
+            tool_choice: None,
+            thinking: None,
+            output_config: None,
+            metadata: None,
+        };
+        let result = convert_request(&req).unwrap();
+        let user_input = &result.conversation_state.current_message.user_input_message;
+        assert!(user_input.images.is_empty());
+        assert!(user_input.content.contains("[图片已省略"));
+        assert!(user_input.content.contains("看图"));
     }
 
     #[test]
@@ -2734,7 +3006,7 @@ mod tests {
                         "content": [
                             {
                                 "type": "image",
-                                "source": {"type": "base64", "media_type": "image/jpeg", "data": "/9j/4AAQ"}
+                                "source": {"type": "base64", "media_type": "image/jpeg", "data": TEST_JPEG}
                             }
                         ]
                     }]),
@@ -2754,7 +3026,7 @@ mod tests {
         // 图片应从 tool_result 提升到当前消息的 images
         assert_eq!(user_input.images.len(), 1);
         assert_eq!(user_input.images[0].format, "jpeg");
-        assert_eq!(user_input.images[0].source.bytes, "/9j/4AAQ");
+        assert_eq!(user_input.images[0].source.bytes, TEST_JPEG);
     }
 
     #[test]

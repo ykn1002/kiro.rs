@@ -116,6 +116,50 @@ const MAX_RETRIES_PER_CREDENTIAL: usize = 3;
 /// 总重试次数硬上限（避免无限重试）
 const MAX_TOTAL_RETRIES: usize = 9;
 
+/// 去掉 Kiro 请求体中所有 `userInputMessage.images`（当前消息与历史），每处替换为文字占位
+///
+/// 返回 (新请求体, 去掉的图片数)；没有图片或解析失败返回 None。
+fn strip_images_from_kiro_body(body: &str) -> Option<(String, usize)> {
+    let mut value: serde_json::Value = serde_json::from_str(body).ok()?;
+    let state = value.get_mut("conversationState")?;
+    let mut removed = 0;
+
+    let mut strip = |msg: Option<&mut serde_json::Value>| {
+        let Some(msg) = msg.and_then(|m| m.as_object_mut()) else {
+            return;
+        };
+        let count = msg
+            .get("images")
+            .and_then(|v| v.as_array())
+            .map_or(0, |a| a.len());
+        if count == 0 {
+            return;
+        }
+        msg.remove("images");
+        removed += count;
+        let note = format!("[{count} 张图片已省略：上游无法处理该图片]");
+        let content = msg
+            .entry("content")
+            .or_insert_with(|| serde_json::Value::String(String::new()));
+        match content.as_str() {
+            Some(s) if !s.is_empty() => *content = format!("{s}\n{note}").into(),
+            _ => *content = note.into(),
+        }
+    };
+
+    strip(state.pointer_mut("/currentMessage/userInputMessage"));
+    if let Some(history) = state.get_mut("history").and_then(|h| h.as_array_mut()) {
+        for item in history {
+            strip(item.get_mut("userInputMessage"));
+        }
+    }
+
+    if removed == 0 {
+        return None;
+    }
+    Some((serde_json::to_string(&value).ok()?, removed))
+}
+
 fn record_request_failure_metrics(last_error: &Option<anyhow::Error>) {
     crate::metrics::inc_request_error();
     if let Some(e) = last_error {
@@ -475,6 +519,8 @@ impl KiroProvider {
         let mut force_refreshed: HashSet<u64> = HashSet::new();
         let mut rpm_reserved: Option<u64> = None;
         let api_type = if is_stream { "流式" } else { "非流式" };
+        // 上游拒绝图片后，去掉图片的请求体（只重试一次）
+        let mut image_body_override: Option<String> = None;
 
         // 优先使用 handler 传入的 model，避免重复解析 JSON
         let model = model_hint
@@ -561,7 +607,8 @@ impl KiroProvider {
                 };
 
                 let url = endpoint.api_url(&rctx);
-                let body = endpoint.transform_api_body(kiro_body, &rctx);
+                let body = endpoint
+                    .transform_api_body(image_body_override.as_deref().unwrap_or(kiro_body), &rctx);
 
                 let base = self
                     .client_for(&ctx.credentials)?
@@ -674,6 +721,30 @@ impl KiroProvider {
                     retry_after: None,
                 }));
                 continue;
+            }
+
+            // 400 + 图片错误（IMAGE_FORMAT_UNSUPPORTED / IMAGE_SIZE_EXCEEDED /
+            // IMAGE_DIMENSION_EXCEEDED 等）：本地校验没拦住的坏图。坏图会留在会话历史里，
+            // 不处理的话该会话之后每轮都 400 卡死，因此去掉全部图片、换成文字占位后重试一次。
+            if status.as_u16() == 400
+                && !is_passthrough
+                && image_body_override.is_none()
+                && body.contains("\"IMAGE_")
+            {
+                match strip_images_from_kiro_body(kiro_body) {
+                    Some((stripped, count)) => {
+                        tracing::warn!(
+                            removed_images = count,
+                            upstream = %body,
+                            "上游拒绝图片，去掉全部图片后重试一次"
+                        );
+                        image_body_override = Some(stripped);
+                        continue;
+                    }
+                    None => {
+                        tracing::warn!(upstream = %body, "上游报图片错误，但请求体中未找到可去掉的图片");
+                    }
+                }
             }
 
             // 400 Bad Request - 请求问题，重试/切换凭据无意义
@@ -859,5 +930,51 @@ impl KiroProvider {
         let jitter_max = (backoff / 4).max(1);
         let jitter = fastrand::u64(0..=jitter_max);
         Duration::from_millis(backoff.saturating_add(jitter))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_strip_images_from_kiro_body() {
+        let body = serde_json::json!({
+            "conversationState": {
+                "currentMessage": {"userInputMessage": {
+                    "content": "看图", "modelId": "m",
+                    "images": [{"format": "png", "source": {"bytes": "x"}}]
+                }},
+                "history": [
+                    {"userInputMessage": {"content": "", "modelId": "m",
+                        "images": [{"format": "png", "source": {"bytes": "a"}},
+                                   {"format": "jpeg", "source": {"bytes": "b"}}]}},
+                    {"assistantResponseMessage": {"content": "ok"}}
+                ]
+            }
+        })
+        .to_string();
+
+        let (stripped, removed) = strip_images_from_kiro_body(&body).unwrap();
+        assert_eq!(removed, 3);
+        let v: serde_json::Value = serde_json::from_str(&stripped).unwrap();
+        let cur = &v["conversationState"]["currentMessage"]["userInputMessage"];
+        assert!(cur.get("images").is_none());
+        assert!(cur["content"].as_str().unwrap().starts_with("看图\n["));
+        let h0 = &v["conversationState"]["history"][0]["userInputMessage"];
+        assert!(h0.get("images").is_none());
+        assert!(
+            h0["content"]
+                .as_str()
+                .unwrap()
+                .starts_with("[2 张图片已省略")
+        );
+    }
+
+    #[test]
+    fn test_strip_images_none_when_no_images() {
+        let body =
+            r#"{"conversationState":{"currentMessage":{"userInputMessage":{"content":"hi"}}}}"#;
+        assert!(strip_images_from_kiro_body(body).is_none());
     }
 }
