@@ -248,6 +248,15 @@ fn scan_sso_credentials() -> Vec<app::SsoCredentialCandidate> {
     app::scan_sso_credentials()
 }
 
+/// IPC：从本机安装的 Kiro IDE 读取版本指纹（不落盘，由前端填入表单后随保存生效）。
+/// 需要拉起 Kiro 子进程并读取十余 MB 的扩展 bundle，放到阻塞线程执行。
+#[tauri::command]
+async fn detect_kiro_fingerprint() -> Result<app::DetectedFingerprint, String> {
+    tauri::async_runtime::spawn_blocking(app::detect_fingerprint)
+        .await
+        .map_err(|e| format!("探测本机 Kiro 版本失败: {e}"))
+}
+
 /// IPC：检查 GitHub 最新 release 是否有新版本。
 /// 当前版本取本桌面壳的 Cargo 包版本（编译时嵌入）。
 #[tauri::command]
@@ -361,6 +370,7 @@ fn main() {
             import_config,
             save_text_file,
             scan_sso_credentials,
+            detect_kiro_fingerprint,
             check_update,
             get_app_version,
             open_url

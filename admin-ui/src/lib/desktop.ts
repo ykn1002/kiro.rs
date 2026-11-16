@@ -216,6 +216,25 @@ export async function scanSsoCredentials(): Promise<SsoCredentialCandidate[]> {
   }
 }
 
+/** 本机 Kiro 探测到的版本指纹，探测不到的字段为 null */
+export interface DetectedFingerprint {
+  kiroVersion: string | null
+  systemVersion: string | null
+  nodeVersion: string | null
+  streamingSdkVersion: string | null
+}
+
+/** 从本机安装的 Kiro IDE 读取版本指纹；非桌面环境返回 null。 */
+export async function detectKiroFingerprint(): Promise<DetectedFingerprint | null> {
+  const t = tauri()
+  if (!t) return null
+  try {
+    return await t.core.invoke<DetectedFingerprint>('detect_kiro_fingerprint')
+  } catch (e) {
+    throw toError(e, 'detect_kiro_fingerprint')
+  }
+}
+
 export interface UpdateInfo {
   /** 是否有新版本 */
   hasUpdate: boolean

@@ -34,6 +34,7 @@ import {
   setConfiguredPort,
   importConfig,
   saveTextFile,
+  detectKiroFingerprint,
   type PortStatus,
 } from '@/lib/desktop'
 import { storage } from '@/lib/storage'
@@ -290,6 +291,38 @@ export function SettingsDialog({ open, onOpenChange }: SettingsDialogProps) {
       toast.error(`保存端口失败: ${extractErrorMessage(e)}`)
     } finally {
       setPortSaving(false)
+    }
+  }
+
+  const [detecting, setDetecting] = useState(false)
+  // 从本机 Kiro 读取版本指纹，只填入表单，点保存后才生效
+  const handleDetectFingerprint = async () => {
+    setDetecting(true)
+    try {
+      const fp = await detectKiroFingerprint()
+      if (!fp) return
+      const fields: Array<[string, string | null, (v: string) => void]> = [
+        ['kiroVersion', fp.kiroVersion, setKiroVersion],
+        ['systemVersion', fp.systemVersion, setSystemVersion],
+        ['nodeVersion', fp.nodeVersion, setNodeVersion],
+        ['streamingSdkVersion', fp.streamingSdkVersion, setStreamingSdkVersion],
+      ]
+      const missing: string[] = []
+      for (const [name, value, set] of fields) {
+        if (value) set(value)
+        else missing.push(name)
+      }
+      if (missing.length === fields.length) {
+        toast.error('未检测到本机 Kiro 安装，版本信息未改动')
+      } else if (missing.length > 0) {
+        toast.warning(`已填入读取到的版本，以下字段未读取到、保留原值：${missing.join(', ')}；确认后点保存生效`)
+      } else {
+        toast.success('已从本机 Kiro 填入版本信息，确认后点保存生效')
+      }
+    } catch (e) {
+      toast.error(`读取本机 Kiro 版本失败: ${extractErrorMessage(e)}`)
+    } finally {
+      setDetecting(false)
     }
   }
 
@@ -772,7 +805,20 @@ export function SettingsDialog({ open, onOpenChange }: SettingsDialogProps) {
 
               {/* 版本信息 */}
               <section className={`space-y-2 ${activeTab === 'fingerprint' ? '' : 'hidden'}`}>
-                <h3 className="text-sm font-semibold">版本信息（上游指纹）</h3>
+                <div className="flex items-center justify-between gap-2">
+                  <h3 className="text-sm font-semibold">版本信息（上游指纹）</h3>
+                  {isDesktop() && (
+                    <Button
+                      type="button"
+                      variant="outline"
+                      size="sm"
+                      onClick={handleDetectFingerprint}
+                      disabled={isPending || detecting}
+                    >
+                      {detecting ? '读取中...' : '从本机 Kiro 读取'}
+                    </Button>
+                  )}
+                </div>
                 <div className="grid grid-cols-1 gap-3 md:grid-cols-2 lg:grid-cols-4">
                   <div className="space-y-1">
                     <label className="text-xs text-muted-foreground">kiroVersion</label>

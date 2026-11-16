@@ -26,6 +26,7 @@
     "allow-import-config",
     "allow-save-text-file",
     "allow-scan-sso-credentials",
+    "allow-detect-kiro-fingerprint",
     "allow-check-update",
     "allow-open-url"
   ]

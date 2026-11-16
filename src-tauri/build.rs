@@ -14,6 +14,7 @@ fn main() {
         "import_config",
         "save_text_file",
         "scan_sso_credentials",
+        "detect_kiro_fingerprint",
         "check_update",
         "open_url",
     ]);

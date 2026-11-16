@@ -35,6 +35,7 @@ use crate::openai;
 use crate::stats_db;
 use crate::token;
 
+pub use host_info::{DetectedFingerprint, detect_fingerprint};
 pub use paths::{RuntimeMode, desktop_data_dir, resolved_paths};
 pub use sso_scan::{SsoCredentialCandidate, scan_sso_credentials};
 
