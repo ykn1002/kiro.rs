@@ -2399,7 +2399,7 @@ dependencies = [
 
 [[package]]
 name = "kiro-rs-desktop"
-version = "2026.11.17"
+version = "2026.11.18"
 dependencies = [
  "chrono",
  "kiro-rs",
