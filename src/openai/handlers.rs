@@ -158,17 +158,21 @@ pub(crate) fn override_thinking_from_model_name(
         return;
     }
 
-    let is_opus_4_6 = model_lower.contains("opus")
-        && (model_lower.contains("4-6") || model_lower.contains("4.6"));
+    let adaptive = crate::anthropic::supports_adaptive_thinking(&payload.model);
 
-    let thinking_type = if is_opus_4_6 { "adaptive" } else { "enabled" };
+    let thinking_type = if adaptive { "adaptive" } else { "enabled" };
+    tracing::info!(
+        model = %payload.model,
+        thinking_type = thinking_type,
+        "模型名包含 thinking 后缀，覆写 thinking 配置"
+    );
 
     payload.thinking = Some(crate::anthropic::types::Thinking {
         thinking_type: thinking_type.to_string(),
         budget_tokens: 20000,
     });
 
-    if is_opus_4_6 {
+    if adaptive {
         payload.output_config = Some(crate::anthropic::types::OutputConfig {
             effort: "high".to_string(),
         });

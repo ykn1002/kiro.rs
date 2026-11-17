@@ -312,17 +312,22 @@ fn infer_thinking_config(
         return (None, None);
     }
 
-    let is_opus_4_6 = model_lower.contains("opus")
-        && (model_lower.contains("4-6") || model_lower.contains("4.6"));
+    let adaptive = crate::anthropic::supports_adaptive_thinking(&req.model);
 
-    let thinking_type = if is_opus_4_6 { "adaptive" } else { "enabled" };
+    let thinking_type = if adaptive { "adaptive" } else { "enabled" };
+    tracing::debug!(
+        model = %req.model,
+        thinking_type = thinking_type,
+        reasoning_effort = ?req.reasoning_effort,
+        "OpenAI chat 推断 thinking 配置"
+    );
 
     let thinking = Some(Thinking {
         thinking_type: thinking_type.to_string(),
         budget_tokens: 20000,
     });
 
-    let output_config = if is_opus_4_6 {
+    let output_config = if adaptive {
         Some(crate::anthropic::types::OutputConfig {
             effort: req
                 .reasoning_effort

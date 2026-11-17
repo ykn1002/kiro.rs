@@ -1199,19 +1199,18 @@ async fn handle_non_stream_request(
 
 /// 检测模型名是否包含 "thinking" 后缀，若包含则覆写 thinking 配置
 ///
-/// - Opus 4.6：覆写为 adaptive 类型
+/// - Opus / Sonnet 4.6 及以后：覆写为 adaptive 类型（effort = high）
 /// - 其他模型：覆写为 enabled 类型
-/// - budget_tokens 固定为 20000
+/// - budget_tokens 固定为 20000（adaptive 下不生效）
 fn override_thinking_from_model_name(payload: &mut MessagesRequest) {
     let model_lower = payload.model.to_lowercase();
     if !model_lower.contains("thinking") {
         return;
     }
 
-    let is_opus_4_6 = model_lower.contains("opus")
-        && (model_lower.contains("4-6") || model_lower.contains("4.6"));
+    let adaptive = super::converter::supports_adaptive_thinking(&payload.model);
 
-    let thinking_type = if is_opus_4_6 { "adaptive" } else { "enabled" };
+    let thinking_type = if adaptive { "adaptive" } else { "enabled" };
 
     tracing::info!(
         model = %payload.model,
@@ -1224,7 +1223,7 @@ fn override_thinking_from_model_name(payload: &mut MessagesRequest) {
         budget_tokens: 20000,
     });
 
-    if is_opus_4_6 {
+    if adaptive {
         payload.output_config = Some(OutputConfig {
             effort: "high".to_string(),
         });

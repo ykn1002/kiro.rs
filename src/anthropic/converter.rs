@@ -333,6 +333,72 @@ pub fn map_model(model: &str) -> Option<String> {
     match_model_def(model).map(|def| def.kiro_id.clone())
 }
 
+/// 判断模型是否应使用 adaptive thinking（Opus / Sonnet 4.6 及以后）。
+///
+/// 用于模型名带 `thinking` 后缀或 OpenAI 端点携带 reasoning effort 时推断 thinking 类型：
+/// 4.6 及以后的 Opus/Sonnet 走 adaptive（由模型按难度决定思考量，effort 控制积极程度），
+/// 其余（Haiku 4.5、旧版本、非 Claude 模型）仍走 enabled + 固定 budget。
+///
+/// 先从原始模型名解析 `family-major[-minor]`（兼容 `4-6` / `4.6` / `5` 写法，
+/// 日期后缀如 `4-20250514` 不会被误读为小版本）；解析不到时回退模型表定义的 family/version。
+pub fn supports_adaptive_thinking(model: &str) -> bool {
+    let parsed = parse_claude_family_version(model).or_else(|| {
+        match_model_def(model).and_then(|def| {
+            let version = def.version.as_deref()?;
+            let mut parts = version.split('.');
+            let major = parts.next()?.parse::<u32>().ok()?;
+            let minor = parts
+                .next()
+                .and_then(|m| m.parse::<u32>().ok())
+                .unwrap_or(0);
+            Some((def.family.to_lowercase(), major, minor))
+        })
+    });
+
+    let adaptive = matches!(
+        &parsed,
+        Some((family, major, minor))
+            if (family == "opus" || family == "sonnet") && (*major, *minor) >= (4, 6)
+    );
+    tracing::debug!(model = %model, parsed = ?parsed, adaptive, "thinking 类型推断");
+    adaptive
+}
+
+/// 从模型名解析 `(family, major, minor)`，family 仅识别 opus / sonnet / haiku。
+///
+/// 规则：family 后紧跟 `-` 或 `.` 与主版本数字；其后若再跟分隔符与 1~2 位数字
+/// （且后面不再是数字）视为小版本，否则小版本为 0。
+fn parse_claude_family_version(model: &str) -> Option<(String, u32, u32)> {
+    let lower = model.to_lowercase();
+    for family in ["opus", "sonnet", "haiku"] {
+        let Some(idx) = lower.find(family) else {
+            continue;
+        };
+        let rest = &lower[idx + family.len()..];
+        let rest = rest.strip_prefix(['-', '.', '_'])?;
+        let major_len = rest.chars().take_while(|c| c.is_ascii_digit()).count();
+        if major_len == 0 {
+            return None;
+        }
+        let major = rest[..major_len].parse::<u32>().ok()?;
+        let after_major = &rest[major_len..];
+        let minor = after_major
+            .strip_prefix(['-', '.'])
+            .and_then(|s| {
+                let len = s.chars().take_while(|c| c.is_ascii_digit()).count();
+                // 超过 2 位视为日期后缀（如 4-20250514），不当作小版本
+                if (1..=2).contains(&len) {
+                    s[..len].parse::<u32>().ok()
+                } else {
+                    None
+                }
+            })
+            .unwrap_or(0);
+        return Some((family.to_string(), major, minor));
+    }
+    None
+}
+
 /// 将客户端原始模型名归一为展示名（用于监控统计聚合）。
 ///
 /// 命中模型表则返回其 `display_id`（thinking 变体、别名、kiroId 都归并到同一展示名）；
@@ -1967,6 +2033,34 @@ mod tests {
 
         // 恢复默认，避免影响其他测试
         set_chunked_write_policy(ChunkedWritePolicy::default());
+    }
+
+    /// Opus/Sonnet 4.6 及以后走 adaptive，其余走 enabled
+    #[test]
+    fn test_supports_adaptive_thinking() {
+        for m in [
+            "claude-opus-4-6-thinking",
+            "claude-opus-4.6",
+            "claude-opus-4-7-thinking",
+            "claude-opus-4-8",
+            "claude-opus-5-5-thinking",
+            "claude-opus-5-thinking",
+            "claude-sonnet-4-6-thinking",
+            "claude-sonnet-5-5-thinking",
+            "claude-sonnet-5",
+        ] {
+            assert!(supports_adaptive_thinking(m), "{m} 应走 adaptive");
+        }
+        for m in [
+            "claude-opus-4-5-thinking",
+            "claude-opus-4-1",
+            "claude-sonnet-4-5-thinking",
+            "claude-sonnet-4-20250514-thinking",
+            "claude-haiku-4-5-20251001-thinking",
+            "claude-3-7-sonnet-thinking",
+        ] {
+            assert!(!supports_adaptive_thinking(m), "{m} 应走 enabled");
+        }
     }
 
     #[test]
