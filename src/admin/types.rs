@@ -300,6 +300,8 @@ pub struct AppConfigResponse {
     pub credential_rpm_haiku: Option<u32>,
     /// RPM 打满时最多等待毫秒数（0 = 立即 429）
     pub credential_rpm_max_wait_ms: u64,
+    /// round-robin 会话保持空闲过期秒数（0 = 关闭）
+    pub session_affinity_ttl_secs: u64,
     /// Kiro 客户端版本
     pub kiro_version: String,
     /// 全局 machineId（未配置凭据级时使用）
@@ -352,6 +354,9 @@ pub struct UpdateAppConfigRequest {
     pub credential_rpm_haiku: Option<u32>,
     /// RPM 打满时最多等待毫秒数（0 = 立即 429）；缺省时不更新（兼容旧 Admin UI）
     pub credential_rpm_max_wait_ms: Option<u64>,
+    /// round-robin 会话保持空闲过期秒数（0 = 关闭）；缺省时不更新（兼容旧 Admin UI）
+    #[serde(default)]
+    pub session_affinity_ttl_secs: Option<u64>,
     /// Kiro 客户端版本（不能为空）
     pub kiro_version: String,
     /// 全局 machineId（空字符串表示清除；字段缺失则不更新，兼容旧 UI）

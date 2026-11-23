@@ -851,6 +851,11 @@ pub struct MultiTokenManager {
     load_balancing_mode: Mutex<String>,
     /// round-robin 模式的轮转游标（单调递增，对可用凭据取模）
     round_robin_cursor: AtomicU64,
+    /// round-robin 会话保持表：会话标识 → (绑定凭据 id, 最近命中时间)
+    ///
+    /// 同一会话固定落到同一凭据，避免交替路由破坏上游前缀缓存。
+    /// 锁顺序：总是在持有 `entries` 锁之后获取，不可反向。
+    session_affinity: Mutex<HashMap<String, (u64, Instant)>>,
     /// 最近一次统计持久化时间（用于 debounce）
     last_stats_save_at: Mutex<Option<Instant>>,
     /// 统计数据是否有未落盘更新
@@ -862,6 +867,13 @@ pub struct MultiTokenManager {
 
 /// 每个凭据最大 API 调用失败次数
 const MAX_FAILURES_PER_CREDENTIAL: u32 = 3;
+/// 会话保持表超过该条目数时，在插入前清理一次过期条目（防止长期运行无限增长）
+const SESSION_AFFINITY_PRUNE_THRESHOLD: usize = 256;
+
+/// 会话标识的日志短形式（只打前 8 个字符，便于排查又不刷屏）
+fn short_session(key: &str) -> &str {
+    key.get(..8).unwrap_or(key)
+}
 /// 统计数据持久化防抖间隔
 const STATS_SAVE_DEBOUNCE: StdDuration = StdDuration::from_secs(30);
 
@@ -987,6 +999,7 @@ impl MultiTokenManager {
             is_multiple_format,
             load_balancing_mode: Mutex::new(load_balancing_mode),
             round_robin_cursor: AtomicU64::new(0),
+            session_affinity: Mutex::new(HashMap::new()),
             last_stats_save_at: Mutex::new(None),
             stats_dirty: AtomicBool::new(false),
             model_rpm_windows: Mutex::new(HashMap::new()),
@@ -1041,11 +1054,27 @@ impl MultiTokenManager {
     ///
     /// # 参数
     /// - `model`: 可选的模型名称，用于过滤支持该模型的凭据（如 opus 模型需要付费订阅）
+    #[cfg(test)]
     fn select_next_credential(
         &self,
         model: Option<&str>,
         cap: Capability,
         passthrough_only: bool,
+    ) -> Option<(u64, KiroCredentials)> {
+        self.select_next_credential_for_session(model, cap, passthrough_only, None)
+    }
+
+    /// 同 [`select_next_credential`](Self::select_next_credential)，额外接收会话标识。
+    ///
+    /// round-robin 模式下若开启会话保持（`session_affinity_ttl_secs > 0`）且提供了 `session`：
+    /// 会话已绑定且绑定凭据仍在候选集中 → 直接复用（不推进游标）；否则正常轮转并改绑。
+    /// 其他模式忽略 `session`。
+    fn select_next_credential_for_session(
+        &self,
+        model: Option<&str>,
+        cap: Capability,
+        passthrough_only: bool,
+        session: Option<&str>,
     ) -> Option<(u64, KiroCredentials)> {
         let mut entries = self.entries.lock();
 
@@ -1112,12 +1141,69 @@ impl MultiTokenManager {
                 // 真·轮询：不看使用次数，在可用候选中按稳定顺序逐个轮转。
                 // 先按 (priority, id) 排序保证候选顺序稳定（不受 entries 内部顺序/RPM 过滤抖动影响），
                 // 再用单调递增的游标对候选数取模，确保连续请求依次落到不同凭据。
+                let ttl_secs = self.config().session_affinity_ttl_secs;
+                let session = session.filter(|_| ttl_secs > 0);
+
+                // 会话保持：同一会话固定落到已绑定凭据，避免交替路由破坏上游前缀缓存
+                if let Some(key) = session {
+                    let ttl = StdDuration::from_secs(ttl_secs);
+                    let mut affinity = self.session_affinity.lock();
+                    match affinity.get(key).copied() {
+                        Some((bound_id, last_seen)) if now.duration_since(last_seen) < ttl => {
+                            if let Some(entry) = available.iter().find(|e| e.id == bound_id) {
+                                affinity.insert(key.to_string(), (bound_id, now));
+                                tracing::debug!(
+                                    session = short_session(key),
+                                    credential_id = bound_id,
+                                    "round-robin 会话保持命中，复用已绑定凭据"
+                                );
+                                return Some((entry.id, entry.credentials.clone()));
+                            }
+                            tracing::info!(
+                                session = short_session(key),
+                                credential_id = bound_id,
+                                "round-robin 会话绑定的凭据当前不可用（禁用/不支持该模型/RPM 打满），重新轮转并改绑"
+                            );
+                        }
+                        Some((bound_id, _)) => {
+                            tracing::debug!(
+                                session = short_session(key),
+                                credential_id = bound_id,
+                                ttl_secs,
+                                "round-robin 会话绑定已过期，重新轮转"
+                            );
+                        }
+                        None => {}
+                    }
+                }
+
                 let mut ordered: Vec<&CredentialEntry> = available.clone();
                 ordered.sort_by_key(|e| (e.credentials.priority, e.id));
                 let n = ordered.len() as u64;
                 // fetch_add 返回旧值，对当前候选数取模得到本次索引
                 let idx = (self.round_robin_cursor.fetch_add(1, Ordering::Relaxed) % n) as usize;
                 let entry = ordered[idx];
+
+                if let Some(key) = session {
+                    let ttl = StdDuration::from_secs(ttl_secs);
+                    let mut affinity = self.session_affinity.lock();
+                    if affinity.len() >= SESSION_AFFINITY_PRUNE_THRESHOLD {
+                        let before = affinity.len();
+                        affinity.retain(|_, (_, last_seen)| now.duration_since(*last_seen) < ttl);
+                        tracing::debug!(
+                            before,
+                            after = affinity.len(),
+                            "清理过期的 round-robin 会话绑定"
+                        );
+                    }
+                    affinity.insert(key.to_string(), (entry.id, now));
+                    tracing::info!(
+                        session = short_session(key),
+                        credential_id = entry.id,
+                        "round-robin 新会话绑定凭据"
+                    );
+                }
+
                 Some((entry.id, entry.credentials.clone()))
             }
             _ => {
@@ -1261,6 +1347,20 @@ impl MultiTokenManager {
         passthrough_only: bool,
         rpm_mode: RpmChargeMode,
     ) -> anyhow::Result<CallContext> {
+        self.acquire_context_for_session(model, cap, passthrough_only, rpm_mode, None)
+            .await
+    }
+
+    /// 同 [`acquire_context`](Self::acquire_context)，额外携带会话标识，
+    /// 供 round-robin 模式做会话保持（同一会话固定落到同一凭据，保护上游前缀缓存）。
+    pub async fn acquire_context_for_session(
+        &self,
+        model: Option<&str>,
+        cap: Capability,
+        passthrough_only: bool,
+        rpm_mode: RpmChargeMode,
+        session: Option<&str>,
+    ) -> anyhow::Result<CallContext> {
         let total = self.total_count();
         let max_attempts = (total * MAX_FAILURES_PER_CREDENTIAL as usize).max(1);
         let mut attempt_count = 0;
@@ -1341,7 +1441,12 @@ impl MultiTokenManager {
                     hit
                 } else {
                     // 当前凭据不可用或 balanced 模式，根据负载均衡策略选择
-                    let mut best = self.select_next_credential(model, cap, passthrough_only);
+                    let mut best = self.select_next_credential_for_session(
+                        model,
+                        cap,
+                        passthrough_only,
+                        session,
+                    );
 
                     // 没有可用凭据：如果是"自动禁用导致全灭"，做一次类似重启的自愈
                     if best.is_none() {
@@ -1360,7 +1465,12 @@ impl MultiTokenManager {
                                 }
                             }
                             drop(entries);
-                            best = self.select_next_credential(model, cap, passthrough_only);
+                            best = self.select_next_credential_for_session(
+                                model,
+                                cap,
+                                passthrough_only,
+                                session,
+                            );
                         }
                     }
 
@@ -3188,6 +3298,121 @@ mod tests {
         );
         // 两个可用凭据都应出现
         assert!(picks.contains(&1) && picks.contains(&3));
+    }
+
+    fn round_robin_manager(n: usize, ttl_secs: u64) -> MultiTokenManager {
+        let mut config = Config::default();
+        config.load_balancing_mode = "round-robin".to_string();
+        config.session_affinity_ttl_secs = ttl_secs;
+        let creds = (0..n).map(|_| KiroCredentials::default()).collect();
+        MultiTokenManager::new(config, creds, None, None, false).unwrap()
+    }
+
+    fn pick_rr(manager: &MultiTokenManager, session: Option<&str>) -> u64 {
+        manager
+            .select_next_credential_for_session(None, Capability::Anthropic, false, session)
+            .unwrap()
+            .0
+    }
+
+    #[test]
+    fn test_round_robin_session_affinity_sticks_to_bound_credential() {
+        let manager = round_robin_manager(2, 1800);
+        let first = pick_rr(&manager, Some("sess-aaaa-1111"));
+        // 同一会话连续请求始终落到同一凭据
+        for _ in 0..5 {
+            assert_eq!(pick_rr(&manager, Some("sess-aaaa-1111")), first);
+        }
+    }
+
+    #[test]
+    fn test_round_robin_session_affinity_spreads_distinct_sessions() {
+        let manager = round_robin_manager(2, 1800);
+        let a = pick_rr(&manager, Some("sess-aaaa"));
+        let b = pick_rr(&manager, Some("sess-bbbb"));
+        // 新会话仍按轮转分配，两个会话分摊到不同凭据
+        assert_ne!(a, b);
+        // 已绑定会话的命中不推进游标：之后的新会话继续轮转
+        assert_eq!(pick_rr(&manager, Some("sess-aaaa")), a);
+        assert_eq!(pick_rr(&manager, Some("sess-cccc")), a);
+    }
+
+    #[test]
+    fn test_round_robin_without_session_still_rotates() {
+        let manager = round_robin_manager(2, 1800);
+        let picks: Vec<u64> = (0..4).map(|_| pick_rr(&manager, None)).collect();
+        assert_eq!(picks, vec![1, 2, 1, 2]);
+    }
+
+    #[test]
+    fn test_round_robin_session_affinity_disabled_when_ttl_zero() {
+        let manager = round_robin_manager(2, 0);
+        let picks: Vec<u64> = (0..4)
+            .map(|_| pick_rr(&manager, Some("sess-aaaa")))
+            .collect();
+        assert_eq!(picks, vec![1, 2, 1, 2], "ttl=0 应关闭会话保持");
+    }
+
+    #[test]
+    fn test_round_robin_session_affinity_rebinds_when_bound_disabled() {
+        let manager = round_robin_manager(2, 1800);
+        let first = pick_rr(&manager, Some("sess-aaaa"));
+        {
+            let mut entries = manager.entries.lock();
+            entries.iter_mut().find(|e| e.id == first).unwrap().disabled = true;
+        }
+        let second = pick_rr(&manager, Some("sess-aaaa"));
+        assert_ne!(second, first, "绑定凭据被禁用后应改绑");
+        // 原凭据恢复后，会话保持在新绑定上，不回切
+        {
+            let mut entries = manager.entries.lock();
+            entries.iter_mut().find(|e| e.id == first).unwrap().disabled = false;
+        }
+        assert_eq!(pick_rr(&manager, Some("sess-aaaa")), second);
+    }
+
+    #[test]
+    fn test_round_robin_session_affinity_expires_after_ttl() {
+        let manager = round_robin_manager(2, 1800);
+        let first = pick_rr(&manager, Some("sess-aaaa"));
+        // 人为把绑定时间拨到 TTL 之前，模拟空闲过期
+        {
+            let mut affinity = manager.session_affinity.lock();
+            let past = Instant::now()
+                .checked_sub(StdDuration::from_secs(1801))
+                .expect("单调时钟可回拨");
+            affinity.insert("sess-aaaa".to_string(), (first, past));
+        }
+        // 过期后重新轮转：游标已推进一次，下一个是另一凭据
+        assert_ne!(pick_rr(&manager, Some("sess-aaaa")), first);
+    }
+
+    #[tokio::test]
+    async fn test_acquire_context_for_session_sticks_in_round_robin() {
+        let mut config = Config::default();
+        config.load_balancing_mode = "round-robin".to_string();
+        let mut c1 = KiroCredentials::default();
+        c1.access_token = Some("t1".to_string());
+        c1.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
+        let mut c2 = c1.clone();
+        c2.access_token = Some("t2".to_string());
+        let manager = MultiTokenManager::new(config, vec![c1, c2], None, None, false).unwrap();
+
+        let mut ids = Vec::new();
+        for _ in 0..4 {
+            let ctx = manager
+                .acquire_context_for_session(
+                    None,
+                    Capability::Anthropic,
+                    false,
+                    RpmChargeMode::Charge,
+                    Some("sess-aaaa"),
+                )
+                .await
+                .unwrap();
+            ids.push(ctx.id);
+        }
+        assert!(ids.iter().all(|&id| id == ids[0]), "实际: {:?}", ids);
     }
 
     #[test]

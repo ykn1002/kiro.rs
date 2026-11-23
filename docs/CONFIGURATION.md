@@ -45,6 +45,7 @@
 | `proxyPassword` | string | - | 代理密码 |
 | `adminApiKey` | string | - | Admin API 密钥，配置后启用凭据管理 API 和 Web 管理界面 |
 | `loadBalancingMode` | string | `priority` | 负载均衡模式：`priority`（按优先级，主备式黏住最高优先级凭据）、`balanced`（按累计成功数 least-used 均衡）或 `round-robin`（真·轮询，在可用凭据间严格依次轮转，不看使用次数） |
+| `sessionAffinityTtlSecs` | number | `1800` | 仅 `round-robin` 模式生效的会话保持：同一会话（`metadata.user_id` 中的 session UUID；Codex 取 `prompt_cache_key` 等）在空闲该秒数内固定落到首次分配的凭据，避免相邻轮次交替路由到不同凭据、破坏上游前缀缓存。每次命中刷新计时；绑定凭据被禁用 / 不支持该模型 / RPM 打满时重新轮转并改绑。无会话标识的请求仍逐请求轮转。`0` = 关闭 |
 | `credentialRpm` | number | `0` | 单凭据目标 RPM（60 秒滑动窗口内请求数）；达到上限时跳过该凭据并分流到其他凭据；**全部打满时向客户端返回 429**；`0` 表示不限制。作为 Opus/Sonnet/Haiku 未单独配置时的兜底值 |
 | `credentialRpmOpus` | number | - | 单凭据 Opus 模型专用 RPM，未配置时回退到 `credentialRpm` |
 | `credentialRpmSonnet` | number | - | 单凭据 Sonnet 模型专用 RPM，未配置时回退到 `credentialRpm` |
@@ -294,7 +295,7 @@ Select-String -Path "$env:LOCALAPPDATA\Programs\Kiro\resources\app\extensions\ki
 负载均衡模式（`loadBalancingMode`，可在 config 配置或 Admin UI 运行时切换）：
 - `priority`（默认）：主备式，始终使用优先级最高（priority 最小）的凭据，仅当其被禁用、额度用尽或撞上 RPM 上限时才故障转移到下一个。**同级凭据是主备关系，不会分摊负载。**
 - `balanced`：least-used，每次请求选累计成功次数（`success_count`）最少的凭据。注意成功计数会持久化到 `kiro_stats.json` 并跨重启加载，因此切换初期会偏向历史计数低的凭据。
-- `round-robin`：真·轮询，在可用凭据间按 `(priority, id)` 顺序严格依次轮转，**完全不看使用次数**，低流量下也能均匀分摊。
+- `round-robin`：真·轮询，在可用凭据间按 `(priority, id)` 顺序严格依次轮转，**完全不看使用次数**，低流量下也能均匀分摊。默认开启会话保持（`sessionAffinityTtlSecs`，30 分钟空闲过期）：轮转粒度是「新会话」而非「单个请求」，同一会话的多轮请求留在同一凭据上以命中上游前缀缓存；不同会话仍在凭据间轮转分摊。
 
 > 三种模式的候选集都会先过滤掉禁用 / 不支持 Opus 订阅 / 已达 RPM 上限的凭据。
 

@@ -497,6 +497,17 @@ pub(crate) fn extract_session_id(user_id: &str) -> Option<String> {
     None
 }
 
+/// 提取请求的会话标识，供 round-robin 会话保持做凭据粘滞
+///
+/// 与 conversationId 同源（`metadata.user_id` 中的 session UUID），但提取不到时返回 None，
+/// 不像 conversationId 那样回退到随机 UUID（随机值无法跨轮复用，绑定没有意义）。
+pub(crate) fn request_session_key(req: &MessagesRequest) -> Option<String> {
+    req.metadata
+        .as_ref()
+        .and_then(|m| m.user_id.as_deref())
+        .and_then(extract_session_id)
+}
+
 /// 简单验证 UUID 格式（36 字符，包含 4 个连字符）
 fn is_valid_uuid(s: &str) -> bool {
     s.len() == 36 && s.chars().filter(|c| *c == '-').count() == 4

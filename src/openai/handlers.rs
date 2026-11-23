@@ -119,6 +119,12 @@ pub async fn chat_completions(
         .unwrap_or(false);
 
     let tool_name_map = conversion_result.tool_name_map;
+    // 会话标识（round-robin 会话保持用），无则 None
+    let session_key = crate::anthropic::request_session_key(&anthropic_payload);
+    tracing::debug!(
+        has_session = session_key.is_some(),
+        "提取会话标识（用于 round-robin 会话保持）"
+    );
     let include_usage = payload
         .stream_options
         .as_ref()
@@ -134,6 +140,7 @@ pub async fn chat_completions(
             tool_name_map,
             include_usage,
             state.passthrough_retry_after,
+            session_key.as_deref(),
         )
         .await
     } else {
@@ -145,6 +152,7 @@ pub async fn chat_completions(
             thinking_enabled,
             tool_name_map,
             state.passthrough_retry_after,
+            session_key.as_deref(),
         )
         .await
     }
@@ -225,6 +233,7 @@ fn handle_openai_decode_failure(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn handle_stream_request(
     provider: std::sync::Arc<crate::kiro::provider::KiroProvider>,
     request_body: &str,
@@ -234,6 +243,7 @@ async fn handle_stream_request(
     tool_name_map: std::collections::HashMap<String, String>,
     include_usage: bool,
     passthrough_retry_after: bool,
+    session_key: Option<&str>,
 ) -> Response {
     // Chat Completions 无对应透传协议（透传站为 Responses API），仅走 Kiro
     let upstream = match provider
@@ -244,6 +254,7 @@ async fn handle_stream_request(
             passthrough_only: false,
             protocol: crate::kiro::provider::PassthroughProtocol::Openai,
             model_hint: Some(model),
+            session_key,
         })
         .await
     {
@@ -387,6 +398,7 @@ fn create_openai_sse_stream(
     .flatten()
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn handle_non_stream_request(
     provider: std::sync::Arc<crate::kiro::provider::KiroProvider>,
     request_body: &str,
@@ -395,6 +407,7 @@ async fn handle_non_stream_request(
     thinking_enabled: bool,
     tool_name_map: std::collections::HashMap<String, String>,
     passthrough_retry_after: bool,
+    session_key: Option<&str>,
 ) -> Response {
     let upstream = match provider
         .call_api(crate::kiro::provider::UpstreamRequest {
@@ -404,6 +417,7 @@ async fn handle_non_stream_request(
             passthrough_only: false,
             protocol: crate::kiro::provider::PassthroughProtocol::Openai,
             model_hint: Some(model),
+            session_key,
         })
         .await
     {

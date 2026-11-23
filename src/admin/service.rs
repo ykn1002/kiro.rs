@@ -674,6 +674,7 @@ impl AdminService {
             credential_rpm_sonnet: config.credential_rpm_sonnet,
             credential_rpm_haiku: config.credential_rpm_haiku,
             credential_rpm_max_wait_ms: config.credential_rpm_max_wait_ms,
+            session_affinity_ttl_secs: config.session_affinity_ttl_secs,
             kiro_version: config.kiro_version.clone(),
             machine_id: config.machine_id.clone(),
             system_version: config.system_version.clone(),
@@ -810,6 +811,16 @@ impl AdminService {
         new_config.credential_rpm_haiku = req.credential_rpm_haiku;
         if let Some(max_wait_ms) = req.credential_rpm_max_wait_ms {
             new_config.credential_rpm_max_wait_ms = max_wait_ms;
+        }
+        if let Some(ttl_secs) = req.session_affinity_ttl_secs {
+            if ttl_secs != new_config.session_affinity_ttl_secs {
+                tracing::info!(
+                    old = new_config.session_affinity_ttl_secs,
+                    new = ttl_secs,
+                    "Admin 更新 round-robin 会话保持 TTL（sessionAffinityTtlSecs）"
+                );
+            }
+            new_config.session_affinity_ttl_secs = ttl_secs;
         }
         if let Some(ref raw_machine_id) = req.machine_id {
             let trimmed = raw_machine_id.trim();

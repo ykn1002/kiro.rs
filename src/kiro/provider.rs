@@ -66,6 +66,8 @@ pub struct UpstreamRequest<'a> {
     pub protocol: PassthroughProtocol,
     /// 模型名提示（用于 RPM 凭据选择）
     pub model_hint: Option<&'a str>,
+    /// 会话标识（从 metadata 提取的 session UUID），供 round-robin 会话保持；无则 None
+    pub session_key: Option<&'a str>,
 }
 
 /// 一次上游请求的成功结果
@@ -512,6 +514,7 @@ impl KiroProvider {
             passthrough_only,
             protocol,
             model_hint,
+            session_key,
         } = request;
         let total_credentials = self.token_manager.total_count();
         let max_retries = (total_credentials * MAX_RETRIES_PER_CREDENTIAL).min(MAX_TOTAL_RETRIES);
@@ -534,7 +537,13 @@ impl KiroProvider {
             // 获取调用上下文（绑定 index、credentials、token）
             let ctx = match self
                 .token_manager
-                .acquire_context(model.as_deref(), cap, passthrough_only, rpm_mode)
+                .acquire_context_for_session(
+                    model.as_deref(),
+                    cap,
+                    passthrough_only,
+                    rpm_mode,
+                    session_key,
+                )
                 .await
             {
                 Ok(c) => c,

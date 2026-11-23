@@ -273,6 +273,13 @@ async fn handle_messages(
 
     override_thinking_from_model_name(&mut payload);
 
+    // 会话标识（round-robin 会话保持用），无则 None
+    let session_key = super::converter::request_session_key(&payload);
+    tracing::debug!(
+        has_session = session_key.is_some(),
+        "提取会话标识（用于 round-robin 会话保持）"
+    );
+
     if websearch::has_web_search_tool(&payload) {
         tracing::info!("检测到 WebSearch 工具，路由到 WebSearch 处理");
 
@@ -301,6 +308,7 @@ async fn handle_messages(
                     &payload.model,
                     payload.stream,
                     state.passthrough_retry_after,
+                    session_key.as_deref(),
                 )
                 .await;
             }
@@ -361,6 +369,7 @@ async fn handle_messages(
             delay_message_start,
             state.passthrough_retry_after,
             state.cc_message_start_max_delay_ms,
+            session_key,
         )
         .await
     } else {
@@ -373,6 +382,7 @@ async fn handle_messages(
             thinking_enabled,
             tool_name_map,
             state.passthrough_retry_after,
+            session_key.as_deref(),
         )
         .await
     }
@@ -403,6 +413,8 @@ struct StreamRestarter {
     remaining: usize,
     /// 最近一次成功建流的上游凭据 id（-1 = 未知），供监控按凭据统计
     current_credential_id: i64,
+    /// 会话标识（round-robin 会话保持），重放时沿用以落回同一凭据
+    session_key: Option<String>,
 }
 
 impl StreamRestarter {
@@ -439,6 +451,7 @@ impl StreamRestarter {
                 passthrough_only: false,
                 protocol: crate::kiro::provider::PassthroughProtocol::Anthropic,
                 model_hint: Some(&self.model),
+                session_key: self.session_key.as_deref(),
             })
             .await
         {
@@ -468,6 +481,7 @@ async fn handle_anthropic_passthrough_only(
     model: &str,
     stream: bool,
     passthrough_retry_after: bool,
+    session_key: Option<&str>,
 ) -> Response {
     let req = crate::kiro::provider::UpstreamRequest {
         kiro_body: "",
@@ -476,6 +490,7 @@ async fn handle_anthropic_passthrough_only(
         passthrough_only: true,
         protocol: crate::kiro::provider::PassthroughProtocol::Anthropic,
         model_hint: Some(model),
+        session_key,
     };
     let result = if stream {
         provider.call_api_stream(req).await
@@ -507,6 +522,7 @@ async fn handle_stream_request(
     delay_message_start: bool,
     passthrough_retry_after: bool,
     cc_message_start_max_delay_ms: u64,
+    session_key: Option<String>,
 ) -> Response {
     let mut restarter = StreamRestarter {
         provider: provider.clone(),
@@ -519,6 +535,7 @@ async fn handle_stream_request(
         delay_message_start,
         remaining: MAX_STREAM_RESTARTS,
         current_credential_id: -1,
+        session_key,
     };
 
     let upstream = match provider
@@ -529,6 +546,7 @@ async fn handle_stream_request(
             passthrough_only: false,
             protocol: crate::kiro::provider::PassthroughProtocol::Anthropic,
             model_hint: Some(model),
+            session_key: restarter.session_key.as_deref(),
         })
         .await
     {
@@ -877,6 +895,7 @@ async fn handle_non_stream_request(
     thinking_enabled: bool,
     tool_name_map: std::collections::HashMap<String, String>,
     passthrough_retry_after: bool,
+    session_key: Option<&str>,
 ) -> Response {
     // 调用 Kiro API（支持多凭据故障转移）
     let upstream = match provider
@@ -887,6 +906,7 @@ async fn handle_non_stream_request(
             passthrough_only: false,
             protocol: crate::kiro::provider::PassthroughProtocol::Anthropic,
             model_hint: Some(model),
+            session_key,
         })
         .await
     {

@@ -268,6 +268,15 @@ pub struct Config {
     #[serde(default = "default_load_balancing_mode")]
     pub load_balancing_mode: String,
 
+    /// round-robin 模式的会话保持空闲过期时间（秒）
+    ///
+    /// 同一会话（从 `metadata.user_id` 等提取的 session UUID）在此时间内的请求固定落到
+    /// 首次分配的凭据，避免相邻轮次交替路由到不同凭据、破坏上游的前缀缓存。
+    /// 每次命中会刷新计时；绑定凭据不可用（禁用 / 不支持 opus / RPM 打满）时重新轮转并改绑。
+    /// `0` 表示关闭（恢复逐请求轮转）。仅对 round-robin 模式生效；无会话标识的请求不受影响。
+    #[serde(default = "default_session_affinity_ttl_secs")]
+    pub session_affinity_ttl_secs: u64,
+
     /// 单凭据目标 RPM（每分钟请求数），用于凭据级节流/分流
     ///
     /// 当某个凭据在最近 60 秒内的请求数达到该值时，会在凭据选择时被跳过，
@@ -412,6 +421,11 @@ fn default_tls_backend() -> TlsBackend {
 
 fn default_load_balancing_mode() -> String {
     "priority".to_string()
+}
+
+/// round-robin 会话保持默认空闲过期时间：30 分钟
+fn default_session_affinity_ttl_secs() -> u64 {
+    1800
 }
 
 fn default_extract_thinking() -> bool {
@@ -564,6 +578,7 @@ impl Default for Config {
             proxy_password: None,
             admin_api_key: None,
             load_balancing_mode: default_load_balancing_mode(),
+            session_affinity_ttl_secs: default_session_affinity_ttl_secs(),
             credential_rpm: 0,
             credential_rpm_opus: None,
             credential_rpm_sonnet: None,

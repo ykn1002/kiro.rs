@@ -77,6 +77,8 @@ struct ResponsesStreamRestarter {
     remaining: usize,
     /// 最近一次成功建流的上游凭据 id（-1 = 未知），供监控按凭据统计
     current_credential_id: i64,
+    /// 会话标识（round-robin 会话保持），重放时沿用以落回同一凭据
+    session_key: Option<String>,
 }
 
 impl ResponsesStreamRestarter {
@@ -108,6 +110,7 @@ impl ResponsesStreamRestarter {
                 passthrough_only: false,
                 protocol: crate::kiro::provider::PassthroughProtocol::Openai,
                 model_hint: Some(&self.model),
+                session_key: self.session_key.as_deref(),
             })
             .await
         {
@@ -257,6 +260,7 @@ pub async fn create_response(State(state): State<AppState>, raw_body: bytes::Byt
                     &payload.model,
                     payload.stream,
                     state.passthrough_retry_after,
+                    None,
                 )
                 .await;
             }
@@ -270,6 +274,13 @@ pub async fn create_response(State(state): State<AppState>, raw_body: bytes::Byt
     };
 
     override_thinking_from_model_name(&mut anthropic_payload);
+
+    // 会话标识（round-robin 会话保持用；Codex 通常来自 prompt_cache_key），无则 None
+    let session_key = crate::anthropic::request_session_key(&anthropic_payload);
+    tracing::debug!(
+        has_session = session_key.is_some(),
+        "提取会话标识（用于 round-robin 会话保持）"
+    );
 
     let conversion_result = match crate::anthropic::convert_responses_request(&anthropic_payload) {
         Ok(r) => r,
@@ -289,6 +300,7 @@ pub async fn create_response(State(state): State<AppState>, raw_body: bytes::Byt
                     &payload.model,
                     payload.stream,
                     state.passthrough_retry_after,
+                    session_key.as_deref(),
                 )
                 .await;
             }
@@ -350,6 +362,7 @@ pub async fn create_response(State(state): State<AppState>, raw_body: bytes::Byt
             tool_name_map,
             state.passthrough_retry_after,
             code_mode,
+            session_key.as_deref(),
         )
         .await
     } else {
@@ -363,6 +376,7 @@ pub async fn create_response(State(state): State<AppState>, raw_body: bytes::Byt
             tool_name_map,
             state.passthrough_retry_after,
             code_mode,
+            session_key.as_deref(),
         )
         .await
     }
@@ -378,6 +392,7 @@ async fn handle_responses_passthrough_only(
     model: &str,
     stream: bool,
     passthrough_retry_after: bool,
+    session_key: Option<&str>,
 ) -> Response {
     let req = crate::kiro::provider::UpstreamRequest {
         kiro_body: "",
@@ -386,6 +401,7 @@ async fn handle_responses_passthrough_only(
         passthrough_only: true,
         protocol: crate::kiro::provider::PassthroughProtocol::Openai,
         model_hint: Some(model),
+        session_key,
     };
     let result = if stream {
         provider.call_api_stream(req).await
@@ -415,6 +431,7 @@ async fn handle_responses_stream(
     tool_name_map: std::collections::HashMap<String, String>,
     passthrough_retry_after: bool,
     code_mode: bool,
+    session_key: Option<&str>,
 ) -> Response {
     let mut restarter = ResponsesStreamRestarter {
         provider: provider.clone(),
@@ -427,6 +444,7 @@ async fn handle_responses_stream(
         code_mode,
         remaining: MAX_RESPONSES_STREAM_RESTARTS,
         current_credential_id: -1,
+        session_key: session_key.map(str::to_string),
     };
     let upstream = match provider
         .call_api_stream(crate::kiro::provider::UpstreamRequest {
@@ -436,6 +454,7 @@ async fn handle_responses_stream(
             passthrough_only: false,
             protocol: crate::kiro::provider::PassthroughProtocol::Openai,
             model_hint: Some(model),
+            session_key,
         })
         .await
     {
@@ -683,6 +702,7 @@ async fn handle_responses_non_stream(
     tool_name_map: std::collections::HashMap<String, String>,
     passthrough_retry_after: bool,
     code_mode: bool,
+    session_key: Option<&str>,
 ) -> Response {
     let upstream = match provider
         .call_api(crate::kiro::provider::UpstreamRequest {
@@ -692,6 +712,7 @@ async fn handle_responses_non_stream(
             passthrough_only: false,
             protocol: crate::kiro::provider::PassthroughProtocol::Openai,
             model_hint: Some(model),
+            session_key,
         })
         .await
     {

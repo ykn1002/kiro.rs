@@ -221,6 +221,8 @@ export interface AppConfig {
   credentialRpmSonnet?: number | null
   credentialRpmHaiku?: number | null
   credentialRpmMaxWaitMs: number
+  /** round-robin 会话保持空闲过期秒数（0 = 关闭） */
+  sessionAffinityTtlSecs: number
   kiroVersion: string
   machineId?: string | null
   systemVersion: string
@@ -247,6 +249,8 @@ export interface UpdateAppConfigRequest {
   credentialRpmSonnet?: number | null
   credentialRpmHaiku?: number | null
   credentialRpmMaxWaitMs: number
+  /** round-robin 会话保持空闲过期秒数（0 = 关闭） */
+  sessionAffinityTtlSecs: number
   kiroVersion: string
   machineId?: string | null
   systemVersion: string

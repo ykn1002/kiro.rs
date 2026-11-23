@@ -160,6 +160,7 @@ export function SettingsDialog({ open, onOpenChange }: SettingsDialogProps) {
   const [rpmSonnet, setRpmSonnet] = useState('')
   const [rpmHaiku, setRpmHaiku] = useState('')
   const [rpmMaxWaitMs, setRpmMaxWaitMs] = useState('0')
+  const [sessionAffinityTtl, setSessionAffinityTtl] = useState('1800')
   const [kiroVersion, setKiroVersion] = useState('')
   const [machineId, setMachineId] = useState('')
   const [systemVersion, setSystemVersion] = useState('')
@@ -204,6 +205,7 @@ export function SettingsDialog({ open, onOpenChange }: SettingsDialogProps) {
     setRpmSonnet(config.credentialRpmSonnet == null ? '' : String(config.credentialRpmSonnet))
     setRpmHaiku(config.credentialRpmHaiku == null ? '' : String(config.credentialRpmHaiku))
     setRpmMaxWaitMs(String(config.credentialRpmMaxWaitMs ?? 0))
+    setSessionAffinityTtl(String(config.sessionAffinityTtlSecs ?? 1800))
     setKiroVersion(config.kiroVersion)
     setMachineId(config.machineId ?? '')
     setSystemVersion(config.systemVersion)
@@ -528,6 +530,7 @@ export function SettingsDialog({ open, onOpenChange }: SettingsDialogProps) {
         credentialRpmSonnet: parseOptionalRpm(rpmSonnet),
         credentialRpmHaiku: parseOptionalRpm(rpmHaiku),
         credentialRpmMaxWaitMs: Math.max(0, parseInt(rpmMaxWaitMs, 10) || 0),
+        sessionAffinityTtlSecs: Math.max(0, parseInt(sessionAffinityTtl, 10) || 0),
         kiroVersion: kiroVersion.trim(),
         machineId: machineId.trim(),
         systemVersion: systemVersion.trim(),
@@ -730,6 +733,22 @@ export function SettingsDialog({ open, onOpenChange }: SettingsDialogProps) {
                 <p className="text-xs text-muted-foreground">
                   每个凭据每分钟请求数上限。0 或留空表示不单独限制（专用项留空回退到兜底值）。
                   「RPM 打满等待」：全部凭据达上限时，发出请求前最多等待的毫秒数；0 表示不等待、立即向客户端返回 429
+                </p>
+                <div className="space-y-1 max-w-xs pt-2">
+                  <label className="text-xs text-muted-foreground">
+                    轮询会话保持 (sessionAffinityTtlSecs, 秒)
+                  </label>
+                  <Input
+                    type="number"
+                    min="0"
+                    value={sessionAffinityTtl}
+                    onChange={(e) => setSessionAffinityTtl(e.target.value)}
+                    disabled={isPending}
+                  />
+                </div>
+                <p className="text-xs text-muted-foreground">
+                  仅轮询（round-robin）模式生效：同一会话在空闲该秒数内固定使用同一凭据，避免交替路由破坏上游前缀缓存；
+                  绑定凭据不可用时自动改绑。默认 1800（30 分钟），0 表示关闭（逐请求轮转）
                 </p>
               </section>
 
